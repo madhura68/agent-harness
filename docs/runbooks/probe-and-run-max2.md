@@ -98,3 +98,9 @@ De zin over "gebruikerservaring" is een algemene opvulling van het model zonder 
 **Geen secrets.** Een scan op de tokenwaarde en de DB-wachtwoorden vond nul treffers in de run-dir, in `docs/` en in de volledige console-uitvoer. `run_start` toont `tools.server.env` als `<redacted>`.
 
 **Verwachte bijwerking.** De scrum4me-MCP registreert bij elke start onder het gebruikte token een `ClaudeWorker`-rij en stuurt heartbeats (`src/stdio-server.ts`: authenticate, registerWorker, startHeartbeat). Bij afsluiten (`client.close()`, stdin-EOF) deregistreert hij. Een kortstondige workerrij in presence tijdens een tools-run is dus geen storing. De MCP-stderr verschijnt met het voorvoegsel `[mcp]`; de melding over `module.register()` komt van tsx in de MCP-checkout, niet van de harness.
+
+### Waarneming: concurrentie op max2 en de deadline
+
+Een herhaling van dezelfde run om 00:25 UTC eindigde als **`timed_out`** na precies 300 s. Oorzaak: een andere gebruiker draaide tegelijk `qwen3.6:35b-a3b-coding` op max2, en met `OLLAMA_MAX_LOADED_MODELS=1` laadt Ollama per verzoek het gevraagde model opnieuw. Beurt 1 duurde daardoor 75 s en beurt 2 155 s, tegen 21 s in de eerste run. Beide toolcalls slaagden. Beurt 3 werd bij de deadline afgebroken; er volgde geen verdere aanroep. Bewijs: [evidence/sprint-summary-contention.trace.jsonl](evidence/sprint-summary-contention.trace.jsonl).
+
+Dit is het gedrag dat de spec eist (§6: een vastgelopen model trekt de run niet over `maxWallSeconds`). Voor proeven: kijk eerst met `ssh max2 'curl -s localhost:11434/api/ps'` of er een ander model geladen is.
