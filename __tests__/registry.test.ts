@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { connectRegistry, flattenContent, RegistryError, TOOL_OUTPUT_LIMIT } from '../src/tools/registry.js'
+import { connectRegistry, createRegistryView, flattenContent, RegistryError, TOOL_OUTPUT_LIMIT } from '../src/tools/registry.js'
 import type { ToolRegistry } from '../src/types.js'
 import { startFakeMcp } from './fakes/fake-mcp-server.js'
 
@@ -163,4 +163,43 @@ describe('connectStdioRegistry', () => {
     if (alive) process.kill(pid, 'SIGKILL')
     expect(alive).toBe(false)
   }, 10_000)
+})
+
+describe('createRegistryView', () => {
+  it('closing the view leaves the shared client usable', async () => {
+    const fake = await startFakeMcp()
+    open.push(fake)
+    const view = await createRegistryView(fake.client, ['echo'])
+    expect(view.snapshot.entries.map((e) => e.name)).toEqual(['echo'])
+    await view.close()
+    const { tools } = await fake.client.listTools()
+    expect(tools.length).toBeGreaterThan(0)
+    const again = await createRegistryView(fake.client, ['echo'])
+    const r = await again.execute('echo', { text: 'nog open' }, sig())
+    expect(r).toMatchObject({ ok: true, content: 'nog open' })
+  })
+})
+
+describe('connectStdioClient', () => {
+  it('starts the child with the default env subset and close() ends it', async () => {
+    const { connectStdioClient } = await import('../src/tools/registry.js')
+    const conn = await connectStdioClient({
+      command: process.execPath,
+      args: ['--import', 'tsx', '__tests__/fakes/stdio-env-server.ts'],
+      env: { GIVEN_BY_CONFIG: '1' },
+    })
+    let closed = false
+    try {
+      const { tools } = await conn.client.listTools()
+      expect(tools.map((t) => t.name)).toEqual(['env_names'])
+      const r = await conn.client.callTool({ name: 'env_names', arguments: {} })
+      const names: string[] = JSON.parse((r.content as Array<{ text: string }>)[0].text)
+      expect(names).toContain('GIVEN_BY_CONFIG')
+      await conn.close()
+      closed = true
+      await expect(conn.client.listTools()).rejects.toThrow()
+    } finally {
+      if (!closed) await conn.close()
+    }
+  }, 20_000)
 })

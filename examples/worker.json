@@ -1,0 +1,11 @@
+{
+  "model": { "baseUrl": "http://127.0.0.1:11434/v1", "name": "qwen3-coder:30b" },
+  "mcp": {
+    "command": "/Users/janpetervisser/Development/scrum4me-mcp-stable/node_modules/.bin/tsx",
+    "args": ["--tsconfig", "/Users/janpetervisser/Development/scrum4me-mcp-stable/tsconfig.json", "/Users/janpetervisser/Development/scrum4me-mcp-stable/src/index.ts"],
+    "env": { "SCRUM4ME_TOKEN": "${SCRUM4ME_TOKEN}", "DATABASE_URL": "${DATABASE_URL}", "DIRECT_URL": "${DIRECT_URL}" }
+  },
+  "allow": ["search_product_docs", "get_product_doc", "list_product_docs", "related_product_docs"],
+  "limits": { "maxTurns": 6, "maxOutputTokens": 2048, "maxWallSeconds": 240, "maxToolErrors": 2 },
+  "waitSeconds": 300
+}

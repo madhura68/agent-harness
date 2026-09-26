@@ -116,7 +116,7 @@ Per claim `runs/job-<jobId>-<claim-epoch-ms>/` (een job die na een lease-verloop
 - **`lib/env.ts`:** optionele `IDEA_CHAT_LOCAL_PRODUCT_IDS`, kommagescheiden, spaties genegeerd, leeg = uit.
 - **`actions/idea-chat.ts`:** bij het aanmaken van de IDEA_CHAT-job `required_capability: 'local_llm'` als `lockedProductId` in de lijst staat.
 - **Tests:** met en zonder lijst, en een product buiten de lijst.
-- Geen schemawijziging: `required_capability` bestaat al. Herstart van een IDEA_CHAT-job is al uitgesloten (een nieuw bericht is de retry), dus er is geen derde aanmaakpad.
+- Geen schemawijziging: `required_capability` bestaat al. Herstart van een IDEA_CHAT-job is al uitgesloten (een nieuw bericht is de retry). Wél een derde aanmaakpad (gevonden in de eindreview, 2026-09-26): de copilot-tool `send_idea_chat_message` in scrum4me-mcp maakt IDEA_CHAT-jobs zonder capability. Dat pad blijft in M2 ongerouteerd (bekende grens, zie de runbook).
 
 ## 7. Uitrol en bouwvolgorde
 

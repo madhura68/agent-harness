@@ -3,19 +3,23 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
-import { loadManifest, ManifestError, resolveServerEnv, type Manifest } from './manifest.js'
+import { loadManifest, ManifestError, resolveServerEnv } from './manifest.js'
 import { createModelClient } from './model-client.js'
 import { probeDir, runProbe } from './probe.js'
 import { runManifest } from './run.js'
-import { connectStdioRegistry } from './tools/registry.js'
+import { connectStdioClient, connectStdioRegistry, createRegistryView } from './tools/registry.js'
 import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
+import { loadWorkerConfig, workerMcpEnv } from './worker/config.js'
+import { createControlChannel } from './worker/control.js'
+import { runWorker } from './worker/worker.js'
 
 const USAGE = `harness — agent-harness v0
 
 Usage:
   harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>]
   harness run <manifest.json> --out <dir> [--skip-probe]
+  harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe]
 `
 
 // allowPositionals is required: without it Node throws ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL on the subcommand.
@@ -30,6 +34,8 @@ export const cliArgsConfig = {
     'api-key-env': { type: 'string' },
     'step-timeout': { type: 'string' },
     'skip-probe': { type: 'boolean' },
+    config: { type: 'string' },
+    once: { type: 'boolean' },
   },
 } satisfies ParseArgsConfig
 
@@ -65,19 +71,29 @@ async function cmdProbe(values: Values): Promise<number> {
 }
 
 /** Spec §7: a tools run needs a reliable probe for the same baseUrl + model, unless --skip-probe. */
-function probeGate(manifest: Manifest, out: string): string | undefined {
-  const file = join(probeDir(out, manifest.model.name), 'probe.json')
+function probeGate(model: { baseUrl: string; name: string }, out: string): string | undefined {
+  const file = join(probeDir(out, model.name), 'probe.json')
   let probe: { baseUrl?: unknown; model?: unknown; tool_calling?: unknown }
   try {
     probe = JSON.parse(readFileSync(file, 'utf8'))
   } catch {
     return `no probe result at ${file}`
   }
-  if (probe.baseUrl !== manifest.model.baseUrl || probe.model !== manifest.model.name) {
+  if (probe.baseUrl !== model.baseUrl || probe.model !== model.name) {
     return `${file} was made for ${String(probe.model)} at ${String(probe.baseUrl)}`
   }
   if (probe.tool_calling !== 'reliable') return `${file} rates tool calling as ${String(probe.tool_calling)}`
   return undefined
+}
+
+function passesProbeGate(model: { baseUrl: string; name: string }, out: string): boolean {
+  const reason = probeGate(model, out)
+  if (!reason) return true
+  process.stderr.write(
+    `PROBE_REQUIRED: ${reason}. Draai eerst harness probe --base-url ${model.baseUrl} --model ${model.name} --out ${out}` +
+      ` (of gebruik --skip-probe).\n`,
+  )
+  return false
 }
 
 async function cmdRun(values: Values, manifestPath: string | undefined): Promise<number> {
@@ -91,14 +107,7 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
   }
   if (manifest.profile === 'tools' && manifest.tools) {
     if (!skipProbe) {
-      const reason = probeGate(manifest, out)
-      if (reason) {
-        process.stderr.write(
-          `PROBE_REQUIRED: ${reason}. Draai eerst harness probe --base-url ${manifest.model.baseUrl} --model ${manifest.model.name} --out ${out}` +
-            ` (of gebruik --skip-probe).\n`,
-        )
-        return 1
-      }
+      if (!passesProbeGate(manifest.model, out)) return 1
     }
     // Expand ${VAR} here, before the run dir exists; the expanded values only travel to the MCP child process.
     const server = { ...manifest.tools.server, env: resolveServerEnv(manifest) }
@@ -117,6 +126,46 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
   )
   if (result.status === 'completed') process.stdout.write(`\n${result.answer}\n`)
   return result.status === 'completed' ? 0 : 1
+}
+
+async function cmdWorker(values: Values): Promise<number> {
+  if (!values.config) throw new UsageError('worker needs --config')
+  const out = values.out ?? 'runs'
+  const config = loadWorkerConfig(values.config)
+  if (values['skip-probe'] !== true && !passesProbeGate(config.model, out)) return 1
+  // Expand ${VAR} before anything starts; the values only travel to the MCP child process.
+  const env = workerMcpEnv(config)
+
+  const stop = new AbortController()
+  let interrupts = 0
+  const onSignal = () => {
+    interrupts++
+    if (interrupts > 1) process.exit(130)
+    process.stderr.write('worker stopt na de lopende stap (nogmaals Ctrl-C = direct afbreken)\n')
+    stop.abort()
+  }
+  process.on('SIGINT', onSignal)
+  process.on('SIGTERM', onSignal)
+  let conn: Awaited<ReturnType<typeof connectStdioClient>> | undefined
+  try {
+    conn = await connectStdioClient({ ...config.mcp, env }, stop.signal)
+    const client = conn.client
+    const { exitCode, jobs } = await runWorker({
+      control: createControlChannel(client),
+      registryView: (signal) => createRegistryView(client, config.allow, signal),
+      modelClient: createModelClient({ baseUrl: config.model.baseUrl, name: config.model.name, apiKey: config.model.apiKey }),
+      config,
+      out,
+      once: values.once === true,
+      signal: stop.signal,
+    })
+    process.stdout.write(`worker klaar — ${jobs.length} job(s): ${jobs.map((j) => `${j.jobId}=${j.outcome}`).join(', ') || 'geen'}\n`)
+    return exitCode
+  } finally {
+    process.off('SIGINT', onSignal)
+    process.off('SIGTERM', onSignal)
+    await conn?.close().catch(() => undefined)
+  }
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -138,6 +187,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdProbe(values)
       case 'run':
         return await cmdRun(values, positionals[1])
+      case 'worker':
+        return await cmdWorker(values)
       default:
         process.stderr.write(`${positionals[0]}: not implemented\n`)
         return 1

@@ -56,10 +56,10 @@ export function loadManifest(path: string): Manifest {
 }
 
 /** Replaces ${VAR}; an unset or empty VAR is an error naming the variable. */
-export function expandEnv(value: string, env: NodeJS.ProcessEnv): string {
+export function expandEnv(value: string, env: NodeJS.ProcessEnv, where = 'tools.server.env'): string {
   return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name: string) => {
     const v = env[name]
-    if (v === undefined || v === '') throw new ManifestError(`environment variable ${name} is not set (needed by tools.server.env)`)
+    if (v === undefined || v === '') throw new ManifestError(`environment variable ${name} is not set (needed by ${where})`)
     return v
   })
 }
