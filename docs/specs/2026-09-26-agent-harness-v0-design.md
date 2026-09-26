@@ -126,9 +126,13 @@ loop:
 ## 8. CLI, repo-indeling en tests
 
 ```bash
-harness probe --base-url http://<max2>:11434/v1 --model <naam> --out runs/probe-<naam>
+harness probe --base-url http://<max2>:11434/v1 --model <naam> --out runs
 harness run examples/sprint-summary.json --out runs/
 ```
+
+`--out` is in beide commando's dezelfde runs-map: `probe` schrijft er zelf
+`probe-<slug(model)>/probe.json` in, en dat is precies het pad dat de
+`PROBE_REQUIRED`-gate van `run` leest.
 
 ```
 src/cli.ts              commando's, exit-codes
