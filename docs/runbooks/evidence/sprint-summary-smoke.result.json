@@ -1,0 +1,20 @@
+{
+  "runId": "sprint-summary-smoke",
+  "status": "completed",
+  "answer": "In sprint S-2026-09-15-1 worden automatische uitvoering van queue-opdrachten en reviews geïmplementeerd, waarbij de watcherkeuze behouden blijft. De sprint richt zich op het bouwen van een duurzaam systeem met behulp van dispatching, capaciteitsreservering en betrouwbare jobuitvoering. Er vinden diverse review-fixes plaats voor het verbeteren van stabiliteit en regressieproblemen. Deze taken zijn gericht op het verbeteren van zowel de infrastructuur als de gebruikerservaring binnen de applicatie. De meeste taken zijn in een review-status, wat suggereert dat de functionaliteiten vrijwel voltooid zijn en klaar zijn voor evaluatie.",
+  "model": {
+    "name": "qwen3-coder:30b",
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "reported": "qwen3-coder:30b"
+  },
+  "usage": {
+    "source": "provider_reported",
+    "inputTokens": 10732,
+    "outputTokens": 257,
+    "turns": 3,
+    "toolCalls": 2,
+    "toolErrors": 0
+  },
+  "durationMs": 59065,
+  "toolSnapshotHash": "7f76236720ff16b66cd5c2313b05ee920cab0c6cc04420b1cd3e88ce41722b61"
+}

@@ -62,3 +62,39 @@ De trace bevat vier events in deze volgorde: `run_start` (manifest zonder `apiKe
 Het antwoord is inhoudelijk redelijk. De zin "een potentiël bepaalde productuitvoer" is kromme taal van het model, geen harnessfout.
 
 Een run-id is eenmalig: `runs/<id>/` bestaat na de eerste run, dus een tweede run met hetzelfde manifest weigert. Verwijder de map of kies een andere `id` om opnieuw te draaien.
+
+## Increment 3 — `harness run`, profiel `tools` met de scrum4me-MCP
+
+Het model draait op max2 (via de tunnel), de scrum4me-MCP als stdio-kindproces op de Mac. `SCRUM4ME_TOKEN`, `DATABASE_URL` en `DIRECT_URL` moeten in de omgeving van `harness run` staan; het manifest bevat alleen `${VAR}`-verwijzingen. Voor de proef kwamen de waarden uit de `scrum4me`-entry in `~/.claude.json`, via een klein script dat ze als omgeving doorgeeft zonder ze te printen.
+
+```bash
+SCRUM4ME_TOKEN=… DATABASE_URL=… DIRECT_URL=… npm run dev -- run examples/sprint-summary.json --out runs/
+```
+
+De probe-gate vond `runs/probe-qwen3-coder-30b/probe.json` met hetzelfde `baseUrl` en model en verdict `reliable`, dus `--skip-probe` was niet nodig.
+
+Resultaat: **`completed`**, exit 0, 3 beurten, 2 toolcalls, 0 toolfouten, tokens in/uit 10 732/257 (`provider_reported`), 59 s. Bewijs: [evidence/sprint-summary-smoke.result.json](evidence/sprint-summary-smoke.result.json) en [evidence/sprint-summary-smoke.trace.jsonl](evidence/sprint-summary-smoke.trace.jsonl).
+
+| Beurt | Toolcall | Resultaat |
+|---|---|---|
+| 1 | `get_context({"product_id":"cmohrysyj0000rd17clnjy4tc"})` | ok, 5 238 bytes, niet afgekapt |
+| 2 | `get_sprint_context({"sprint_id":"cmu296u6b0002j9170fcqfl0r"})` | ok, 14 563 bytes, niet afgekapt |
+| 3 | geen, eindantwoord | `finishReason: stop` |
+
+Snapshot-hash van `get_context` + `get_sprint_context`: `7f76236720ff16b66cd5c2313b05ee920cab0c6cc04420b1cd3e88ce41722b61`.
+
+Het antwoord van het model:
+
+> In sprint S-2026-09-15-1 worden automatische uitvoering van queue-opdrachten en reviews geïmplementeerd, waarbij de watcherkeuze behouden blijft. De sprint richt zich op het bouwen van een duurzaam systeem met behulp van dispatching, capaciteitsreservering en betrouwbare jobuitvoering. Er vinden diverse review-fixes plaats voor het verbeteren van stabiliteit en regressieproblemen. Deze taken zijn gericht op het verbeteren van zowel de infrastructuur als de gebruikerservaring binnen de applicatie. De meeste taken zijn in een review-status, wat suggereert dat de functionaliteiten vrijwel voltooid zijn en klaar zijn voor evaluatie.
+
+**Spec-criterium 3.** Het model koos de juiste sprint: S-2026-09-15-1 heeft de meest recente `start_date` van de drie open sprints. Deze gegevens staan alleen in de `get_sprint_context`-uitvoer, niet in die van `get_context`:
+
+- "review-fixes" en "regressieproblemen" komen uit taaktitels als "Review-fix R1: Task.dispatch_request_id opnemen in schema.prisma" en "Sluit alle consumenten aan en bewijs contractregressies".
+- "capaciteitsreservering" en "dispatching" komen uit taaktitels als "Selecteer geschikte capaciteit en reserveer atomisch" en "Voeg MCP- en CLI-dispatchingangen en context toe".
+- "De meeste taken zijn in een review-status" klopt met de taakstatussen: 35 van de 49 taken staan op `review`, 11 op `done` en 3 op `todo`.
+
+De zin over "gebruikerservaring" is een algemene opvulling van het model zonder duidelijke bron.
+
+**Geen secrets.** Een scan op de tokenwaarde en de DB-wachtwoorden vond nul treffers in de run-dir, in `docs/` en in de volledige console-uitvoer. `run_start` toont `tools.server.env` als `<redacted>`.
+
+**Verwachte bijwerking.** De scrum4me-MCP registreert bij elke start onder het gebruikte token een `ClaudeWorker`-rij en stuurt heartbeats (`src/stdio-server.ts`: authenticate, registerWorker, startHeartbeat). Bij afsluiten (`client.close()`, stdin-EOF) deregistreert hij. Een kortstondige workerrij in presence tijdens een tools-run is dus geen storing. De MCP-stderr verschijnt met het voorvoegsel `[mcp]`; de melding over `module.register()` komt van tsx in de MCP-checkout, niet van de harness.

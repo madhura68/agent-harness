@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-import { mkdirSync, realpathSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
-import { loadManifest, ManifestError } from './manifest.js'
+import { loadManifest, ManifestError, resolveServerEnv, type Manifest } from './manifest.js'
 import { createModelClient } from './model-client.js'
 import { probeDir, runProbe } from './probe.js'
 import { runManifest } from './run.js'
+import { connectStdioRegistry } from './tools/registry.js'
 import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
 
@@ -63,15 +64,51 @@ async function cmdProbe(values: Values): Promise<number> {
   return result.tool_calling === 'reliable' ? 0 : 1
 }
 
+/** Spec §7: a tools run needs a reliable probe for the same baseUrl + model, unless --skip-probe. */
+function probeGate(manifest: Manifest, out: string): string | undefined {
+  const file = join(probeDir(out, manifest.model.name), 'probe.json')
+  let probe: { baseUrl?: unknown; model?: unknown; tool_calling?: unknown }
+  try {
+    probe = JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return `no probe result at ${file}`
+  }
+  if (probe.baseUrl !== manifest.model.baseUrl || probe.model !== manifest.model.name) {
+    return `${file} was made for ${String(probe.model)} at ${String(probe.baseUrl)}`
+  }
+  if (probe.tool_calling !== 'reliable') return `${file} rates tool calling as ${String(probe.tool_calling)}`
+  return undefined
+}
+
 async function cmdRun(values: Values, manifestPath: string | undefined): Promise<number> {
   if (!manifestPath) throw new UsageError('run needs a manifest path')
+  const out = values.out ?? 'runs'
   const manifest = loadManifest(manifestPath)
-  const trace = openTrace(values.out ?? 'runs', manifest.id)
-  const client = createModelClient({ baseUrl: manifest.model.baseUrl, name: manifest.model.name, apiKey: manifest.model.apiKey })
-  const connectRegistry = async (): Promise<ToolRegistry> => {
-    throw new Error('profile tools is not implemented yet')
+  const skipProbe = values['skip-probe'] === true
+
+  let connectRegistry = async (): Promise<ToolRegistry> => {
+    throw new Error('connectRegistry is only available for profile tools')
   }
-  const result = await runManifest(manifest, { client, trace, connectRegistry })
+  if (manifest.profile === 'tools' && manifest.tools) {
+    if (!skipProbe) {
+      const reason = probeGate(manifest, out)
+      if (reason) {
+        process.stderr.write(
+          `PROBE_REQUIRED: ${reason}. Draai eerst harness probe --base-url ${manifest.model.baseUrl} --model ${manifest.model.name} --out ${out}` +
+            ` (of gebruik --skip-probe).\n`,
+        )
+        return 1
+      }
+    }
+    // Expand ${VAR} here, before the run dir exists; the expanded values only travel to the MCP child process.
+    const server = { ...manifest.tools.server, env: resolveServerEnv(manifest) }
+    const allow = manifest.tools.allow
+    connectRegistry = () => connectStdioRegistry(server, allow)
+  }
+
+  const trace = openTrace(out, manifest.id)
+  const client = createModelClient({ baseUrl: manifest.model.baseUrl, name: manifest.model.name, apiKey: manifest.model.apiKey })
+  const result = await runManifest(manifest, { client, trace, connectRegistry, ...(skipProbe && manifest.profile === 'tools' ? { probeSkipped: true } : {}) })
   const u = result.usage
   process.stdout.write(
     `${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''} — turns ${u.turns}, ` +

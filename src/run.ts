@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import type { Manifest } from './manifest.js'
 import { ModelError, type ModelClient } from './model-client.js'
+import { createPolicy, type Policy } from './tools/policy.js'
+import { RegistryError } from './tools/registry.js'
 import { redactManifest, type RunResult, type TraceWriter } from './trace.js'
 import type { ChatMessage, ErrorCode, RunStatus, ToolCall, ToolDef, ToolExecResult, ToolRegistry } from './types.js'
 
@@ -35,17 +37,29 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   let reportedModel: string | undefined
   let snapshotHash: string | undefined
   let registry: ToolRegistry | undefined
+  let policy: Policy | undefined
   const seenCallIds = new Set<string>()
 
   trace.event({ type: 'run_start', manifest: redactManifest(manifest), ...(deps.probeSkipped ? { probeSkipped: true } : {}) })
 
-  const executeCall = async (call: ToolCall, _signal: AbortSignal): Promise<ToolExecResult> => {
-    return { ok: false, errorCode: 'UNKNOWN_TOOL', content: `tool ${call.name} is not available`, truncated: false }
+  const executeCall = async (call: ToolCall, signal: AbortSignal): Promise<ToolExecResult> => {
+    if (!registry || !policy) {
+      return { ok: false, errorCode: 'UNKNOWN_TOOL', content: `tool ${call.name} is not available in profile ${manifest.profile}`, truncated: false }
+    }
+    const decision = policy.check(call)
+    if (!decision.ok) return { ok: false, errorCode: decision.errorCode, content: decision.message, truncated: false }
+    return registry.execute(decision.name, decision.args, signal)
   }
 
   const loop = async (): Promise<Terminal> => {
     if (manifest.profile === 'tools') {
-      registry = await deps.connectRegistry()
+      try {
+        registry = await deps.connectRegistry()
+      } catch (err) {
+        if (err instanceof RegistryError) return { status: 'failed', error: { code: 'TOOL_NOT_AVAILABLE', message: err.message } }
+        throw err
+      }
+      policy = createPolicy(registry.snapshot)
       snapshotHash = registry.snapshot.hash
       trace.event({ type: 'tool_snapshot', names: registry.snapshot.entries.map((e) => e.name), hash: snapshotHash })
     }
@@ -104,7 +118,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         trace.event({ type: 'tool_call', callId: call.id, name: call.name, arguments: call.arguments, argumentsWasObject: call.argumentsWasObject })
         const toolSignal = AbortSignal.timeout(Math.max(1, deadline - now()))
         const r = await executeCall(call, toolSignal)
-        if (r.errorCode === 'TOOL_TIMEOUT' && now() >= deadline) {
+        if (r.errorCode === 'TOOL_TIMEOUT' && (toolSignal.aborted || now() >= deadline)) {
           recordToolResult(call.id, r)
           return { status: 'timed_out' }
         }
