@@ -1,0 +1,43 @@
+{
+  "name": "agent-harness",
+  "version": "0.1.0",
+  "description": "Standalone agent-harness CLI: capability probe and manifest runs against OpenAI-compatible local models",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "verify": "npm run lint && npm run typecheck && npm test",
+    "dev": "tsx src/cli.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://git.jp-visser.nl/janpeter/agent-harness"
+  },
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "ajv": "^8.20.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "eslint": "^10.11.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.1",
+    "vitest": "^5.0.2"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "harness": "dist/cli.js"
+  },
+  "private": true
+}

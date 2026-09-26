@@ -1,0 +1,19 @@
+{
+  "runId": "sprint-summary-smoke",
+  "status": "timed_out",
+  "model": {
+    "name": "qwen3-coder:30b",
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "reported": "qwen3-coder:30b"
+  },
+  "usage": {
+    "source": "provider_reported",
+    "inputTokens": 2949,
+    "outputTokens": 85,
+    "turns": 3,
+    "toolCalls": 2,
+    "toolErrors": 0
+  },
+  "durationMs": 300119,
+  "toolSnapshotHash": "7f76236720ff16b66cd5c2313b05ee920cab0c6cc04420b1cd3e88ce41722b61"
+}

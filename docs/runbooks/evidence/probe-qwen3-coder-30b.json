@@ -1,0 +1,114 @@
+{
+  "baseUrl": "http://127.0.0.1:11434/v1",
+  "model": "qwen3-coder:30b",
+  "reportedModel": "qwen3-coder:30b",
+  "ranAt": "2026-09-26T00:10:13.984Z",
+  "steps": {
+    "a_plain": {
+      "pass": true,
+      "reason": "content: pong",
+      "raw": {
+        "message": {
+          "content": "pong",
+          "toolCalls": []
+        },
+        "finishReason": "stop",
+        "usage": {
+          "source": "provider_reported",
+          "inputTokens": 19,
+          "outputTokens": 2
+        },
+        "model": "qwen3-coder:30b"
+      }
+    },
+    "b_single_tool": {
+      "pass": true,
+      "reason": "echo(\"ping\")",
+      "raw": {
+        "message": {
+          "content": "",
+          "toolCalls": [
+            {
+              "id": "call_ch1nxk5r",
+              "name": "echo",
+              "arguments": "{\"text\":\"ping\"}",
+              "argumentsWasObject": false
+            }
+          ]
+        },
+        "finishReason": "tool_calls",
+        "usage": {
+          "source": "provider_reported",
+          "inputTokens": 302,
+          "outputTokens": 21
+        },
+        "model": "qwen3-coder:30b"
+      }
+    },
+    "c_two_tools": {
+      "pass": true,
+      "reason": "turn 1 echo(\"ping\"); turn 2 echo(\"pong\")",
+      "raw": {
+        "turn1": {
+          "message": {
+            "content": "",
+            "toolCalls": [
+              {
+                "id": "call_59t6c4qr",
+                "name": "echo",
+                "arguments": "{\"text\":\"ping\"}",
+                "argumentsWasObject": false
+              }
+            ]
+          },
+          "finishReason": "tool_calls",
+          "usage": {
+            "source": "provider_reported",
+            "inputTokens": 302,
+            "outputTokens": 21
+          },
+          "model": "qwen3-coder:30b"
+        },
+        "turn2": {
+          "message": {
+            "content": "",
+            "toolCalls": [
+              {
+                "id": "call_sbrcw2jt",
+                "name": "echo",
+                "arguments": "{\"text\":\"pong\"}",
+                "argumentsWasObject": false
+              }
+            ]
+          },
+          "finishReason": "tool_calls",
+          "usage": {
+            "source": "provider_reported",
+            "inputTokens": 354,
+            "outputTokens": 21
+          },
+          "model": "qwen3-coder:30b"
+        }
+      }
+    },
+    "d_nonexistent_tool": {
+      "pass": true,
+      "reason": "no foreign tool call (0 echo calls)",
+      "raw": {
+        "message": {
+          "content": "Ik kan de tool `delete_everything` niet vinden. Wil je dat ik iets anders doe?",
+          "toolCalls": []
+        },
+        "finishReason": "stop",
+        "usage": {
+          "source": "provider_reported",
+          "inputTokens": 299,
+          "outputTokens": 21
+        },
+        "model": "qwen3-coder:30b"
+      }
+    }
+  },
+  "tool_calling": "reliable",
+  "usage_reported": true
+}
