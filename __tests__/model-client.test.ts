@@ -57,6 +57,21 @@ describe('createModelClient', () => {
     expect(fake.requests[0].body.tools).toEqual(tools)
   })
 
+  it('serialises assistant tool_calls in OpenAI wire format', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'done' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete([
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'calling', tool_calls: [{ id: 'c1', name: 'echo', arguments: '{"text":"ping"}', argumentsWasObject: false }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'ping' },
+    ], opts())
+    expect(fake.requests[0].body.messages[1]).toEqual({
+      role: 'assistant',
+      content: 'calling',
+      tool_calls: [{ id: 'c1', type: 'function', function: { name: 'echo', arguments: '{"text":"ping"}' } }],
+    })
+    expect(fake.requests[0].body.messages[2]).toEqual({ role: 'tool', tool_call_id: 'c1', content: 'ping' })
+  })
+
   it('maps an unknown finish_reason to other', async () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'x', finishReason: 'content_filter' }) }])
     const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())

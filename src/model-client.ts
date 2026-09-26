@@ -40,6 +40,18 @@ function parseToolCalls(raw: unknown): ToolCall[] {
   })
 }
 
+// Internal ToolCall -> OpenAI wire shape; the harness never sends its own bookkeeping fields.
+function toWire(messages: ChatMessage[]): unknown[] {
+  return messages.map((m) => {
+    if (m.role !== 'assistant' || !m.tool_calls || m.tool_calls.length === 0) return m
+    return {
+      role: 'assistant',
+      content: m.content,
+      tool_calls: m.tool_calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: c.arguments } })),
+    }
+  })
+}
+
 export function createModelClient(opts: ModelClientOptions): ModelClient {
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`
   return {
@@ -48,7 +60,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       if (opts.apiKey) headers.authorization = `Bearer ${opts.apiKey}`
       const body: Record<string, unknown> = {
         model: opts.name,
-        messages,
+        messages: toWire(messages),
         max_tokens: options.maxTokens,
         stream: false,
       }
