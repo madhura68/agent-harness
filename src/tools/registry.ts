@@ -100,18 +100,27 @@ export async function connectRegistry(
       }
     },
     async close() {
-      await client.close()
-      await onClose?.()
+      // A given onClose owns the connection (a view passes a no-op, a stdio registry its own close);
+      // without one the registry owns the client.
+      if (onClose) await onClose()
+      else await client.close()
     },
   }
 }
 
+export type StdioConnection = { client: Client; close(): Promise<void> }
+
 /**
  * Spawns the MCP server over stdio. The child gets the SDK's default environment subset
- * (HOME, LOGNAME, PATH, SHELL, TERM, USER) plus only what the manifest names — never process.env,
+ * (HOME, LOGNAME, PATH, SHELL, TERM, USER) plus only what the caller names — never process.env,
  * so host secrets such as FORGEJO_TOKEN or S4M_* do not reach it.
  */
-export async function connectStdioRegistry(server: ServerSpec, allow: string[], signal?: AbortSignal): Promise<ToolRegistry> {
+export async function connectStdioClient(server: ServerSpec, signal?: AbortSignal): Promise<StdioConnection> {
+  const { client, close } = await openStdio(server, signal)
+  return { client, close }
+}
+
+async function openStdio(server: ServerSpec, signal?: AbortSignal): Promise<StdioConnection & { kill(): void }> {
   const transport = new StdioClientTransport({
     command: server.command,
     args: server.args,
@@ -135,12 +144,39 @@ export async function connectStdioRegistry(server: ServerSpec, allow: string[], 
   try {
     if (signal?.aborted) throw new Error('MCP startup aborted at the deadline')
     await client.connect(transport, signal ? { signal } : undefined)
-    return await connectRegistry(client, allow, () => transport.close(), signal)
   } catch (err) {
     kill()
     await client.close().catch(() => undefined)
     throw err
   } finally {
     signal?.removeEventListener('abort', kill)
+  }
+  return {
+    client,
+    async close() {
+      await client.close().catch(() => undefined)
+      await transport.close()
+    },
+    kill,
+  }
+}
+
+/** Allowlist view on an existing client; closing the view leaves the shared connection open. */
+export function createRegistryView(client: Client, allow: string[], signal?: AbortSignal): Promise<ToolRegistry> {
+  return connectRegistry(client, allow, async () => undefined, signal)
+}
+
+/** Stdio connection plus allowlist; close() ends the connection. `harness run` uses this. */
+export async function connectStdioRegistry(server: ServerSpec, allow: string[], signal?: AbortSignal): Promise<ToolRegistry> {
+  const conn = await openStdio(server, signal)
+  signal?.addEventListener('abort', conn.kill, { once: true })
+  try {
+    return await connectRegistry(conn.client, allow, conn.close, signal)
+  } catch (err) {
+    conn.kill()
+    await conn.close().catch(() => undefined)
+    throw err
+  } finally {
+    signal?.removeEventListener('abort', conn.kill)
   }
 }
