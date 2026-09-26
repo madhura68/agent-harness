@@ -86,7 +86,7 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
   const manifest = loadManifest(manifestPath)
   const skipProbe = values['skip-probe'] === true
 
-  let connectRegistry = async (): Promise<ToolRegistry> => {
+  let connectRegistry = async (_signal: AbortSignal): Promise<ToolRegistry> => {
     throw new Error('connectRegistry is only available for profile tools')
   }
   if (manifest.profile === 'tools' && manifest.tools) {
@@ -103,7 +103,7 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
     // Expand ${VAR} here, before the run dir exists; the expanded values only travel to the MCP child process.
     const server = { ...manifest.tools.server, env: resolveServerEnv(manifest) }
     const allow = manifest.tools.allow
-    connectRegistry = () => connectStdioRegistry(server, allow)
+    connectRegistry = (signal: AbortSignal) => connectStdioRegistry(server, allow, signal)
   }
 
   const trace = openTrace(out, manifest.id)

@@ -6,6 +6,7 @@ import { createModelClient } from '../src/model-client.js'
 import { runManifest } from '../src/run.js'
 import { connectRegistry } from '../src/tools/registry.js'
 import { openTrace } from '../src/trace.js'
+import type { ToolRegistry } from '../src/types.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeMcp } from './fakes/fake-mcp-server.js'
 import { readTrace, tmp } from './helpers.js'
@@ -24,7 +25,10 @@ type Call = { id?: string; name: string; arguments?: unknown }
 const calls = (cs: Call[], content: string | null = null): FakeTurn => ({ body: completion({ content, toolCalls: cs }) })
 const answer = (text: string): FakeTurn => ({ body: completion({ content: text }) })
 
-async function run(script: FakeTurn[], opts: { allow?: string[]; limits?: Partial<typeof limits> } = {}) {
+async function run(
+  script: FakeTurn[],
+  opts: { allow?: string[]; limits?: Partial<typeof limits>; connect?: (signal: AbortSignal) => Promise<ToolRegistry> } = {},
+) {
   fake = await startFakeModelServer(script)
   const mcp = await startFakeMcp()
   open.push(mcp)
@@ -36,10 +40,7 @@ async function run(script: FakeTurn[], opts: { allow?: string[]; limits?: Partia
     limits: { ...limits, ...opts.limits },
   }
   const trace = openTrace(tmp('tools'), m.id)
-  const connect = vi.fn(async () => {
-    const reg = await connectRegistry(mcp.client, allow)
-    return reg
-  })
+  const connect = vi.fn(opts.connect ?? (async () => connectRegistry(mcp.client, allow)))
   const result = await runManifest(m, { client: createModelClient({ baseUrl: fake.baseUrl, name: 'm' }), trace, connectRegistry: connect })
   return { result, trace, requests: fake.requests, mcpCalls: mcp.calls, connect, events: readTrace(trace.dir) }
 }
@@ -143,5 +144,54 @@ describe('runManifest — tools profile', () => {
     expect(r.requests).toHaveLength(0)
     expect(r.events.at(-1)).toMatchObject({ type: 'run_end', status: 'failed', error: { code: 'TOOL_NOT_AVAILABLE' } })
     expect(existsSync(join(r.trace.dir, 'result.json'))).toBe(true)
+  })
+
+  it('bounds MCP startup by maxWallSeconds and aborts the connect signal', async () => {
+    let seen: AbortSignal | undefined
+    const started = Date.now()
+    const r = await run([answer('never')], {
+      limits: { maxWallSeconds: 1 },
+      connect: (signal) => { seen = signal; return new Promise<ToolRegistry>(() => undefined) }, // hangs forever
+    })
+    expect(r.result.status).toBe('timed_out')
+    expect(r.requests).toHaveLength(0)
+    expect(seen?.aborted).toBe(true)
+    expect(Date.now() - started).toBeLessThan(2500)
+  })
+
+  it('closes a registry that connects after the startup deadline', async () => {
+    const close = vi.fn(async () => undefined)
+    const late = { snapshot: { entries: [], hash: 'h' }, toOpenAiTools: () => [], execute: vi.fn(), close } as unknown as ToolRegistry
+    const r = await run([answer('never')], {
+      limits: { maxWallSeconds: 1 },
+      connect: () => new Promise<ToolRegistry>((resolve) => setTimeout(() => resolve(late), 1300)),
+    })
+    expect(r.result.status).toBe('timed_out')
+    await new Promise((res) => setTimeout(res, 500))
+    expect(close).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports an MCP server that fails to start as failed/TOOL_NOT_AVAILABLE', async () => {
+    const r = await run([answer('never')], { connect: async () => { throw new Error('spawn mcp-bin ENOENT') } })
+    expect(r.result).toMatchObject({ status: 'failed', error: { code: 'TOOL_NOT_AVAILABLE' } })
+    expect(r.result.error?.message).toMatch(/ENOENT/)
+  })
+
+  it('never reuses a model-supplied id for a generated one', async () => {
+    const r = await run([
+      calls([{ id: 'call_1_1', name: 'echo', arguments: '{"text":"a"}' }, { name: 'echo', arguments: '{"text":"b"}' }]),
+      answer('ok'),
+    ])
+    const ids = lastToolMessages(r.requests[1]).map((m) => m.tool_call_id)
+    expect(new Set(ids).size).toBe(2)
+  })
+
+  it('keeps the full tool content on disk while the model gets the truncated text', async () => {
+    const r = await run([calls([{ id: 'b', name: 'big', arguments: '{}' }]), answer('ok')], { allow: ['big'] })
+    const msg = JSON.parse(lastToolMessages(r.requests[1])[0].content)
+    expect(msg.truncated).toBe(true)
+    expect(Buffer.byteLength(msg.content)).toBeLessThanOrEqual(16_384)
+    expect(readFileSync(join(r.trace.dir, 'tools', 'b.txt'), 'utf8')).toHaveLength(40_000)
+    expect(r.events.find((e) => e.type === 'tool_result')).toMatchObject({ truncated: true, bytes: 40_000 })
   })
 })

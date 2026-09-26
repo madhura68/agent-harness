@@ -47,7 +47,8 @@ export type ErrorCode =
 export type ServerSpec = { command: string; args: string[]; env?: Record<string, string> } // = Manifest.tools.server
 export type ToolSnapshotEntry = { name: string; description?: string; inputSchema: Record<string, unknown> }
 export type ToolSnapshot = { entries: ToolSnapshotEntry[]; hash: string } // sha256 over JSON.stringify(entries), names sorted
-export type ToolExecResult = { ok: boolean; content: string; errorCode?: ErrorCode; truncated: boolean }
+// content is what the model sees (≤ 16 384 bytes); fullContent is set only when content was truncated.
+export type ToolExecResult = { ok: boolean; content: string; errorCode?: ErrorCode; truncated: boolean; fullContent?: string }
 
 export interface ToolRegistry {
   readonly snapshot: ToolSnapshot

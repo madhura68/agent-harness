@@ -46,8 +46,13 @@ function abortPromise(signal: AbortSignal): { promise: Promise<'aborted'>; dispo
   return { promise, dispose: () => signal.removeEventListener('abort', onAbort) }
 }
 
-export async function connectRegistry(client: Client, allow: string[], onClose?: () => Promise<void>): Promise<ToolRegistry> {
-  const { tools } = await client.listTools()
+export async function connectRegistry(
+  client: Client,
+  allow: string[],
+  onClose?: () => Promise<void>,
+  signal?: AbortSignal,
+): Promise<ToolRegistry> {
+  const { tools } = await client.listTools(undefined, signal ? { signal } : undefined)
   const byName = new Map(tools.map((t) => [t.name, t]))
   const missing = allow.filter((n) => !byName.has(n))
   if (missing.length > 0) throw new RegistryError(`allowed tools not offered by the MCP server: ${missing.join(', ')}`)
@@ -81,8 +86,9 @@ export async function connectRegistry(client: Client, allow: string[], onClose?:
         if (outcome === 'aborted') return { ok: false, errorCode: 'TOOL_TIMEOUT', content: 'tool call aborted at the deadline', truncated: false }
         const content = Array.isArray(outcome.content) ? flattenContent(outcome.content) : JSON.stringify(outcome.structuredContent ?? outcome)
         const cut = truncateUtf8(content, TOOL_OUTPUT_LIMIT)
-        if (outcome.isError) return { ok: false, errorCode: 'TOOL_ERROR', content: cut.text, truncated: cut.truncated }
-        return { ok: true, content: cut.text, truncated: cut.truncated }
+        const full = cut.truncated ? { fullContent: content } : {}
+        if (outcome.isError) return { ok: false, errorCode: 'TOOL_ERROR', content: cut.text, truncated: cut.truncated, ...full }
+        return { ok: true, content: cut.text, truncated: cut.truncated, ...full }
       } catch (err) {
         if (signal.aborted || (err instanceof McpError && err.code === McpErrorCode.RequestTimeout)) {
           return { ok: false, errorCode: 'TOOL_TIMEOUT', content: 'tool call timed out', truncated: false }
@@ -105,7 +111,7 @@ export async function connectRegistry(client: Client, allow: string[], onClose?:
  * (HOME, LOGNAME, PATH, SHELL, TERM, USER) plus only what the manifest names — never process.env,
  * so host secrets such as FORGEJO_TOKEN or S4M_* do not reach it.
  */
-export async function connectStdioRegistry(server: ServerSpec, allow: string[]): Promise<ToolRegistry> {
+export async function connectStdioRegistry(server: ServerSpec, allow: string[], signal?: AbortSignal): Promise<ToolRegistry> {
   const transport = new StdioClientTransport({
     command: server.command,
     args: server.args,
@@ -117,12 +123,24 @@ export async function connectStdioRegistry(server: ServerSpec, allow: string[]):
     createInterface({ input: stderr as NodeJS.ReadableStream }).on('line', (line) => process.stderr.write(`[mcp] ${line}\n`))
   }
   const client = new Client({ name: 'agent-harness', version: '0.1.0' })
+  // A server that has not finished startup gets SIGTERM straight away. The SDK's close() first waits
+  // up to 2 s for a voluntary exit, and a second close() returns at once, so the child could outlive us.
+  const kill = () => {
+    const pid = transport.pid
+    if (pid) {
+      try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
+    }
+  }
+  signal?.addEventListener('abort', kill, { once: true })
   try {
-    await client.connect(transport)
-    return await connectRegistry(client, allow, () => transport.close())
+    if (signal?.aborted) throw new Error('MCP startup aborted at the deadline')
+    await client.connect(transport, signal ? { signal } : undefined)
+    return await connectRegistry(client, allow, () => transport.close(), signal)
   } catch (err) {
+    kill()
     await client.close().catch(() => undefined)
-    await transport.close().catch(() => undefined)
     throw err
+  } finally {
+    signal?.removeEventListener('abort', kill)
   }
 }

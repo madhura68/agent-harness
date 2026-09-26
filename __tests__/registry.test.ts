@@ -67,12 +67,13 @@ describe('execute', () => {
     expect(await reg.execute('echo', { text: 'hoi' }, sig())).toEqual({ ok: true, content: 'hoi', truncated: false })
   })
 
-  it('truncates output above the limit', async () => {
+  it('truncates output above the limit and keeps the full text alongside', async () => {
     const { reg } = await registry(['big'])
     const r = await reg.execute('big', {}, sig())
     expect(r.ok).toBe(true)
     expect(r.truncated).toBe(true)
     expect(Buffer.byteLength(r.content)).toBeLessThanOrEqual(TOOL_OUTPUT_LIMIT)
+    expect(r.fullContent).toHaveLength(40_000)
   })
 
   it('renders non-text content as a placeholder', async () => {
@@ -144,4 +145,22 @@ describe('connectStdioRegistry', () => {
     ).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(RegistryError)
   }, 20_000)
+
+  it('kills a child that never speaks MCP when the signal aborts', async () => {
+    const { connectStdioRegistry } = await import('../src/tools/registry.js')
+    const { mkdtempSync, readFileSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const pidFile = join(mkdtempSync(join(tmpdir(), 'harness-pid-')), 'pid')
+    const script = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`
+    const started = Date.now()
+    const err = await connectStdioRegistry({ command: process.execPath, args: ['-e', script] }, ['echo'], AbortSignal.timeout(300)).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect(Date.now() - started).toBeLessThan(1500)
+    const pid = Number(readFileSync(pidFile, 'utf8'))
+    await new Promise((r) => setTimeout(r, 200))
+    const alive = (() => { try { process.kill(pid, 0); return true } catch { return false } })()
+    if (alive) process.kill(pid, 'SIGKILL')
+    expect(alive).toBe(false)
+  }, 10_000)
 })

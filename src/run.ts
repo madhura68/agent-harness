@@ -9,8 +9,11 @@ import type { ChatMessage, ErrorCode, RunStatus, ToolCall, ToolDef, ToolExecResu
 export type RunDeps = {
   client: ModelClient
   trace: TraceWriter
-  /** Closure bound by the CLI; called ONLY for profile 'tools'. It never exposes expanded secrets to this module. */
-  connectRegistry: () => Promise<ToolRegistry>
+  /**
+   * Closure bound by the CLI; called ONLY for profile 'tools'. It never exposes expanded secrets to this module.
+   * The signal aborts when the run's deadline passes during MCP startup.
+   */
+  connectRegistry: (signal: AbortSignal) => Promise<ToolRegistry>
   now?: () => number
   /** Recorded on run_start when the CLI bypassed the probe gate. */
   probeSkipped?: boolean
@@ -19,6 +22,26 @@ export type RunDeps = {
 type Terminal = { status: RunStatus; answer?: string; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex')
+
+/** Resolves with the connected registry, or rejects when the signal aborts first; a late registry is closed. */
+function connectWithin(connect: Promise<ToolRegistry>, signal: AbortSignal): Promise<ToolRegistry> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new Error('MCP startup exceeded the deadline'))
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+    connect.then(
+      (reg) => {
+        signal.removeEventListener('abort', onAbort)
+        if (signal.aborted) void reg.close().catch(() => undefined)
+        else resolve(reg)
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err)
+      },
+    )
+  })
+}
 
 export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<RunResult> {
   const now = deps.now ?? Date.now
@@ -53,11 +76,13 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
 
   const loop = async (): Promise<Terminal> => {
     if (manifest.profile === 'tools') {
+      const connectSignal = AbortSignal.timeout(Math.max(1, deadline - now()))
       try {
-        registry = await deps.connectRegistry()
+        registry = await connectWithin(deps.connectRegistry(connectSignal), connectSignal)
       } catch (err) {
-        if (err instanceof RegistryError) return { status: 'failed', error: { code: 'TOOL_NOT_AVAILABLE', message: err.message } }
-        throw err
+        if (connectSignal.aborted || now() >= deadline) return { status: 'timed_out' }
+        const message = err instanceof RegistryError ? err.message : `MCP server unavailable: ${err instanceof Error ? err.message : String(err)}`
+        return { status: 'failed', error: { code: 'TOOL_NOT_AVAILABLE', message } }
       }
       policy = createPolicy(registry.snapshot)
       snapshotHash = registry.snapshot.hash
@@ -106,7 +131,11 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
 
       // Assign unique call ids: the model may omit them or repeat them.
       const calls = res.message.toolCalls.map((c, i) => {
-        const id = c.id && !seenCallIds.has(c.id) ? c.id : `call_${turns}_${i}`
+        let id = c.id
+        if (!id || seenCallIds.has(id)) {
+          id = `call_${turns}_${i}`
+          for (let n = 1; seenCallIds.has(id); n++) id = `call_${turns}_${i}_${n}`
+        }
         seenCallIds.add(id)
         return { ...c, id }
       })
@@ -138,11 +167,13 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
     }
   }
 
+  // Spec §7: tools/<callId>.txt holds the full content; the model only ever sees the truncated text.
   const recordToolResult = (callId: string, r: ToolExecResult) => {
-    trace.toolContent(callId, r.content)
+    const full = r.fullContent ?? r.content
+    trace.toolContent(callId, full)
     trace.event({
       type: 'tool_result', callId, ok: r.ok, ...(r.errorCode ? { errorCode: r.errorCode } : {}),
-      truncated: r.truncated, sha256: sha256(r.content), bytes: Buffer.byteLength(r.content),
+      truncated: r.truncated, sha256: sha256(full), bytes: Buffer.byteLength(full),
     })
   }
 
