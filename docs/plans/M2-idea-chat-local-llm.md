@@ -264,11 +264,14 @@ export type ClaimResult =
   | { type: 'job'; jobId: string; kind: string; payload: unknown }
   | { type: 'error'; message: string }      // server gaf een toolfout; de verbinding is gezond
   | { type: 'broken'; message: string }     // SDK/transport faalde; verbinding kapot of een handler loopt mogelijk nog
+  | { type: 'stopped' }                     // het meegegeven signaal (Ctrl-C) is afgegaan
 export interface ControlChannel {
   waitForJob(waitSeconds: number, signal: AbortSignal): Promise<ClaimResult>
     // client.callTool({ name: 'wait_for_job', arguments: { wait_seconds } }, undefined, { timeout: (waitSeconds + 30) * 1000, signal })
     // — zonder die timeout breekt de SDK na 60 s af (DEFAULT_REQUEST_TIMEOUT_MSEC). Parse content[0].text als JSON:
-    // {status:'timeout'} ⇒ timeout; isError (server-toolfout) ⇒ error; SDK-/transportrejectie (McpError RequestTimeout, "Not connected", verbinding dicht) ⇒ broken
+    // Eerst: signal.aborted ⇒ stopped (SDK 1.30.1 levert een abort via het signaal af als McpError RequestTimeout,
+    // niet te onderscheiden van een echte timeout). Daarna: {status:'timeout'} ⇒ timeout; isError (server-toolfout) ⇒ error;
+    // SDK-/transportrejectie (McpError RequestTimeout, "Not connected", verbinding dicht) ⇒ broken
   heartbeat(jobId: string): Promise<boolean>                                   // tool job_heartbeat; false bij isError (eigendom kwijt / job terminaal)
   updateStatus(jobId: string, input: { status: 'running' | 'done' | 'failed'; summary?: string; error?: string;
     model_id?: string; input_tokens?: number; output_tokens?: number }): Promise<{ ok: boolean; message?: string }>
@@ -299,7 +302,7 @@ export async function runOneJob(deps: WorkerDeps, claim: Extract<ClaimResult, { 
 4. Bouw een in-memory `Manifest` (`id: runId` met `runId = 'job-' + jobId + '-' + Date.now()` — alleen kleine letters, cijfers en streepjes, dus binnen de manifest-grammatica `^[a-z0-9][a-z0-9-]{0,79}$`, zodat een na lease-verloop opnieuw geclaimde job niet op `openTrace` ("run dir already exists") strandt, `profile: 'tools'`, `system: IDEA_CHAT_SYSTEM_PROMPT`, `prompt: renderIdeaChatUserMessage(p)`, `model: config.model`, `tools: { server: { command: 'shared', args: [] }, allow: config.allow }`, `limits: config.limits`) en draai `runManifest(manifest, { client: modelClient, trace: openTrace(out, runId), connectRegistry: () => registryView() })`. `RunDeps` krijgt ook een optioneel `runStartExtra?: { jobId: string; ideaId: string }` dat `runManifest` als veld `job` aan het `run_start`-event toevoegt (spec §4.3); het `TraceEvent`-type voor `run_start` krijgt `job?: { jobId: string; ideaId: string }`.
    `RunDeps` krijgt een optioneel `signal?: AbortSignal` (Modify `src/run.ts`). `runManifest` combineert het met de deadline (`AbortSignal.any([deadlineSignal, deps.signal])`) voor elke model- en toolaanroep en controleert het aan het begin van elke beurt en vóór elke toolcall; bij abort eindigt de run als `failed` met `error: { code: 'HARNESS_ERROR', message: 'aborted' }`, zonder verdere model- of toolaanroep. De worker geeft een interne `AbortController` mee die afgaat bij Ctrl-C én bij een mislukte heartbeat. Test in `__tests__/run-answer.test.ts`: abort tijdens een trage modelbeurt ⇒ `failed`/`HARNESS_ERROR` binnen 500 ms, precies één request.
 5. Afronding in `finally`, tabel uit spec §4.2: `completed` + `answer.trim() !== ''` ⇒ `done` met `summary = truncate(answer, 4000, '\n\n_[antwoord afgekapt]_')`, `model_id = result.model.reported ?? config.model.name`, tokens alleen als `usage.source === 'provider_reported'`; lege trim ⇒ `failed` "leeg antwoord van <model>" (Review Focus 2); andere status ⇒ `failed` "`<status>: <code> <message>`" ≤ 2000; exception ⇒ `failed` "harness: <message>"; Ctrl-C ⇒ `failed` "worker gestopt"; `abandoned` ⇒ geen aanroep (Review Focus 4). `updateStatus` met `ok: false` ⇒ loggen, geen retry (Review Focus 5).
-6. `runWorker`: lus `waitForJob`; `timeout` ⇒ opnieuw (bij `once`: stop met exit 0); `error` ⇒ loggen, opnieuw (bij `once`: stop met exit 1) (Review Focus 3); `broken` ⇒ loggen dat de uitkomst van een eventueel lopende claim onbekend is (een geclaimde job herstelt via de lease-reset van 5 minuten), géén nieuwe `waitForJob` op deze verbinding, stop met exit 1 — de CLI sluit het kindproces in zijn `finally`. Geen automatische herverbinding in dit increment; `job` ⇒ `runOneJob`, daarna bij `once` stoppen (exit 0 bij `done`, anders 1). Ctrl-C tussen jobs ⇒ netjes stoppen, exit 0.
+6. `runWorker`: lus `waitForJob`; `timeout` ⇒ opnieuw (bij `once`: stop met exit 0); `error` ⇒ loggen, opnieuw (bij `once`: stop met exit 1) (Review Focus 3); `stopped` ⇒ netjes stoppen, exit 0; `broken` ⇒ loggen dat de uitkomst van een eventueel lopende claim onbekend is (een geclaimde job herstelt via de lease-reset van 5 minuten), géén nieuwe `waitForJob` op deze verbinding, stop met exit 1 — de CLI sluit het kindproces in zijn `finally`. Geen automatische herverbinding in dit increment; `job` ⇒ `runOneJob`, daarna bij `once` stoppen (exit 0 bij `done`, anders 1). Ctrl-C tussen jobs ⇒ netjes stoppen, exit 0.
 
 **Fake scrum4me-MCP (`__tests__/fakes/fake-scrum4me-mcp.ts`):** `McpServer` met `wait_for_job` (speelt een script van claims af: `{ timeout } | { job: payload } | { error }`), `job_heartbeat` (antwoordt volgens een instelbare vlag), `update_job_status` (legt alle aanroepen vast, kan een fout teruggeven), en de vier doc-tools (vaste teksten). `InMemoryTransport`. Retourneert `{ client, calls: { name, args }[] }`. Payloads bouw je met een helper `ideaChatPayload(overrides)` in de vorm van de echte IDEA_CHAT-tak.
 
@@ -309,7 +312,8 @@ export async function runOneJob(deps: WorkerDeps, claim: Extract<ClaimResult, { 
 - coalescing-payload (`[USER A, USER B, ASSISTANT A]`, `pending = [B]`) ⇒ wordt beantwoord (`done`), het modelverzoek bevat B onder `## Te beantwoorden`;
 - `update_job_status(running)` geeft een fout ⇒ `abandoned`, geen modelverzoek, geen `done`/`failed`;
 - dezelfde job twee keer geclaimd in één `out`-map ⇒ beide beurten leveren een resultaat (geen "run dir already exists");
-- `waitForJob` geeft `callTool` een `timeout` ≥ `(waitSeconds + 30) * 1000` en het signaal mee (spy op `client.callTool`); een SDK-rejectie wordt `{ type: 'error' }`, een `{status:'timeout'}`-payload `{ type: 'timeout' }`;
+- `waitForJob` geeft `callTool` een `timeout` ≥ `(waitSeconds + 30) * 1000` en het signaal mee (spy op `client.callTool`); een SDK-rejectie wordt `{ type: 'broken' }`, een server-`isError` `{ type: 'error' }`, een `{status:'timeout'}`-payload `{ type: 'timeout' }`;
+- signaal afbreken terwijl de fake-`wait_for_job`-handler nog wacht ⇒ `stopped`, exit 0, geen `broken`-logregel, precies één `callTool`;
 - model roept `search_product_docs` aan en antwoordt daarna ⇒ `done`; de doc-tool staat in `calls`;
 - model roept `update_job_status` aan ⇒ `UNKNOWN_TOOL` in de trace; de fake ontvangt geen `update_job_status` van het model (alleen de twee van de harness);
 - `timed_out` (modelvertraging > `maxWallSeconds: 1`) ⇒ `failed` met `error` die met `timed_out:` begint;
@@ -320,8 +324,8 @@ export async function runOneJob(deps: WorkerDeps, claim: Extract<ClaimResult, { 
 - heartbeat-vlag op `false` tijdens een trage modelbeurt ⇒ `abandoned`, geen `done`/`failed` (Review Focus 4);
 - `update_job_status` geeft een fout bij `done` ⇒ gelogd, `runWorker` geeft toch een resultaat terug (Review Focus 5);
 - `wait_for_job` toolfout met `once` ⇒ exit 1; zonder `once` gevolgd door een job ⇒ die job wordt uitgevoerd (Review Focus 3);
-- gesloten client (de fake-verbinding vóór `waitForJob` dichtgedaan) ⇒ `broken`, precies één `callTool`-poging, `runWorker` keert terug met exit 1;
-- request-timeout terwijl de fake-handler nog loopt (korte timeout in de test) ⇒ `broken`, geen tweede `wait_for_job` op die verbinding;
+- gesloten client (de fake-verbinding vóór `waitForJob` dichtgedaan), met `once: false` ⇒ `broken`, precies één `callTool`-poging, `runWorker` keert terug met exit 1;
+- request-timeout terwijl de fake-handler nog loopt (korte timeout in de test), met `once: false` ⇒ `broken`, geen tweede `wait_for_job` op die verbinding, exit 1;
 - abort van `signal` tijdens een beurt ⇒ `failed` "worker gestopt";
 - antwoord van 5000 tekens ⇒ `summary` ≤ 4000 en eindigt op de afkapmarkering;
 - `run_start` in de run-dir bevat `job: { jobId, ideaId }`;
@@ -437,3 +441,17 @@ Fixes ronde 1: codex "held" op product-id, workspace/gates en de minors; "partia
 - **MINOR (codex + claude), convergent — run-id.** Spec §4.2 noemde nog `job-<jobId>`; de voorbeeldstempel viel buiten de manifest-grammatica. Remedie: `job-<jobId>-<epoch-ms>` in spec §4.2/§4.3 en plan.
 
 **Scope-delta:** geen nieuw werk buiten bestaande taken; één extra `ClaimResult`-variant en twee tests in Taak 5, één reject-test in Taak 2. Eerste bruikbare resultaat en praktijkproeven ongewijzigd.
+
+### Ronde 3 — 2026-09-26, plan rev 3 (`b9080d5`), mac:codex + mac:claude — **dubbel GO**
+
+| Reviewer | BLOCKER | MAJOR | MINOR | Verdict |
+|---|---|---|---|---|
+| mac:codex | 0 | 0 | 1 | GO |
+| mac:claude | 0 | 0 | 1 | GO |
+
+Alle drie ronde-2-fixes door beide reviewers "held" verklaard. De twee minors zijn na de GO als testcorrecties verwerkt (rev 4), exact volgens de voorgestelde fix; ze wijzigen geen gedrag of scope:
+
+- **MINOR (claude) — Ctrl-C tijdens `wait_for_job` wordt als `broken` geclassificeerd.** SDK 1.30.1 levert een signaal-abort af als `McpError(RequestTimeout)` (`shared/protocol.js` ~684/710). Remedie: eerst `signal.aborted` ⇒ nieuwe variant `stopped` ⇒ exit 0; één test.
+- **MINOR (codex) — verouderde testregel en once-modus.** Remedie: SDK-rejectie ⇒ `broken` in de testregel; de twee kapotte-verbindingstests draaien met `once: false`.
+
+**Scope-delta over de hele loop:** +1 additief payloadveld in scrum4me-mcp (`chat.pending_user_message_ids`); `ClaimResult` +2 varianten (`broken`, `stopped`); extra tests binnen bestaande taken; −1 geheugenstap. Eerste bruikbare resultaat, acceptatie en praktijkproeven ongewijzigd. Technisch GO autoriseert geen uitvoering, merge of uitrol.
