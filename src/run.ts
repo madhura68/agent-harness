@@ -17,11 +17,17 @@ export type RunDeps = {
   now?: () => number
   /** Recorded on run_start when the CLI bypassed the probe gate. */
   probeSkipped?: boolean
+  /** External stop (worker: Ctrl-C or lost job ownership). Ends the run as failed/HARNESS_ERROR 'aborted'. */
+  signal?: AbortSignal
+  /** Worker context recorded on run_start as `job`. */
+  runStartExtra?: { jobId: string; ideaId: string }
 }
 
 type Terminal = { status: RunStatus; answer?: string; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex')
+
+const ABORTED: Terminal = { status: 'failed', error: { code: 'HARNESS_ERROR', message: 'aborted' } }
 
 /** Resolves with the connected registry, or rejects when the signal aborts first; a late registry is closed. */
 function connectWithin(connect: Promise<ToolRegistry>, signal: AbortSignal): Promise<ToolRegistry> {
@@ -49,6 +55,13 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   const started = now()
   const deadline = started + limits.maxWallSeconds * 1000
   const { trace, client } = deps
+  const external = deps.signal
+  const aborted = () => external?.aborted === true
+  // The deadline and the external stop, as one signal for every model and tool call.
+  const within = (ms: number) => {
+    const timeout = AbortSignal.timeout(Math.max(1, ms))
+    return external ? AbortSignal.any([timeout, external]) : timeout
+  }
 
   let turns = 0
   let toolCalls = 0
@@ -63,7 +76,11 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   let policy: Policy | undefined
   const seenCallIds = new Set<string>()
 
-  trace.event({ type: 'run_start', manifest: redactManifest(manifest), ...(deps.probeSkipped ? { probeSkipped: true } : {}) })
+  trace.event({
+    type: 'run_start', manifest: redactManifest(manifest),
+    ...(deps.probeSkipped ? { probeSkipped: true } : {}),
+    ...(deps.runStartExtra ? { job: deps.runStartExtra } : {}),
+  })
 
   const executeCall = async (call: ToolCall, signal: AbortSignal): Promise<ToolExecResult> => {
     if (!registry || !policy) {
@@ -76,10 +93,12 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
 
   const loop = async (): Promise<Terminal> => {
     if (manifest.profile === 'tools') {
-      const connectSignal = AbortSignal.timeout(Math.max(1, deadline - now()))
+      if (aborted()) return ABORTED
+      const connectSignal = within(deadline - now())
       try {
         registry = await connectWithin(deps.connectRegistry(connectSignal), connectSignal)
       } catch (err) {
+        if (aborted()) return ABORTED
         if (connectSignal.aborted || now() >= deadline) return { status: 'timed_out' }
         const message = err instanceof RegistryError ? err.message : `MCP server unavailable: ${err instanceof Error ? err.message : String(err)}`
         return { status: 'failed', error: { code: 'TOOL_NOT_AVAILABLE', message } }
@@ -94,6 +113,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
     messages.push({ role: 'user', content: manifest.prompt })
 
     for (;;) {
+      if (aborted()) return ABORTED
       if (turns + 1 > limits.maxTurns) return { status: 'budget_exceeded' }
       if (now() >= deadline) return { status: 'timed_out' }
       const maxTokens = limits.maxOutputTokens - outputTokens
@@ -101,11 +121,12 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       turns++
 
       trace.event({ type: 'model_request', turn: turns, messages: messages.length, tools: tools.length, maxTokens })
-      const signal = AbortSignal.timeout(Math.max(1, deadline - now()))
+      const signal = within(deadline - now())
       let res
       try {
         res = await client.complete(messages, { signal, maxTokens, tools })
       } catch (err) {
+        if (aborted()) return ABORTED
         if (signal.aborted || now() >= deadline) return { status: 'timed_out' }
         if (err instanceof ModelError) return { status: 'failed', error: { code: 'MODEL_ERROR', message: err.message } }
         throw err
@@ -142,11 +163,16 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       messages.push({ role: 'assistant', content: res.message.content, tool_calls: calls })
 
       for (const call of calls) {
+        if (aborted()) return ABORTED
         if (now() >= deadline) return { status: 'timed_out' }
         toolCalls++
         trace.event({ type: 'tool_call', callId: call.id, name: call.name, arguments: call.arguments, argumentsWasObject: call.argumentsWasObject })
-        const toolSignal = AbortSignal.timeout(Math.max(1, deadline - now()))
+        const toolSignal = within(deadline - now())
         const r = await executeCall(call, toolSignal)
+        if (r.errorCode === 'TOOL_TIMEOUT' && aborted()) {
+          recordToolResult(call.id, r)
+          return ABORTED
+        }
         if (r.errorCode === 'TOOL_TIMEOUT' && (toolSignal.aborted || now() >= deadline)) {
           recordToolResult(call.id, r)
           return { status: 'timed_out' }

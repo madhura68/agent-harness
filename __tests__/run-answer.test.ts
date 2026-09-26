@@ -158,3 +158,51 @@ describe('harness run CLI', () => {
     expect(again.stderr).toMatch(/already exists/)
   })
 })
+
+describe('runManifest with an external abort signal', () => {
+  it('stops a slow model turn within 500 ms as failed/HARNESS_ERROR, with exactly one request', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'te laat' }), delayMs: 5000 }])
+    const m = manifest(fake.baseUrl)
+    const trace = openTrace(tmp('run'), m.id)
+    const controller = new AbortController()
+    setTimeout(() => controller.abort(), 100)
+    const started = Date.now()
+    const result = await runManifest(m, {
+      client: createModelClient({ baseUrl: m.model.baseUrl, name: m.model.name }),
+      trace,
+      connectRegistry: async () => { throw new Error('unused') },
+      signal: controller.signal,
+    })
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(result.status).toBe('failed')
+    expect(result.error).toEqual({ code: 'HARNESS_ERROR', message: 'aborted' })
+    expect(fake.requests).toHaveLength(1)
+  })
+
+  it('makes no model call when the signal is already aborted', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'nee' }) }])
+    const m = manifest(fake.baseUrl)
+    const trace = openTrace(tmp('run'), m.id)
+    const result = await runManifest(m, {
+      client: createModelClient({ baseUrl: m.model.baseUrl, name: m.model.name }),
+      trace,
+      connectRegistry: async () => { throw new Error('unused') },
+      signal: AbortSignal.abort(),
+    })
+    expect(result.error).toEqual({ code: 'HARNESS_ERROR', message: 'aborted' })
+    expect(fake.requests).toHaveLength(0)
+  })
+
+  it('records runStartExtra as job on run_start', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'ok' }) }])
+    const m = manifest(fake.baseUrl)
+    const trace = openTrace(tmp('run'), m.id)
+    await runManifest(m, {
+      client: createModelClient({ baseUrl: m.model.baseUrl, name: m.model.name }),
+      trace,
+      connectRegistry: async () => { throw new Error('unused') },
+      runStartExtra: { jobId: 'job1', ideaId: 'idea1' },
+    })
+    expect(readTrace(trace.dir)[0]).toMatchObject({ type: 'run_start', job: { jobId: 'job1', ideaId: 'idea1' } })
+  })
+})

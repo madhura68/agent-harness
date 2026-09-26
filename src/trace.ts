@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import type { ErrorCode, RunStatus, ToolCall, Usage } from './types.js'
 
 export type TraceEvent =
-  | { type: 'run_start'; manifest: unknown; probeSkipped?: boolean } // manifest after redactManifest
+  | { type: 'run_start'; manifest: unknown; probeSkipped?: boolean; job?: { jobId: string; ideaId: string } } // manifest after redactManifest
   | { type: 'tool_snapshot'; names: string[]; hash: string }
   | { type: 'model_request'; turn: number; messages: number; tools: number; maxTokens: number }
   | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage }
