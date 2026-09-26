@@ -129,11 +129,14 @@ Voeg bij de `localLlmOnly`-tak een commentaar toe in de stijl van de M17/M19-com
 
 ```ts
 // wait-for-job.ts, IDEA_CHAT-tak, naast de history-query
+// Géén .catch: een mislukte lookup is iets anders dan "geen DONE-job" en mag nooit een gegokte
+// pending-lijst opleveren (dan zou het model al beantwoorde berichten opnieuw beantwoorden). De fout
+// loopt door naar de bestaande foutroute van de contextopbouw in wait_for_job.
 const lastDone = await prisma.claudeJob.findFirst({
   where: { idea_id: idea.id, kind: 'IDEA_CHAT', status: 'DONE', id: { not: job.id } },
   orderBy: [{ finished_at: 'desc' }, { id: 'desc' }],
   select: { chat_cutoff_at: true, chat_cutoff_message_id: true, created_at: true },
-}).catch(() => null)
+})
 const prevAt = lastDone ? (lastDone.chat_cutoff_at ?? lastDone.created_at) : null
 const prevId = lastDone?.chat_cutoff_message_id ?? ''
 // pending = USER-berichten in history met (created_at, id) > (prevAt, prevId); geen lastDone ⇒ alle USER-berichten
@@ -149,7 +152,7 @@ required_capability: true,
 ```
 
 **Stappen:**
-- [ ] Test in `wait-for-job-idea-chat-context.test.ts` (bestaande mock-stijl volgen): history `[USER A (t1), USER B (t2), ASSISTANT A (t3)]`, laatste DONE-job met cutoff = USER A ⇒ `pending_user_message_ids = [B]`; geen DONE-job ⇒ `[A, B]`; laatste DONE-job met cutoff = ASSISTANT A en geen latere USER ⇒ `[]`.
+- [ ] Test in `wait-for-job-idea-chat-context.test.ts`: voeg `findFirst: vi.fn().mockResolvedValue(null)` toe aan de `claudeJob`-mock (die heeft nu alleen `findUnique`; zonder deze regel falen de bestaande gevallen). History `[USER A (t1), USER B (t2), ASSISTANT A (t3)]`, laatste DONE-job met cutoff = USER A ⇒ `pending_user_message_ids = [B]`; geen DONE-job ⇒ `[A, B]`; laatste DONE-job met cutoff = ASSISTANT A en geen latere USER ⇒ `[]`; `findFirst` rejectt ⇒ de contextopbouw faalt (geen payload met een pending-lijst).
 - [ ] Test in `update-job-status-idea-chat.test.ts`, naar het model van "done + USER-bericht ná de cutoff → precies één vervolg-job": met `findUnique` → `{ ..., required_capability: 'local_llm' }` verwacht `claudeJob.create` met `data` inclusief `required_capability: 'local_llm'`. Idem voor het `failed`-pad (coalescing draait daar ook).
 - [ ] Bestaande test ongewijzigd laten: zonder capability blijft `data` exact zonder `required_capability`.
 - [ ] Run ⇒ FAIL; implementeer; run ⇒ PASS; `npm run typecheck && npm test` ⇒ groen.
@@ -259,12 +262,13 @@ Bronvorm van de payload: `scrum4me-mcp/src/tools/wait-for-job.ts`, IDEA_CHAT-tak
 export type ClaimResult =
   | { type: 'timeout' }
   | { type: 'job'; jobId: string; kind: string; payload: unknown }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string }      // server gaf een toolfout; de verbinding is gezond
+  | { type: 'broken'; message: string }     // SDK/transport faalde; verbinding kapot of een handler loopt mogelijk nog
 export interface ControlChannel {
   waitForJob(waitSeconds: number, signal: AbortSignal): Promise<ClaimResult>
     // client.callTool({ name: 'wait_for_job', arguments: { wait_seconds } }, undefined, { timeout: (waitSeconds + 30) * 1000, signal })
     // — zonder die timeout breekt de SDK na 60 s af (DEFAULT_REQUEST_TIMEOUT_MSEC). Parse content[0].text als JSON:
-    // {status:'timeout'} ⇒ timeout; isError ⇒ error met de tekst; SDK-/transportrejectie (McpError RequestTimeout, verbinding dicht) ⇒ error met de melding
+    // {status:'timeout'} ⇒ timeout; isError (server-toolfout) ⇒ error; SDK-/transportrejectie (McpError RequestTimeout, "Not connected", verbinding dicht) ⇒ broken
   heartbeat(jobId: string): Promise<boolean>                                   // tool job_heartbeat; false bij isError (eigendom kwijt / job terminaal)
   updateStatus(jobId: string, input: { status: 'running' | 'done' | 'failed'; summary?: string; error?: string;
     model_id?: string; input_tokens?: number; output_tokens?: number }): Promise<{ ok: boolean; message?: string }>
@@ -292,15 +296,15 @@ export async function runOneJob(deps: WorkerDeps, claim: Extract<ClaimResult, { 
 1. `kind !== 'IDEA_CHAT'` ⇒ `updateStatus(failed, error: "kind <X> niet ondersteund door agent-harness")` ⇒ `failed`.
 2. Payload parse faalt ⇒ `failed` met `error: "payload ongeldig: <zod-melding>"`. `pendingUserMessages(p)` leeg ⇒ `failed` met `error: "geen onbeantwoord USER-bericht"` (Review Focus 1).
 3. `updateStatus(running)`; geeft die `ok: false`, dan is de job niet (meer) van deze worker ⇒ `abandoned`, geen modelaanroep. Anders start `setInterval(heartbeat, heartbeatMs)`; een `false` van `heartbeat` aborteert een interne `AbortController` en markeert de job `abandoned`.
-4. Bouw een in-memory `Manifest` (`id: runId` met `runId = 'job-' + jobId + '-' + compacte ISO-claimtijd` (bv. `20260926T101500Z`), zodat een na lease-verloop opnieuw geclaimde job niet op `openTrace` ("run dir already exists") strandt, `profile: 'tools'`, `system: IDEA_CHAT_SYSTEM_PROMPT`, `prompt: renderIdeaChatUserMessage(p)`, `model: config.model`, `tools: { server: { command: 'shared', args: [] }, allow: config.allow }`, `limits: config.limits`) en draai `runManifest(manifest, { client: modelClient, trace: openTrace(out, runId), connectRegistry: () => registryView() })`. `RunDeps` krijgt ook een optioneel `runStartExtra?: { jobId: string; ideaId: string }` dat `runManifest` als veld `job` aan het `run_start`-event toevoegt (spec §4.3); het `TraceEvent`-type voor `run_start` krijgt `job?: { jobId: string; ideaId: string }`.
+4. Bouw een in-memory `Manifest` (`id: runId` met `runId = 'job-' + jobId + '-' + Date.now()` — alleen kleine letters, cijfers en streepjes, dus binnen de manifest-grammatica `^[a-z0-9][a-z0-9-]{0,79}$`, zodat een na lease-verloop opnieuw geclaimde job niet op `openTrace` ("run dir already exists") strandt, `profile: 'tools'`, `system: IDEA_CHAT_SYSTEM_PROMPT`, `prompt: renderIdeaChatUserMessage(p)`, `model: config.model`, `tools: { server: { command: 'shared', args: [] }, allow: config.allow }`, `limits: config.limits`) en draai `runManifest(manifest, { client: modelClient, trace: openTrace(out, runId), connectRegistry: () => registryView() })`. `RunDeps` krijgt ook een optioneel `runStartExtra?: { jobId: string; ideaId: string }` dat `runManifest` als veld `job` aan het `run_start`-event toevoegt (spec §4.3); het `TraceEvent`-type voor `run_start` krijgt `job?: { jobId: string; ideaId: string }`.
    `RunDeps` krijgt een optioneel `signal?: AbortSignal` (Modify `src/run.ts`). `runManifest` combineert het met de deadline (`AbortSignal.any([deadlineSignal, deps.signal])`) voor elke model- en toolaanroep en controleert het aan het begin van elke beurt en vóór elke toolcall; bij abort eindigt de run als `failed` met `error: { code: 'HARNESS_ERROR', message: 'aborted' }`, zonder verdere model- of toolaanroep. De worker geeft een interne `AbortController` mee die afgaat bij Ctrl-C én bij een mislukte heartbeat. Test in `__tests__/run-answer.test.ts`: abort tijdens een trage modelbeurt ⇒ `failed`/`HARNESS_ERROR` binnen 500 ms, precies één request.
 5. Afronding in `finally`, tabel uit spec §4.2: `completed` + `answer.trim() !== ''` ⇒ `done` met `summary = truncate(answer, 4000, '\n\n_[antwoord afgekapt]_')`, `model_id = result.model.reported ?? config.model.name`, tokens alleen als `usage.source === 'provider_reported'`; lege trim ⇒ `failed` "leeg antwoord van <model>" (Review Focus 2); andere status ⇒ `failed` "`<status>: <code> <message>`" ≤ 2000; exception ⇒ `failed` "harness: <message>"; Ctrl-C ⇒ `failed` "worker gestopt"; `abandoned` ⇒ geen aanroep (Review Focus 4). `updateStatus` met `ok: false` ⇒ loggen, geen retry (Review Focus 5).
-6. `runWorker`: lus `waitForJob`; `timeout` ⇒ opnieuw (bij `once`: stop met exit 0); `error` ⇒ loggen, opnieuw (bij `once`: stop met exit 1) (Review Focus 3); `job` ⇒ `runOneJob`, daarna bij `once` stoppen (exit 0 bij `done`, anders 1). Ctrl-C tussen jobs ⇒ netjes stoppen, exit 0.
+6. `runWorker`: lus `waitForJob`; `timeout` ⇒ opnieuw (bij `once`: stop met exit 0); `error` ⇒ loggen, opnieuw (bij `once`: stop met exit 1) (Review Focus 3); `broken` ⇒ loggen dat de uitkomst van een eventueel lopende claim onbekend is (een geclaimde job herstelt via de lease-reset van 5 minuten), géén nieuwe `waitForJob` op deze verbinding, stop met exit 1 — de CLI sluit het kindproces in zijn `finally`. Geen automatische herverbinding in dit increment; `job` ⇒ `runOneJob`, daarna bij `once` stoppen (exit 0 bij `done`, anders 1). Ctrl-C tussen jobs ⇒ netjes stoppen, exit 0.
 
 **Fake scrum4me-MCP (`__tests__/fakes/fake-scrum4me-mcp.ts`):** `McpServer` met `wait_for_job` (speelt een script van claims af: `{ timeout } | { job: payload } | { error }`), `job_heartbeat` (antwoordt volgens een instelbare vlag), `update_job_status` (legt alle aanroepen vast, kan een fout teruggeven), en de vier doc-tools (vaste teksten). `InMemoryTransport`. Retourneert `{ client, calls: { name, args }[] }`. Payloads bouw je met een helper `ideaChatPayload(overrides)` in de vorm van de echte IDEA_CHAT-tak.
 
 **Tests (`__tests__/worker.test.ts`, fake scrum4me-MCP + fake modelserver, `once: true`, `heartbeatMs` klein):**
-- geslaagde beurt ⇒ aanroepen in volgorde `wait_for_job`, `update_job_status(running)`, `update_job_status(done)` met `summary` = modelantwoord, `model_id`, `input_tokens`/`output_tokens`; run-dir `job-<id>-<claimtijd>/result.json` bestaat;
+- geslaagde beurt ⇒ aanroepen in volgorde `wait_for_job`, `update_job_status(running)`, `update_job_status(done)` met `summary` = modelantwoord, `model_id`, `input_tokens`/`output_tokens`; run-dir `job-<id>-<epoch-ms>/result.json` bestaat;
 - het eerste modelverzoek bevat de echte `idea.product_id` uit de payload, en een `search_product_docs`-call van het (gescripte) model met dat id slaagt tegen de fake;
 - coalescing-payload (`[USER A, USER B, ASSISTANT A]`, `pending = [B]`) ⇒ wordt beantwoord (`done`), het modelverzoek bevat B onder `## Te beantwoorden`;
 - `update_job_status(running)` geeft een fout ⇒ `abandoned`, geen modelverzoek, geen `done`/`failed`;
@@ -316,6 +320,8 @@ export async function runOneJob(deps: WorkerDeps, claim: Extract<ClaimResult, { 
 - heartbeat-vlag op `false` tijdens een trage modelbeurt ⇒ `abandoned`, geen `done`/`failed` (Review Focus 4);
 - `update_job_status` geeft een fout bij `done` ⇒ gelogd, `runWorker` geeft toch een resultaat terug (Review Focus 5);
 - `wait_for_job` toolfout met `once` ⇒ exit 1; zonder `once` gevolgd door een job ⇒ die job wordt uitgevoerd (Review Focus 3);
+- gesloten client (de fake-verbinding vóór `waitForJob` dichtgedaan) ⇒ `broken`, precies één `callTool`-poging, `runWorker` keert terug met exit 1;
+- request-timeout terwijl de fake-handler nog loopt (korte timeout in de test) ⇒ `broken`, geen tweede `wait_for_job` op die verbinding;
 - abort van `signal` tijdens een beurt ⇒ `failed` "worker gestopt";
 - antwoord van 5000 tekens ⇒ `summary` ≤ 4000 en eindigt op de afkapmarkering;
 - `run_start` in de run-dir bevat `job: { jobId, ideaId }`;
@@ -409,10 +415,25 @@ Alle bevindingen geverifieerd tegen de bomen (scrum4me-mcp `bef26bf`, Scrum4Me `
 - **MAJOR (codex) — MCP-werkplek en gate niet uitvoerbaar.** Klopt: submodule `vendor/scrum4me-shared`, geen `verify`-script. Remedie: `--recurse-submodules`, controle op schema-generatie, gates per repo in Global Constraints en spec §9.7; Scrum4Me-build via de PR-pipeline als de worktree hem niet kan draaien, expliciet vermeld.
 - **MINOR (codex) — timeout-only isolatieproef.** Remedie: "smoke geslaagd; isolatiebewijs open" en herhalen in Taak 8.
 - **MINOR (codex) — geheugen-update als deliverable.** SCHRAP.
-- **MINOR (claude) — opnieuw geclaimde job strandt op `openTrace`.** Remedie: run-id `job-<id>-<claimtijd>` + test.
+- **MINOR (claude) — opnieuw geclaimde job strandt op `openTrace`.** Remedie: per-claim run-id + test (vorm in ronde 2 vastgezet op `job-<id>-<epoch-ms>`).
 - **MINOR (claude) — welke eligibility-plekken live zijn.** Remedie: alinea in Taak 1, testvolgorde Prisma-variant eerst.
 - **MINOR (claude) — secret-test in het workerpad.** Remedie: test in `cli-worker.test.ts` op run-dir en log.
 - **MINOR (claude) — mislukte `running` moet `abandoned` geven.** Remedie: stap 3 + test.
 - **MINOR (claude) — web-helper leest `process.env`.** Remedie: action geeft `env.IDEA_CHAT_LOCAL_PRODUCT_IDS` door; test mockt `@/lib/env`.
 
 **Scope-delta:** +1 additief payloadveld in scrum4me-mcp (`pending_user_message_ids`, nodig voor criterium 3); overige remedies zijn reparaties binnen bestaande taken; −1 geheugenstap. Eerste bruikbare resultaat en praktijkproeven ongewijzigd.
+
+### Ronde 2 — 2026-09-26, plan rev 2 (`d36052b`), mac:codex + mac:claude
+
+| Reviewer | BLOCKER | MAJOR | MINOR | Verdict |
+|---|---|---|---|---|
+| mac:codex | 0 | 2 | 1 | NO-GO |
+| mac:claude | 0 | 0 | 2 | GO |
+
+Fixes ronde 1: codex "held" op product-id, workspace/gates en de minors; "partially held" op pending-berichten en de long-poll. Claude: alles held, pending-query alleen stilistisch. Alle ronde-2-bevindingen geverifieerd en geaccepteerd.
+
+- **MAJOR (codex) — SDK-/transportfout herhaalt op dezelfde kapotte verbinding.** Klopt: een gesloten SDK-client geeft direct "Not connected"; na een request-timeout kan de server-handler van `wait_for_job` (luistert niet naar het request-signaal) nog lopen. Remedie: nieuwe `ClaimResult`-variant `broken`; `runWorker` stopt dan met exit 1 zonder nieuwe `waitForJob`, de CLI sluit het kind; geen herverbinding. Twee tests. Spec §4.1.
+- **MAJOR (codex) + MINOR (claude), convergent — `lastDone`-lookup met `.catch(() => null)`.** Klopt: een DB-fout werd "geen DONE-job", dus A en B pending en een dubbel antwoord; bovendien gooit de ontbrekende mock-methode synchroon vóór de `.catch`. Remedie: geen catch; een mislukte lookup laat de contextopbouw falen; testmock krijgt `findFirst` (default `null`) en een reject-case. Spec §5.
+- **MINOR (codex + claude), convergent — run-id.** Spec §4.2 noemde nog `job-<jobId>`; de voorbeeldstempel viel buiten de manifest-grammatica. Remedie: `job-<jobId>-<epoch-ms>` in spec §4.2/§4.3 en plan.
+
+**Scope-delta:** geen nieuw werk buiten bestaande taken; één extra `ClaimResult`-variant en twee tests in Taak 5, één reject-test in Taak 2. Eerste bruikbare resultaat en praktijkproeven ongewijzigd.
