@@ -9,7 +9,7 @@ export type TraceEvent =
   | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage }
   | { type: 'tool_call'; callId: string; name: string; arguments: string; argumentsWasObject: boolean }
   | { type: 'tool_result'; callId: string; ok: boolean; errorCode?: ErrorCode; truncated: boolean; sha256: string; bytes: number }
-  | { type: 'run_end'; status: RunStatus; error?: { code: ErrorCode; message: string } }
+  | { type: 'run_end'; status: RunStatus; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 // Exact spec §4.
 export type RunResult = {

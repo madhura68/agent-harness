@@ -1,0 +1,19 @@
+{
+  "runId": "answer-smoke",
+  "status": "completed",
+  "answer": "Een Scrum-sprint is een vaste periode van twee tot vier weken waarin het Scrum-team een werkend productitem ontwikkelt. Tijdens de sprint wordt het werk opgedeeld in taken die worden afgerond binnen de sprintduur, en wordt er een potentiël bepaalde productuitvoer geleverd. De sprint eindigt met een review en een retrospective waarin het team de voortgang bespreekt en verbeteringen identificeert.",
+  "model": {
+    "name": "qwen3-coder:30b",
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "reported": "qwen3-coder:30b"
+  },
+  "usage": {
+    "source": "provider_reported",
+    "inputTokens": 23,
+    "outputTokens": 110,
+    "turns": 1,
+    "toolCalls": 0,
+    "toolErrors": 0
+  },
+  "durationMs": 4440
+}

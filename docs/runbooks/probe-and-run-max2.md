@@ -48,3 +48,17 @@ Resultaat (`runs/probe-qwen3-coder-30b/probe.json`, kopie in [evidence/probe-qwe
 3. Het model doet betrouwbare toolcalls: verdict `reliable`. Increment 3 mag dit model gebruiken.
 
 Opvallend: bij een toolcall is `content` een lege string, niet `null`.
+
+## Increment 2 — `harness run`, profiel `answer`
+
+```bash
+npm run dev -- run examples/answer.json --out runs/
+```
+
+Resultaat: **`completed`**, exit 0, 1 beurt, tokens in/uit 23/110 met `usage.source = provider_reported`, 4,4 s. Volledige `result.json` en `trace.jsonl` staan in [evidence/answer-smoke.result.json](evidence/answer-smoke.result.json) en [evidence/answer-smoke.trace.jsonl](evidence/answer-smoke.trace.jsonl).
+
+De trace bevat vier events in deze volgorde: `run_start` (manifest zonder `apiKey`), `model_request` (1 bericht, 0 tools, `maxTokens` 512), `model_response` (`finishReason: stop`) en `run_end`.
+
+Het antwoord is inhoudelijk redelijk. De zin "een potentiël bepaalde productuitvoer" is kromme taal van het model, geen harnessfout.
+
+Een run-id is eenmalig: `runs/<id>/` bestaat na de eerste run, dus een tweede run met hetzelfde manifest weigert. Verwijder de map of kies een andere `id` om opnieuw te draaien.

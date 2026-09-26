@@ -3,8 +3,12 @@ import { mkdirSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
+import { loadManifest, ManifestError } from './manifest.js'
 import { createModelClient } from './model-client.js'
 import { probeDir, runProbe } from './probe.js'
+import { runManifest } from './run.js'
+import { openTrace } from './trace.js'
+import type { ToolRegistry } from './types.js'
 
 const USAGE = `harness — agent-harness v0
 
@@ -59,6 +63,25 @@ async function cmdProbe(values: Values): Promise<number> {
   return result.tool_calling === 'reliable' ? 0 : 1
 }
 
+async function cmdRun(values: Values, manifestPath: string | undefined): Promise<number> {
+  if (!manifestPath) throw new UsageError('run needs a manifest path')
+  const manifest = loadManifest(manifestPath)
+  const trace = openTrace(values.out ?? 'runs', manifest.id)
+  const client = createModelClient({ baseUrl: manifest.model.baseUrl, name: manifest.model.name, apiKey: manifest.model.apiKey })
+  const connectRegistry = async (): Promise<ToolRegistry> => {
+    throw new Error('profile tools is not implemented yet')
+  }
+  const result = await runManifest(manifest, { client, trace, connectRegistry })
+  const u = result.usage
+  process.stdout.write(
+    `${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''} — turns ${u.turns}, ` +
+      `tokens in/out ${u.inputTokens}/${u.outputTokens} (${u.source}), tool calls ${u.toolCalls}, tool errors ${u.toolErrors}, ` +
+      `${result.durationMs} ms → ${join(trace.dir, 'result.json')}\n`,
+  )
+  if (result.status === 'completed') process.stdout.write(`\n${result.answer}\n`)
+  return result.status === 'completed' ? 0 : 1
+}
+
 export async function main(argv: string[]): Promise<number> {
   let parsed
   try {
@@ -76,6 +99,8 @@ export async function main(argv: string[]): Promise<number> {
     switch (positionals[0]) {
       case 'probe':
         return await cmdProbe(values)
+      case 'run':
+        return await cmdRun(values, positionals[1])
       default:
         process.stderr.write(`${positionals[0]}: not implemented\n`)
         return 1
@@ -83,6 +108,10 @@ export async function main(argv: string[]): Promise<number> {
   } catch (err) {
     if (err instanceof UsageError) {
       process.stderr.write(`${err.message}\n${USAGE}`)
+      return 1
+    }
+    if (err instanceof ManifestError) {
+      process.stderr.write(`${err.message}\n`)
       return 1
     }
     throw err
