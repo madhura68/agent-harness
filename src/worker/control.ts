@@ -20,7 +20,7 @@ export type StatusUpdate = {
 /** The harness's own channel to the scrum4me MCP. The model never sees these tools. */
 export interface ControlChannel {
   waitForJob(waitSeconds: number, signal: AbortSignal): Promise<ClaimResult>
-  /** false when the job is no longer ours (claim lost, cancelled, terminal) or the call failed. */
+  /** false when the server refuses (claim lost, cancelled, terminal); rejects when the call itself failed. */
   heartbeat(jobId: string): Promise<boolean>
   updateStatus(jobId: string, input: StatusUpdate): Promise<{ ok: boolean; message?: string }>
 }
@@ -66,12 +66,8 @@ export function createControlChannel(client: Client, opts: { requestTimeoutMs?: 
     },
 
     async heartbeat(jobId) {
-      try {
-        const res = await client.callTool({ name: 'job_heartbeat', arguments: { job_id: jobId } })
-        return !res.isError
-      } catch {
-        return false
-      }
+      const res = await client.callTool({ name: 'job_heartbeat', arguments: { job_id: jobId } })
+      return !res.isError
     },
 
     async updateStatus(jobId, input) {

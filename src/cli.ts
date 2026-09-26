@@ -146,12 +146,13 @@ async function cmdWorker(values: Values): Promise<number> {
   }
   process.on('SIGINT', onSignal)
   process.on('SIGTERM', onSignal)
-
-  const conn = await connectStdioClient({ ...config.mcp, env })
+  let conn: Awaited<ReturnType<typeof connectStdioClient>> | undefined
   try {
+    conn = await connectStdioClient({ ...config.mcp, env }, stop.signal)
+    const client = conn.client
     const { exitCode, jobs } = await runWorker({
-      control: createControlChannel(conn.client),
-      registryView: (signal) => createRegistryView(conn.client, config.allow, signal),
+      control: createControlChannel(client),
+      registryView: (signal) => createRegistryView(client, config.allow, signal),
       modelClient: createModelClient({ baseUrl: config.model.baseUrl, name: config.model.name, apiKey: config.model.apiKey }),
       config,
       out,
@@ -163,7 +164,7 @@ async function cmdWorker(values: Values): Promise<number> {
   } finally {
     process.off('SIGINT', onSignal)
     process.off('SIGTERM', onSignal)
-    await conn.close().catch(() => undefined)
+    await conn?.close().catch(() => undefined)
   }
 }
 

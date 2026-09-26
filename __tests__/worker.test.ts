@@ -329,3 +329,55 @@ describe('createControlChannel', () => {
     expect(r).toMatchObject({ type: 'job', jobId: 'job1', kind: 'IDEA_CHAT' })
   })
 })
+
+describe('runWorker — review fixes', () => {
+  it('stops after an unsupported kind: a wrong claim filter must not drain the queue', async () => {
+    const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'TASK_IMPLEMENTATION' }), job()], script: [answer('nee')], once: false })
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
+    expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
+    expect(t.logs.join('\n')).toMatch(/claimfilter/i)
+  })
+
+  it('stops after a payload without pending_user_message_ids (MCP without M2)', async () => {
+    const payload = ideaChatPayload() as unknown as { chat: Record<string, unknown> }
+    delete payload.chat.pending_user_message_ids
+    const t = await setup({ claims: [job(payload), job()], script: [answer('nee')], once: false })
+    const r = await t.run()
+    expect(r.exitCode).toBe(1)
+    expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
+  })
+
+  it('makes no model call when Ctrl-C lands before the running update returns', async () => {
+    const stop = new AbortController()
+    const t = await setup({ claims: [job()], script: [answer('te laat')], signal: stop.signal })
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, input) => { const r = await orig(id, input); if (input.status === 'running') stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.exitCode).toBe(0)
+    expect(t.model.requests).toHaveLength(0)
+    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'worker gestopt' })
+  })
+
+  it('keeps a completed answer when Ctrl-C lands after the run finished', async () => {
+    const stop = new AbortController()
+    const t = await setup({ claims: [job()], script: [answer('op tijd')], signal: stop.signal })
+    const model = t.deps.modelClient
+    t.deps.modelClient = { complete: async (messages, options) => { const r = await model.complete(messages, options); stop.abort(); return r } }
+    await t.run()
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', summary: 'op tijd' })
+  })
+
+  it('survives one heartbeat exception but abandons after two in a row', async () => {
+    const t = await setup({ claims: [job()], script: [{ ...answer('klaar'), delayMs: 400 }], heartbeatMs: 50 })
+    let n = 0
+    t.deps.control = { ...t.deps.control, heartbeat: async () => { n++; if (n === 1) throw new Error('hik'); return true } }
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('done')
+
+    const u = await setup({ claims: [job()], script: [{ ...answer('te laat'), delayMs: 2000 }], heartbeatMs: 30 })
+    u.deps.control = { ...u.deps.control, heartbeat: async () => { throw new Error('weg') } }
+    const r2 = await u.run()
+    expect(r2.jobs[0].outcome).toBe('abandoned')
+  })
+})
