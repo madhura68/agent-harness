@@ -279,6 +279,9 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         trace.event({ type: 'after_answer', turn: turns, outcome: hookResult.kind })
         if (hookResult.kind === 'accept') return { status: 'completed', answer: answerText }
         if (hookResult.kind === 'fail') return { status: 'failed', error: { code: hookResult.code, message: hookResult.message } }
+        // The rejected answer must stay in the transcript: without it the model never sees what it said, and two
+        // user turns in a row (the previous turn plus this retry) is a shape some OpenAI-compatible servers reject.
+        messages.push({ role: 'assistant', content: answerText })
         messages.push({ role: 'user', content: hookResult.message })
         continue
       }

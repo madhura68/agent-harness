@@ -269,7 +269,7 @@ describe('afterAnswer hook', () => {
     expect(r.events.find((e) => e.type === 'after_answer')).toMatchObject({ turn: 1, outcome: 'accept' })
   })
 
-  it('retry adds a user message and lets a second answer accept', async () => {
+  it('retry keeps the rejected answer in history, then a user message, and lets a second answer accept', async () => {
     const afterAnswer = vi.fn<(answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>>()
       .mockResolvedValueOnce({ kind: 'retry', message: 'Nog niet klaar, probeer opnieuw.' })
       .mockResolvedValueOnce({ kind: 'accept' })
@@ -278,9 +278,32 @@ describe('afterAnswer hook', () => {
     expect(afterAnswer).toHaveBeenCalledTimes(2)
     expect(afterAnswer.mock.calls[1][0]).toBe('Tweede antwoord.')
     expect(r.requests).toHaveLength(2)
-    const secondRequestMessages = r.requests[1].body.messages as Array<{ role: string; content: string }>
-    expect(secondRequestMessages.at(-1)).toEqual({ role: 'user', content: 'Nog niet klaar, probeer opnieuw.' })
+    const secondRequestMessages = r.requests[1].body.messages as Array<{ role: string; content: string; tool_calls?: unknown }>
+    // The model must see its own rejected answer before the retry instruction — never two user turns in a row.
+    expect(secondRequestMessages.slice(-2)).toEqual([
+      { role: 'assistant', content: 'Eerste antwoord.' },
+      { role: 'user', content: 'Nog niet klaar, probeer opnieuw.' },
+    ])
     expect(r.events.filter((e) => e.type === 'after_answer').map((e) => e.outcome)).toEqual(['retry', 'accept'])
+  })
+
+  it('counts the retry-added assistant and user messages in the next prompt estimate', async () => {
+    const charsOf = (v: unknown) => JSON.stringify(v).length
+    const afterAnswer = vi.fn<(answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>>()
+      .mockResolvedValueOnce({ kind: 'retry', message: 'Nog niet klaar, probeer opnieuw.' })
+      .mockResolvedValueOnce({ kind: 'accept' })
+    const r = await run([answer('Eerste antwoord.'), answer('Tweede antwoord.')], { afterAnswer, limits: { contextTokens: 50_000 } })
+    expect(r.result.status).toBe('completed')
+    const firstRequestMessages = r.requests[0].body.messages
+    const secondRequestMessages = r.requests[1].body.messages
+    // Exactly the rejected-answer + retry-instruction pair was added on top of the first request's history.
+    expect(secondRequestMessages).toHaveLength(firstRequestMessages.length + 2)
+    const addedChars = charsOf(secondRequestMessages) - charsOf(firstRequestMessages)
+    const modelRequests = r.events.filter((e) => e.type === 'model_request')
+    // calibration.tokens comes from the fake server's default prompt_tokens (10); ADDED_CHARS_PER_TOKEN = 1.7 is the
+    // documented constant in src/run.ts. This pins that fitContext's estimate() actually walks the added history
+    // (both pushed messages), not just the retry user message.
+    expect(modelRequests[1]).toMatchObject({ turn: 2, promptEstimate: 10 + Math.ceil(addedChars / 1.7) })
   })
 
   it('fail ends the run as failed with VERIFY_FAILED', async () => {
@@ -300,5 +323,18 @@ describe('afterAnswer hook', () => {
     expect(r.result.status).toBe('timed_out')
     expect(r.requests).toHaveLength(1)
     expect(Date.now() - started).toBeLessThan(2500)
+  })
+
+  it('a throwing hook ends the run as failed/HARNESS_ERROR, closes the registry, and writes run_end', async () => {
+    const close = vi.fn(async () => undefined)
+    const registryStub = {
+      snapshot: { entries: [], hash: 'h' }, toOpenAiTools: () => [], execute: vi.fn(), close,
+    } as unknown as ToolRegistry
+    const afterAnswer = vi.fn(async (): Promise<AfterAnswerResult> => { throw new Error('gate crashed') })
+    const r = await run([answer('Klaar.')], { afterAnswer, connect: async () => registryStub })
+    expect(r.result).toMatchObject({ status: 'failed', error: { code: 'HARNESS_ERROR', message: 'gate crashed' } })
+    expect(r.requests).toHaveLength(1)
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(r.events.at(-1)).toMatchObject({ type: 'run_end', status: 'failed', error: { code: 'HARNESS_ERROR', message: 'gate crashed' } })
   })
 })
