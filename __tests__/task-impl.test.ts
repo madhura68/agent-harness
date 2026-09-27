@@ -72,7 +72,7 @@ async function setupWorktree(): Promise<{ cloneDir: string; worktree: string }> 
 
 // ---- fake docker ----
 
-type RunSpec = { code?: number | null; out?: string; hang?: boolean; effect?: () => void }
+type RunSpec = { code?: number | null; out?: string; hang?: boolean; delayMs?: number; effect?: () => void }
 type FakeChild = ReturnType<SpawnFn>
 
 function fakeChild(spec: RunSpec): FakeChild {
@@ -96,10 +96,12 @@ function fakeChild(spec: RunSpec): FakeChild {
     stderr.resume()
   }
   if (!spec.hang) {
-    setImmediate(() => {
+    const settle = () => {
       spec.effect?.()
       finish(spec.code === undefined ? 0 : spec.code)
-    })
+    }
+    if (spec.delayMs) setTimeout(settle, spec.delayMs)
+    else setImmediate(settle)
   }
   return { stdout, stderr, done, kill: () => finish(null) }
 }
@@ -108,6 +110,8 @@ type DockerOpts = {
   prepare?: RunSpec
   verify?: RunSpec[] // one per verify container, in order; exhausted = green
   killCode?: number
+  /** `docker kill` answers only after this many ms (a slow, failing kill keeps the cleanup in flight). */
+  killDelayMs?: number
   /** Output of `docker ps` for the leftover check at startup / before a task (one entry per call; exhausted = clean). */
   leftovers?: Array<{ code?: number; out?: string }>
   rmCode?: number
@@ -128,7 +132,7 @@ function fakeDocker(o: DockerOpts = {}) {
         return fakeChild(kind === 'prepare' ? (o.prepare ?? {}) : (verify.shift() ?? {}))
       }
       case 'kill':
-        return fakeChild({ code: o.killCode ?? 0 })
+        return fakeChild({ code: o.killCode ?? 0, delayMs: o.killDelayMs })
       case 'ps': {
         const filter = args[args.indexOf('--filter') + 1]
         if (filter === 'name=^harness-') {
@@ -178,6 +182,8 @@ type Setup = {
   once?: boolean
   /** Container timeouts in seconds; default 0.05 (fast timeouts). */
   timeouts?: { prepare?: number; verify?: number }
+  /** Overrides task.limits.maxWallSeconds after parse (the schema wants whole seconds). */
+  maxWallSeconds?: number
 }
 
 async function setup(s: Setup = {}) {
@@ -213,6 +219,7 @@ async function setup(s: Setup = {}) {
   if (config.task) {
     config.task.prepareTimeoutSeconds = s.timeouts?.prepare ?? 0.05
     config.task.verifyTimeoutSeconds = s.timeouts?.verify ?? 0.05
+    if (s.maxWallSeconds !== undefined) config.task.limits.maxWallSeconds = s.maxWallSeconds
   }
   const docker = fakeDocker(s.docker)
   const out = tmp('out')
@@ -538,12 +545,38 @@ describe('runTaskJob — stopping', () => {
   })
 })
 
+describe('runTaskJob — heartbeat lost on the green path', () => {
+  it('lost during log_commit ⇒ no log_test_result, no done, abandoned', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], heartbeatMs: 20 })
+    let refuse = false
+    const control = t.deps.control
+    t.deps.control = {
+      ...control,
+      heartbeat: async (id) => (refuse ? false : control.heartbeat(id)),
+      log: async (kind, args) => {
+        const r = await control.log(kind, args)
+        if (kind === 'commit') {
+          refuse = true
+          await new Promise((res) => setTimeout(res, 80)) // at least one refused beat lands
+        }
+        return r
+      },
+    }
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    expect(t.mcp.calls.filter((c) => c.name === 'log_test_result')).toEqual([])
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running'])
+    expect(taskUpdates(t.mcp)).toEqual(['in_progress'])
+  })
+})
+
 describe('runTaskJob — container not provably stopped', () => {
   it('via prepare ⇒ failed with the uncertain message, no model call, no scan or commit, exit 1', async () => {
     const t = await setup({ script: [answer('nee')], docker: { prepare: { hang: true }, killCode: 1 } })
     const r = await t.run()
     expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
     expect(String(lastJobUpdate(t.mcp)?.error)).toMatch(UNCERTAIN)
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running', 'failed'])
     expect(t.model.requests).toHaveLength(0)
     expect(t.docker.runs()).toHaveLength(1)
     expect(snapshotGitAdmin).toHaveBeenCalledTimes(1) // only the claim-time snapshot
@@ -556,6 +589,7 @@ describe('runTaskJob — container not provably stopped', () => {
     const r = await t.run()
     expect(r.exitCode).toBe(1)
     expect(String(lastJobUpdate(t.mcp)?.error)).toMatch(UNCERTAIN)
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running', 'failed'])
     expect(t.model.requests).toHaveLength(1)
     expect(t.docker.runs()).toHaveLength(2)
     expect(snapshotGitAdmin).toHaveBeenCalledTimes(1)
@@ -567,12 +601,67 @@ describe('runTaskJob — container not provably stopped', () => {
     const r = await t.run()
     expect(r.exitCode).toBe(1)
     expect(String(lastJobUpdate(t.mcp)?.error)).toMatch(UNCERTAIN)
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running', 'failed'])
     expect(t.model.requests).toHaveLength(2)
     expect(t.docker.runs()).toHaveLength(2)
     expect(snapshotGitAdmin).toHaveBeenCalledTimes(1)
     expect(commitAll).not.toHaveBeenCalled()
     expect(await t.branchSha()).toBe(t.baseSha)
   })
+
+  // Fix round 1: runManifest drops an aborted gate at once (raceAbort) while runInContainer is still killing.
+  const SLOW_FAILING_KILL = { verify: [{ hang: true }], killCode: 1, killDelayMs: 300 }
+
+  it('SIGINT during the gate verify with a slow failing kill ⇒ uncertain message, exit 1', async () => {
+    const stop = new AbortController()
+    const t = await setup({
+      script: [write('a.txt', 'a\n'), answer('klaar')],
+      docker: { ...SLOW_FAILING_KILL, onRun: (kind) => { if (kind === 'verify') setTimeout(() => stop.abort(), 20) } },
+      timeouts: { verify: 10 },
+      signal: stop.signal,
+    })
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
+    expect(String(lastJobUpdate(t.mcp)?.error)).toMatch(UNCERTAIN)
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running', 'failed'])
+    expect(snapshotGitAdmin).toHaveBeenCalledTimes(1)
+    expect(commitAll).not.toHaveBeenCalled()
+  }, 10_000)
+
+  it('heartbeat lost during the gate verify with a slow failing kill ⇒ no update, exit 1, no next claim', async () => {
+    let verifying = false
+    const t = await setup({
+      claims: (wt) => [{ job: taskPayload({ worktree: wt }) }, { job: ideaChatPayload({ jobId: 'job2' }) }],
+      script: [write('a.txt', 'a\n'), answer('klaar'), answer('idee-antwoord')],
+      docker: { ...SLOW_FAILING_KILL, onRun: (kind) => { if (kind === 'verify') verifying = true } },
+      timeouts: { verify: 10 },
+      heartbeatMs: 20,
+      once: false,
+    })
+    // Ends the loop should job2 ever be claimed (the bug): without it the worker would keep polling forever.
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const control = t.deps.control
+    t.deps.control = {
+      ...control,
+      heartbeat: async (id) => (verifying ? false : control.heartbeat(id)),
+      updateStatus: async (id, u) => { if (id === 'job2') stop.abort(); return control.updateStatus(id, u) },
+    }
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'abandoned' }], exitCode: 1 })
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running'])
+    expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
+    expect(commitAll).not.toHaveBeenCalled()
+  }, 10_000)
+
+  it('the wall deadline during the gate verify with a slow failing kill ⇒ uncertain message, exit 1', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], docker: SLOW_FAILING_KILL, timeouts: { verify: 10 }, maxWallSeconds: 0.5 })
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
+    expect(String(lastJobUpdate(t.mcp)?.error)).toMatch(UNCERTAIN)
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running', 'failed'])
+    expect(snapshotGitAdmin).toHaveBeenCalledTimes(1)
+  }, 10_000)
 
   it('with the heartbeat lost as well ⇒ no update at all, still exit 1', async () => {
     const t = await setup({ docker: { prepare: { hang: true }, killCode: 1 }, timeouts: { prepare: 10 }, heartbeatMs: 20 })

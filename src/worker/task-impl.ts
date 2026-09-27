@@ -214,7 +214,23 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   deps.signal.addEventListener('abort', onStop, { once: true })
   if (deps.signal.aborted) inner.abort()
 
-  const container = async (kind: 'prepare' | 'verify', source: 'prepare' | 'run_tests' | 'gate', script: string, signal: AbortSignal): Promise<VerifyRun> => {
+  // Every container() call still running. runManifest drops an aborted gate or tool call at once (raceAbort),
+  // while runInContainer is still killing; the outcome may only be decided once those calls have settled.
+  const inFlight = new Set<Promise<VerifyRun>>()
+  /** Aborts and awaits every container still in flight; bounded by runInContainer's own kill/confirm/grace bounds. */
+  const settleContainers = async () => {
+    if (inFlight.size === 0) return
+    inner.abort()
+    while (inFlight.size > 0) await Promise.allSettled([...inFlight])
+  }
+  const container = (kind: 'prepare' | 'verify', source: 'prepare' | 'run_tests' | 'gate', script: string, signal: AbortSignal): Promise<VerifyRun> => {
+    const call = runContainer(kind, source, script, signal)
+    inFlight.add(call)
+    const forget = () => inFlight.delete(call)
+    call.then(forget, forget)
+    return call
+  }
+  const runContainer = async (kind: 'prepare' | 'verify', source: 'prepare' | 'run_tests' | 'gate', script: string, signal: AbortSignal): Promise<VerifyRun> => {
     // Never another container once one was not provably stopped.
     if (uncertain) return { exitCode: null, output: '', timedOut: false, runnerError: `container ${uncertain} niet aantoonbaar gestopt` }
     const name = containerName(jobId, kind, ++containerNo)
@@ -254,7 +270,8 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   }
   /** The failure path (from step 2): no git; a fresh fs-only scan goes into the error unless `scanned`. */
   const failPath = async (reason: string, scanned = false): Promise<JobOutcome> => {
-    inner.abort() // a container still running is killed by runInContainer
+    inner.abort() // a container still running is killed by runInContainer…
+    await settleContainers() // …and the scan only starts once that kill has settled
     if (uncertain) return uncertainPath()
     let scan = ''
     if (!scanned) {
@@ -334,10 +351,13 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
         afterAnswer,
       })
     } catch (err) {
+      await settleContainers()
       const afterThrow = interrupted()
       if (afterThrow) return await afterThrow
       return await failPath(`harness: ${message(err)}`)
     }
+    // A gate or run_tests container may still be killing; its cleanup outcome decides what comes next.
+    await settleContainers()
     // The uncertain flag first: runManifest reports that abort as an ordinary HARNESS_ERROR.
     if (uncertain) return await uncertainPath()
     if (lost) return abandon()
@@ -372,6 +392,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
 
     // Step 7.
     await logStep('commit', { content: `commit ${sha}: ${p.task.title}`, commitHash: sha, commitMessage: p.task.title })
+    if (lost) return abandon()
     await logStep('test', { content: `verify groen (${recipe.verify})`, status: 'PASSED' })
     if (lost) return abandon()
     const done: StatusUpdate = {
