@@ -4,6 +4,7 @@ import {
   buildDockerArgs,
   buildScript,
   containerName,
+  defaultSpawn,
   killLeftoverContainers,
   runInContainer,
   type SpawnFn,
@@ -29,35 +30,65 @@ type FakeChild = ReturnType<SpawnFn>
  * Mirrors the real `'close'`-based wiring in `defaultSpawn` — `done` only resolves once both streams
  * have actually finished emitting (i.e. after a consumer has drained them), never before, so a caller
  * that races `done` against the stream `'data'` events never sees a truncated read.
+ *
+ * `errorMessage` mirrors `defaultSpawn`'s optional field for a spawn `'error'`. `lateOnKill` simulates a
+ * CLI child that keeps running (like `never: true`) until `kill()` is actually called, at which point it
+ * flushes late output and settles — modelling a real `docker run` that only exits once the container
+ * underneath it is confirmed gone.
  */
-function fakeChild(opts: { exitCode?: number | null; delayMs?: number; never?: boolean; stdout?: string; stderr?: string }): FakeChild {
+function fakeChild(opts: {
+  exitCode?: number | null
+  delayMs?: number
+  never?: boolean
+  stdout?: string
+  stderr?: string
+  errorMessage?: string
+  lateOnKill?: { stdout?: string; stderr?: string; exitCode?: number | null; delayMs?: number }
+}): FakeChild {
   const stdout = new PassThrough()
   const stderr = new PassThrough()
+  let resolveDone!: (code: number | null) => void
   const done = new Promise<number | null>((resolvePromise) => {
-    if (opts.never) return
+    resolveDone = resolvePromise
+  })
+
+  const finish = (outText: string | undefined, errText: string | undefined, code: number | null) => {
     let pending = 2
     const onStreamEnd = () => {
       pending--
-      if (pending === 0) resolvePromise(opts.exitCode ?? 0)
+      if (pending === 0) resolveDone(code)
     }
     stdout.once('end', onStreamEnd)
     stderr.once('end', onStreamEnd)
-    const settle = () => {
-      if (opts.stdout !== undefined) stdout.end(opts.stdout)
-      else stdout.end()
-      if (opts.stderr !== undefined) stderr.end(opts.stderr)
-      else stderr.end()
-    }
+    stdout.end(outText ?? '')
+    stderr.end(errText ?? '')
+  }
+
+  // `exitCode` is deliberately distinguished from "not provided": a fake modelling a spawn error or a
+  // signal-killed CLI passes `exitCode: null` explicitly, which must stay `null`, not fall back to `0`
+  // the way `?? 0` would (`null ?? 0` is `0`, same as `undefined ?? 0` — that would silently defeat every
+  // "done resolves null" test in this file).
+  const exitCodeOrDefault = (v: number | null | undefined) => (v === undefined ? 0 : v)
+
+  if (!opts.never) {
+    const settle = () => finish(opts.stdout, opts.stderr, exitCodeOrDefault(opts.exitCode))
     if (opts.delayMs) setTimeout(settle, opts.delayMs)
     else settle()
-  })
+  }
+
   return {
     stdout,
     stderr,
     done,
     kill(): void {
-      // no-op: this fake process is already "gone" once `done` settles or the test asserts on it
+      if (opts.lateOnKill) {
+        const { stdout: out, stderr: err, exitCode, delayMs } = opts.lateOnKill
+        const settleLate = () => finish(out, err, exitCodeOrDefault(exitCode))
+        if (delayMs) setTimeout(settleLate, delayMs)
+        else settleLate()
+      }
     },
+    errorMessage: () => opts.errorMessage,
   }
 }
 
@@ -189,6 +220,29 @@ describe('runInContainer: normal exit', () => {
   })
 })
 
+describe('runInContainer: runner failure (done resolves null on the normal path)', () => {
+  it('reports a runnerError instead of showing exitcode null as a test result', async () => {
+    const { spawn } = fakeSpawn({ run: () => fakeChild({ exitCode: null, stdout: 'partial output\n' }) })
+    const result = await runInContainer('verify', { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) }, { spawn })
+    expect(result.exitCode).toBeNull()
+    expect(result.timedOut).toBe(false)
+    expect(result.runnerError).toBeDefined()
+    expect(result.output).toContain('partial output\n')
+  })
+
+  it('includes the spawn error detail in runnerError when the SpawnFn provides one', async () => {
+    const { spawn } = fakeSpawn({ run: () => fakeChild({ exitCode: null, errorMessage: 'ENOENT: docker niet gevonden' }) })
+    const result = await runInContainer('prepare', { name: 'harness-abc12345-prepare-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) }, { spawn })
+    expect(result.runnerError).toContain('ENOENT: docker niet gevonden')
+  })
+
+  it('the real defaultSpawn resolves done with null (not a throw) for a non-existent binary', async () => {
+    const child = defaultSpawn('harness-test-definitely-not-a-real-binary-xyz', [], {})
+    const code = await child.done
+    expect(code).toBeNull()
+  })
+})
+
 describe('runInContainer: timeout', () => {
   it('kills the container and reports timedOut+stopped when the confirmation is empty', async () => {
     const { spawn, calls } = fakeSpawn({
@@ -196,7 +250,11 @@ describe('runInContainer: timeout', () => {
       kill: () => fakeChild({ exitCode: 0 }),
       ps: () => fakeChild({ exitCode: 0, stdout: '' }),
     })
-    const result = await runInContainer('verify', { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) }, { spawn })
+    const result = await runInContainer(
+      'verify',
+      { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
+      { spawn, killGraceMs: 20 },
+    )
     expect(result.timedOut).toBe(true)
     expect(result.cleanup).toBe('stopped')
     expect(result.runnerError).toBeUndefined()
@@ -213,7 +271,11 @@ describe('runInContainer: timeout', () => {
       kill: () => fakeChild({ exitCode: 1 }),
       ps: () => fakeChild({ exitCode: 0, stdout: '' }),
     })
-    const result = await runInContainer('verify', { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) }, { spawn })
+    const result = await runInContainer(
+      'verify',
+      { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
+      { spawn, killGraceMs: 20 },
+    )
     expect(result.timedOut).toBe(true)
     expect(result.cleanup).toBe('uncertain')
   })
@@ -226,7 +288,7 @@ describe('runInContainer: timeout', () => {
     const result = await runInContainer(
       'verify',
       { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
-      { spawn, cleanupTimeoutMs: 30 },
+      { spawn, cleanupTimeoutMs: 30, killGraceMs: 20 },
     )
     expect(result.timedOut).toBe(true)
     expect(result.cleanup).toBe('uncertain')
@@ -238,10 +300,51 @@ describe('runInContainer: timeout', () => {
       kill: () => fakeChild({ exitCode: 0 }),
       ps: () => fakeChild({ exitCode: 0, stdout: 'deadbeef1234\n' }),
     })
-    const result = await runInContainer('verify', { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) }, { spawn })
+    const result = await runInContainer(
+      'verify',
+      { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
+      { spawn, killGraceMs: 20 },
+    )
     expect(result.timedOut).toBe(true)
     expect(result.cleanup).toBe('uncertain')
   })
+})
+
+describe('runInContainer: kill grace period', () => {
+  it('includes output that arrives from the CLI child between the kill and its own done, within the grace bound', async () => {
+    const { spawn } = fakeSpawn({
+      run: () => fakeChild({ never: true, lateOnKill: { stdout: 'late tail output\n', delayMs: 20 } }),
+      kill: () => fakeChild({ exitCode: 0 }),
+      ps: () => fakeChild({ exitCode: 0, stdout: '' }),
+    })
+    const result = await runInContainer(
+      'verify',
+      { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
+      { spawn, killGraceMs: 500 },
+    )
+    expect(result.timedOut).toBe(true)
+    expect(result.output).toContain('late tail output\n')
+  }, 2000)
+
+  it('does not block unbounded when the CLI child never exits even after being killed', async () => {
+    const { spawn } = fakeSpawn({
+      run: () => fakeChild({ never: true }), // no lateOnKill: done never resolves, even once kill() is called
+      kill: () => fakeChild({ exitCode: 0 }),
+      ps: () => fakeChild({ exitCode: 0, stdout: '' }),
+    })
+    const start = Date.now()
+    const result = await runInContainer(
+      'verify',
+      { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
+      { spawn, killGraceMs: 50 },
+    )
+    expect(result.timedOut).toBe(true)
+    // Baseline is TASK.verifyTimeoutSeconds (1s, the smallest zod allows) before the grace period even
+    // starts; the assertion is against the *grace* bound (50 ms) adding only a small margin on top of
+    // that, not against 0 — a `killGraceMs` that failed to bound anything would instead hang for
+    // whatever real time the (never-resolving) `done` needed, which this repo has no reason to bound.
+    expect(Date.now() - start).toBeLessThan(1400)
+  }, 2000)
 })
 
 describe('runInContainer: abort', () => {
@@ -253,7 +356,11 @@ describe('runInContainer: abort', () => {
     })
     const controller = new AbortController()
     controller.abort()
-    const result = await runInContainer('prepare', { name: 'harness-abc12345-prepare-0', worktree: '/wt', task: TASK, script: 'noop', signal: controller.signal }, { spawn })
+    const result = await runInContainer(
+      'prepare',
+      { name: 'harness-abc12345-prepare-0', worktree: '/wt', task: TASK, script: 'noop', signal: controller.signal },
+      { spawn, killGraceMs: 20 },
+    )
     expect(result.timedOut).toBe(true)
     expect(result.runnerError).toBe('afgebroken')
     expect(result.cleanup).toBe('stopped')
@@ -268,7 +375,11 @@ describe('runInContainer: abort', () => {
     })
     const controller = new AbortController()
     controller.abort()
-    const result = await runInContainer('prepare', { name: 'harness-abc12345-prepare-0', worktree: '/wt', task: TASK, script: 'noop', signal: controller.signal }, { spawn })
+    const result = await runInContainer(
+      'prepare',
+      { name: 'harness-abc12345-prepare-0', worktree: '/wt', task: TASK, script: 'noop', signal: controller.signal },
+      { spawn, killGraceMs: 20 },
+    )
     expect(result.timedOut).toBe(true)
     expect(result.runnerError).toBe('afgebroken')
     expect(result.cleanup).toBe('uncertain')

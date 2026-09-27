@@ -3,22 +3,30 @@ import type { Readable } from 'node:stream'
 import type { TaskConfig } from './config.js'
 import type { VerifyRun } from './task-tools.js'
 
-/** A running `docker` invocation: streamed output, an exit promise, and a hard-stop handle. */
+/**
+ * A running `docker` invocation: streamed output, an exit promise, and a hard-stop handle.
+ * `errorMessage()`, if present, returns the spawn/child `'error'` text once `done` has resolved with
+ * `null` for that reason — callers use it to explain a `null` exit code rather than showing it as if it
+ * were a real (if odd) test result.
+ */
 export type SpawnFn = (
   cmd: string,
   args: string[],
   opts: { signal?: AbortSignal },
-) => { stdout: Readable; stderr: Readable; done: Promise<number | null>; kill(): void }
+) => { stdout: Readable; stderr: Readable; done: Promise<number | null>; kill(): void; errorMessage?(): string | undefined }
 
 /** Test seam shared by `runInContainer` and `killLeftoverContainers`. Production callers pass neither field. */
-export type ContainerDeps = { spawn?: SpawnFn; cleanupTimeoutMs?: number }
+export type ContainerDeps = { spawn?: SpawnFn; cleanupTimeoutMs?: number; killGraceMs?: number }
 
 const HOME_PREFIX = 'export HOME=/tmp/harness-home && mkdir -p "$HOME" && '
 /** Combined stdout+stderr kept per container run; `run_tests` (task-tools.ts) truncates further for the model. */
 const OUTPUT_TAIL_BYTES = 64 * 1024
 /** Bound for every cleanup docker call (kill, ps, rm -f): a hung docker CLI must not hang the worker. */
 const DEFAULT_CLEANUP_TIMEOUT_MS = 20_000
+/** After the container is confirmed killed, how long to still let the original `docker run` CLI child settle (and flush any last output) before giving up on it — never unbounded. */
+const DEFAULT_KILL_GRACE_MS = 2000
 const LEFTOVER_FILTER = 'name=^harness-'
+const NO_EXIT_CODE_ERROR = 'docker-proces eindigde zonder exitcode'
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -53,15 +61,21 @@ export function buildDockerArgs(
 
 /**
  * Default `SpawnFn`: wraps `node:child_process.spawn`, stdout/stderr piped, no stdin. Never throws
- * synchronously — a spawn error resolves `done` with `null`, same as an exit by signal. Uses `'close'`
- * rather than `'exit'`: `'exit'` can fire before the stdio pipes finish flushing, which would let the
- * caller race ahead and miss trailing output.
+ * synchronously — a spawn error resolves `done` with `null`, same as an exit by signal; `errorMessage()`
+ * then carries the underlying error text (e.g. a missing docker binary). Uses `'close'` rather than
+ * `'exit'`: `'exit'` can fire before the stdio pipes finish flushing, which would let the caller race
+ * ahead and miss trailing output. Exported (only) so a test can exercise it directly against a
+ * non-existent binary without ever invoking real `docker`.
  */
-function defaultSpawn(cmd: string, args: string[], opts: { signal?: AbortSignal }): ReturnType<SpawnFn> {
+export function defaultSpawn(cmd: string, args: string[], opts: { signal?: AbortSignal }): ReturnType<SpawnFn> {
   const child = spawnChildProcess(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], signal: opts.signal })
+  let errorMessage: string | undefined
   const done = new Promise<number | null>((resolvePromise) => {
     child.once('close', (code) => resolvePromise(code))
-    child.once('error', () => resolvePromise(null))
+    child.once('error', (err) => {
+      errorMessage = message(err)
+      resolvePromise(null)
+    })
   })
   return {
     stdout: child.stdout as Readable,
@@ -70,6 +84,7 @@ function defaultSpawn(cmd: string, args: string[], opts: { signal?: AbortSignal 
     kill(): void {
       child.kill('SIGKILL')
     },
+    errorMessage: () => errorMessage,
   }
 }
 
@@ -98,6 +113,38 @@ class TailBuffer {
   toString(): string {
     return Buffer.concat(this.chunks).toString('utf8')
   }
+}
+
+/**
+ * Resolves with `promise`'s value, or `undefined` once `ms` elapses first — whichever comes first.
+ * Used to give the original `docker run` CLI child a bounded grace period to exit (and flush its last
+ * output) after it has been killed, without ever blocking unbounded on a child that never actually goes
+ * away. Same shape as `runDockerBounded`'s own timeout race, kept separate because it waits on a
+ * `SpawnFn`'s `done` directly rather than driving a fresh docker call.
+ */
+function withGrace<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  return new Promise((resolvePromise) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      resolvePromise(undefined)
+    }, ms)
+    promise.then(
+      (value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolvePromise(value)
+      },
+      () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolvePromise(undefined)
+      },
+    )
+  })
 }
 
 type BoundedResult = { code: number | null; output: string; timedOut: boolean }
@@ -175,11 +222,15 @@ async function cleanupContainer(name: string, spawn: SpawnFn, cleanupTimeoutMs: 
 
 /**
  * Runs the prepare or verify script in a throwaway container and reports the outcome as a `VerifyRun`.
- * A normal exit passes the exit code through untouched. A timeout (`prepareTimeoutSeconds` /
+ * A normal exit passes the exit code through untouched — unless `done` resolved with `null` (a spawn
+ * `'error'`, or the CLI child ending by signal rather than a real exit), which is a runner failure, not
+ * a test result: it gets `runnerError` (with the underlying error text when `errorMessage()` has one)
+ * instead of being shown to the model as `exitcode null`. A timeout (`prepareTimeoutSeconds` /
  * `verifyTimeoutSeconds`) or an abort via `o.signal` both kill the container (the `docker run` CLI child
- * alone is not enough — only `docker kill <name>` reaches the container itself) and report
- * `timedOut: true`; an abort additionally sets `runnerError: 'afgebroken'`. `cleanup` is set only on
- * that timeout/abort path, never on a normal exit.
+ * alone is not enough — only `docker kill <name>` reaches the container itself), then give that CLI
+ * child a bounded grace period (`killGraceMs`) to actually exit and flush any last output before the
+ * tail is read, and report `timedOut: true`; an abort additionally sets `runnerError: 'afgebroken'`.
+ * `cleanup` is set only on that timeout/abort path, never on a normal exit.
  */
 export async function runInContainer(
   kind: 'prepare' | 'verify',
@@ -188,6 +239,7 @@ export async function runInContainer(
 ): Promise<VerifyRun> {
   const spawn = deps?.spawn ?? defaultSpawn
   const cleanupTimeoutMs = deps?.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS
+  const killGraceMs = deps?.killGraceMs ?? DEFAULT_KILL_GRACE_MS
   const timeoutSeconds = kind === 'prepare' ? o.task.prepareTimeoutSeconds : o.task.verifyTimeoutSeconds
   const args = buildDockerArgs(kind, {
     name: o.name,
@@ -230,6 +282,15 @@ export async function runInContainer(
   o.signal.removeEventListener('abort', onAbort)
 
   if (outcome.kind === 'exit') {
+    if (outcome.code === null) {
+      const detail = child.errorMessage?.()
+      return {
+        exitCode: null,
+        output: tail.toString(),
+        timedOut: false,
+        runnerError: detail ? `${NO_EXIT_CODE_ERROR}: ${detail}` : NO_EXIT_CODE_ERROR,
+      }
+    }
     return { exitCode: outcome.code, output: tail.toString(), timedOut: false }
   }
 
@@ -239,6 +300,9 @@ export async function runInContainer(
   } catch {
     // best effort: the container itself is already handled via cleanupContainer
   }
+  // Give the original CLI child a bounded chance to actually exit (and flush its last output) now that
+  // the container underneath it is gone — never unbounded, a hung CLI must not hang the worker either.
+  await withGrace(child.done, killGraceMs)
 
   const result: VerifyRun = { exitCode: null, output: tail.toString(), timedOut: true, cleanup }
   if (outcome.kind === 'abort') result.runnerError = 'afgebroken'
