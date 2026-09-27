@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -71,6 +72,109 @@ describe('createTaskTools: path containment', () => {
     expect(r.ok).toBe(true)
     expect(r.content).toContain('hoi')
   })
+})
+
+describe('createTaskTools: dangling symlinks (fix round 1, Critical)', () => {
+  it('refuses write_file through a dangling symlink as the last path component', async () => {
+    const root = tmp('root')
+    const outside = tmp('outside')
+    const plantedTarget = join(outside, 'planted.txt') // never created
+    symlinkSync(plantedTarget, join(root, 'dang'))
+    const reg = tools(root)
+    const r = await reg.execute('write_file', { path: 'dang', content: 'ESCAPED' }, sig())
+    expect(r).toMatchObject({ ok: false, errorCode: 'TOOL_ERROR' })
+    expect(() => readFileSync(plantedTarget, 'utf8')).toThrow()
+  })
+
+  it('refuses write_file through a dangling symlink in the middle of the path', async () => {
+    const root = tmp('root')
+    const outside = tmp('outside')
+    const missingDir = join(outside, 'nonexistent-dir')
+    symlinkSync(missingDir, join(root, 'dlink'))
+    const reg = tools(root)
+    const r = await reg.execute('write_file', { path: 'dlink/newfile.txt', content: 'ESCAPED' }, sig())
+    expect(r).toMatchObject({ ok: false, errorCode: 'TOOL_ERROR' })
+    expect(() => readFileSync(join(missingDir, 'newfile.txt'), 'utf8')).toThrow()
+  })
+
+  it('refuses edit_file through a dangling symlink', async () => {
+    const root = tmp('root')
+    const outside = tmp('outside')
+    symlinkSync(join(outside, 'planted-edit.txt'), join(root, 'dang-edit'))
+    const reg = tools(root)
+    const r = await reg.execute('edit_file', { path: 'dang-edit', old_string: 'a', new_string: 'b' }, sig())
+    expect(r).toMatchObject({ ok: false, errorCode: 'TOOL_ERROR' })
+  })
+
+  it('refuses read_file through a dangling symlink', async () => {
+    const root = tmp('root')
+    const outside = tmp('outside')
+    symlinkSync(join(outside, 'planted-read.txt'), join(root, 'dang-read'))
+    const reg = tools(root)
+    const r = await reg.execute('read_file', { path: 'dang-read' }, sig())
+    expect(r).toMatchObject({ ok: false, errorCode: 'TOOL_ERROR' })
+  })
+
+  it('still refuses a non-dangling symlink as the final component (no regression)', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'real.txt'), 'hoi')
+    symlinkSync(join(root, 'real.txt'), join(root, 'alias'))
+    const reg = tools(root)
+    const r = await reg.execute('read_file', { path: 'alias' }, sig())
+    expect(r).toMatchObject({ ok: false, errorCode: 'TOOL_ERROR' })
+  })
+})
+
+describe('createTaskTools: special files (fix round 1, Important)', () => {
+  it('refuses to read a FIFO instead of hanging (read_file)', async () => {
+    const root = tmp('root')
+    const fifoPath = join(root, 'p')
+    execFileSync('mkfifo', [fifoPath])
+    const reg = tools(root)
+    const r = await reg.execute('read_file', { path: 'p' }, sig())
+    expect(r).toMatchObject({ ok: false, errorCode: 'TOOL_ERROR' })
+  }, 8000)
+
+  it('does not hang on a FIFO in the tree (search)', async () => {
+    const root = tmp('root')
+    execFileSync('mkfifo', [join(root, 'p')])
+    writeFileSync(join(root, 'a.txt'), 'TARGET')
+    const reg = tools(root)
+    const r = await reg.execute('search', { pattern: 'TARGET' }, sig())
+    expect(r.ok).toBe(true)
+    expect(r.content).toBe('a.txt:1: TARGET')
+  }, 8000)
+
+  it('refuses to read an oversized file', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'huge.bin'), Buffer.alloc(6 * 1024 * 1024, 'x'))
+    const reg = tools(root)
+    const r = await reg.execute('read_file', { path: 'huge.bin' }, sig())
+    expect(r).toMatchObject({ ok: false, errorCode: 'TOOL_ERROR' })
+  })
+
+  it('skips an oversized file during search rather than reading it whole', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'huge.txt'), 'TARGET\n'.repeat(200_000)) // > 1 MB
+    writeFileSync(join(root, 'small.txt'), 'TARGET small')
+    const reg = tools(root)
+    const r = await reg.execute('search', { pattern: 'TARGET' }, sig())
+    expect(r.ok).toBe(true)
+    expect(r.content).toBe('small.txt:1: TARGET small')
+  }, 8000)
+})
+
+describe('createTaskTools: ReDoS guard (fix round 1, Important)', () => {
+  it('aborts a catastrophic regex within the timeout instead of hanging', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'a.txt'), `${'a'.repeat(34)}!`)
+    const reg = tools(root)
+    const started = Date.now()
+    const r = await reg.execute('search', { pattern: '^(a+)+$' }, AbortSignal.timeout(9000))
+    const elapsed = Date.now() - started
+    expect(r).toEqual({ ok: false, errorCode: 'TOOL_ERROR', content: 'search afgebroken: timeout', truncated: false })
+    expect(elapsed).toBeLessThan(8000)
+  }, 10_000)
 })
 
 describe('read_file', () => {
