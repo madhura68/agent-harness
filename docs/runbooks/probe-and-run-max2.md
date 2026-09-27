@@ -21,7 +21,7 @@ Daarna is de base-URL `http://127.0.0.1:11434/v1`. Controle: `curl -s http://127
 | Gegeven | Waarde (2026-09-26) |
 |---|---|
 | Ollama-versie | 0.34.4 |
-| GPU | NVIDIA GeForce RTX 5070 Ti, 16 GB; `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_CONTEXT_LENGTH=32768` |
+| GPU | NVIDIA GeForce RTX 5070 Ti, 16 GB; `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_CONTEXT_LENGTH=65536` (tot 2026-09-27 `32768`; zie [meetproef](#meetproef-contextvenster-2026-09-27)) |
 | Gekozen model | `qwen3-coder:30b` (Q4_K_M, 30.5B MoE, capabilities `completion, tools`, geen thinking-modus) |
 
 **Modelkeuze.** JP liet het model open (spec §12). `qwen3-coder:30b` was bij de proef al op de GPU geladen, meldt `tools` als capability en heeft geen thinking-modus die content in een apart redeneerveld zou zetten. Andere geïnstalleerde kandidaten (`qwen3.6:35b-a3b-coding`, `qwen3.8:27b`, `qwen3.5:9b`) zijn niet geprobed omdat het eerste verdict al `reliable` was. Een ander model kiezen is één probe-run: de harness is model-agnostisch.
@@ -107,8 +107,29 @@ Dit is het gedrag dat de spec eist (§6: een vastgelopen model trekt de run niet
 
 ### Contextvenster en lange beurten
 
-Ollama op max2 draait met `OLLAMA_CONTEXT_LENGTH=32768`. Een prompt die groter wordt, kapt Ollama van voren af; de chat-template vindt dan geen gebruikersbericht meer en het verzoek faalt met HTTP 500 `no user query found in messages`. In de spike van 2026-09-27 gebeurde dat bij ongeveer 30,8k prompt-tokens.
+Ollama op max2 draaide tijdens de spike met `OLLAMA_CONTEXT_LENGTH=32768`. Een prompt die groter wordt, kapt Ollama van voren af; de chat-template vindt dan geen gebruikersbericht meer en het verzoek faalt met HTTP 500 `no user query found in messages`. In de spike van 2026-09-27 gebeurde dat bij ongeveer 30,8k prompt-tokens.
 
-Zet daarom `limits.contextTokens` op de contextlengte van de server (`32768` op max2). De harness schat dan vóór elke beurt de promptgrootte: de laatste door de provider gemelde `prompt_tokens`, plus de sindsdien toegevoegde tekens gedeeld door 1,7, min de door compactie verwijderde tekens gedeeld door 4. Die delers komen uit 114 beurten van de spike (tekens per token: p0 1,72, mediaan 3,06, p95 3,89); zo valt de schatting aan beide kanten hoog uit. Tekst die veel dichter is dan code of Nederlands en Engels proza (bijvoorbeeld CJK) valt daarbuiten. Past de prompt samen met een outputreserve (een kwart van het venster, of minder als het outputbudget kleiner is) niet, dan vervangt de harness de oudste toolresultaten die het model al gezien heeft door een korte stub (`{"compacted": true, …}`) en meldt dat met een `context_compacted`-event in de trace. `max_tokens` per verzoek wordt begrensd op de ruimte die over is. Blijft er minder dan 1024 tokens over, dan eindigt de run als `budget_exceeded` met `CONTEXT_EXHAUSTED`, zonder nog een verzoek.
+Zet daarom `limits.contextTokens` op de contextlengte van de server (nu `65536` op max2). De harness schat dan vóór elke beurt de promptgrootte: de laatste door de provider gemelde `prompt_tokens`, plus de sindsdien toegevoegde tekens gedeeld door 1,7, min de door compactie verwijderde tekens gedeeld door 4. Die delers komen uit 114 beurten van de spike (tekens per token: p0 1,72, mediaan 3,06, p95 3,89); zo valt de schatting aan beide kanten hoog uit. Tekst die veel dichter is dan code of Nederlands en Engels proza (bijvoorbeeld CJK) valt daarbuiten. Past de prompt samen met een outputreserve (een kwart van het venster, of minder als het outputbudget kleiner is) niet, dan vervangt de harness de oudste toolresultaten die het model al gezien heeft door een korte stub (`{"compacted": true, …}`) en meldt dat met een `context_compacted`-event in de trace. `max_tokens` per verzoek wordt begrensd op de ruimte die over is. Blijft er minder dan 1024 tokens over, dan eindigt de run als `budget_exceeded` met `CONTEXT_EXHAUSTED`, zonder nog een verzoek.
 
 De model-client heeft geen eigen transporttimeout meer. Node's fetch (undici) brak een verzoek na 300 s zonder headers af, en met `stream: false` komen de headers pas na de hele generatie: een denkende beurt van meer dan vijf minuten eindigde als `fetch failed`. `maxWallSeconds` begrenst nu elk verzoek.
+
+### Meetproef contextvenster (2026-09-27)
+
+Vraag: hoe groot kan het venster voor `qwen3.8-gsq-rco:27b-iq3_s-text` op max2, zonder dat Ollama lagen naar de CPU verplaatst? Opzet: RTX 5070 Ti 16 GiB, `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`, TEI uit. Per grootte het model laden met `options.num_ctx` via `/api/generate` (de serverconfig bleef ongewijzigd), `size_vram` tegen `size` aflezen in `/api/ps`, en daarna een prompt van echte TypeScript uit de scrum4me-MCP met drie verstopte feiten (`DEPLOY-NOTE`-regels op 25, 50 en 75%), thinking uit en temperatuur 0.
+
+| Venster | Op GPU | Model + KV | Prompt | Inlezen | Genereren | Terugvinden |
+|---|---|---|---|---|---|---|
+| 32k | 100% | 12,90 GB | 18,8k | 1698 tok/s | 50 tok/s | 3/3 |
+| 48k | 100% | 13,56 GB | 38,3k | 1431 tok/s | 45 tok/s | 3/3 |
+| 64k | 100% | 14,21 GB | 52,4k | 1285 tok/s | 42 tok/s | 3/3 |
+| 72k | 100% | 14,54 GB | 41,3k | 1396 tok/s | 44 tok/s | 3/3 |
+| 80k | 96% | 15,41 GB | – | – | – | – |
+| 96k | 91% | 16,28 GB | 54,8k | 1041 tok/s | 12,5 tok/s | 3/3 |
+| 128k | 82% | 17,83 GB | – | – | – | – |
+
+- Model plus KV-cache groeit met ongeveer 0,65 GB per 16k tokens: KV-cache en rekenbuffers samen. Het model is hybride (1 op 4 lagen heeft attention), dus de KV-cache is klein, ongeveer 35 KB per token in q8_0.
+- Ollama zet op deze kaart hooguit ongeveer 14,8 GB op de GPU. Wat erboven komt, draait op de CPU: bij 96k blijft terugvinden goed, maar genereren wordt 3,4 keer trager.
+- De 72k-prompt vulde maar 56% van het venster; de marge daar is 0,23 GB.
+- Niet gemeten: `OLLAMA_KV_CACHE_TYPE=q4_0`. Dat halveert de KV-cache (waarschijnlijk richting 96–128k), maar geldt voor alle modellen, vraagt een Ollama-herstart en kan kwaliteit kosten bij lang terugzoeken.
+
+Besluit: 64k, met ongeveer 0,55 GB marge. Sinds 2026-09-27 18:30 staat `OLLAMA_CONTEXT_LENGTH=65536` in `/etc/systemd/system/ollama.service.d/override.conf` en `contextTokens: 65536` in `/etc/agent-harness/worker.json` (backups `*.bak-pre-64k`). Controle: een `/v1`-verzoek zonder `num_ctx` laadt het model met `context_length` 65536, 100% op de GPU. Staat er iets anders op de GPU, zoals TEI, dan eerst opnieuw meten.
