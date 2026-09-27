@@ -26,7 +26,8 @@
     "maxTurns": 8,
     "maxOutputTokens": 4096,
     "maxWallSeconds": 240,
-    "maxToolErrors": 2
+    "maxToolErrors": 2,
+    "contextTokens": 32768
   },
   "waitSeconds": 300
 }

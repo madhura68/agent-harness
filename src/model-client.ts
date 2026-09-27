@@ -1,9 +1,15 @@
+import { Agent, fetch } from 'undici'
 import type { ChatMessage, CompleteResult, ToolCall, ToolDef, Usage } from './types.js'
 
 export const REASONING_EFFORTS = ['none', 'low', 'medium', 'high'] as const
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number]
 /** reasoningEffort goes out as OpenAI `reasoning_effort`; Ollama's /v1 turns thinking off with 'none' (its `think` field is ignored there). */
-export type ModelClientOptions = { baseUrl: string; name: string; apiKey?: string; reasoningEffort?: ReasoningEffort }
+/**
+ * headersTimeoutMs: transport timeout for headers and body; unset = none. With stream:false the headers only arrive
+ * after the whole generation, and undici's 300 s default cut off long thinking turns. The run deadline (the signal)
+ * bounds every request anyway.
+ */
+export type ModelClientOptions = { baseUrl: string; name: string; apiKey?: string; reasoningEffort?: ReasoningEffort; headersTimeoutMs?: number }
 export type CompleteOptions = { signal: AbortSignal; maxTokens: number; tools?: ToolDef[] }
 export type ModelClient = { complete(messages: ChatMessage[], options: CompleteOptions): Promise<CompleteResult> }
 
@@ -13,6 +19,12 @@ export class ModelError extends Error {
     super(message, options)
     this.name = 'ModelError'
   }
+}
+
+/** 0 disables undici's timeout. */
+export function transportTimeouts(opts: Pick<ModelClientOptions, 'headersTimeoutMs'>): { headersTimeout: number; bodyTimeout: number } {
+  const ms = opts.headersTimeoutMs ?? 0
+  return { headersTimeout: ms, bodyTimeout: ms }
 }
 
 const FINISH_REASONS = new Set(['stop', 'length', 'tool_calls'])
@@ -57,6 +69,7 @@ function toWire(messages: ChatMessage[]): unknown[] {
 
 export function createModelClient(opts: ModelClientOptions): ModelClient {
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`
+  const dispatcher = new Agent(transportTimeouts(opts))
   return {
     async complete(messages, options) {
       const headers: Record<string, string> = { 'content-type': 'application/json' }
@@ -73,7 +86,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       let text: string
       let status: number
       try {
-        const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal })
+        const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: options.signal, dispatcher })
         status = res.status
         text = await res.text()
       } catch (err) {

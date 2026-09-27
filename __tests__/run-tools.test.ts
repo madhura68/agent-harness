@@ -20,7 +20,7 @@ afterEach(async () => {
   for (const o of open.splice(0)) await o.close().catch(() => undefined)
 })
 
-const limits = { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2 }
+const limits: Manifest['limits'] = { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2 }
 type Call = { id?: string; name: string; arguments?: unknown }
 const calls = (cs: Call[], content: string | null = null): FakeTurn => ({ body: completion({ content, toolCalls: cs }) })
 const answer = (text: string): FakeTurn => ({ body: completion({ content: text }) })
@@ -193,5 +193,51 @@ describe('runManifest — tools profile', () => {
     expect(Buffer.byteLength(msg.content)).toBeLessThanOrEqual(16_384)
     expect(readFileSync(join(r.trace.dir, 'tools', 'b.txt'), 'utf8')).toHaveLength(40_000)
     expect(r.events.find((e) => e.type === 'tool_result')).toMatchObject({ truncated: true, bytes: 40_000 })
+  })
+})
+
+// Ollama cuts a prompt that exceeds its context from the front and then fails with "no user query found in
+// messages" (spike 2026-09-27, ~30.8k of 32k tokens). limits.contextTokens keeps the prompt under that window.
+describe('context budget (limits.contextTokens)', () => {
+  const big = (id: string, promptTokens: number | null): FakeTurn => ({
+    body: completion({ toolCalls: [{ id, name: 'big', arguments: '{}' }], usage: promptTokens === null ? null : { prompt_tokens: promptTokens, completion_tokens: 5 } }),
+  })
+  const isCompacted = (m: { content: string }) => (JSON.parse(m.content) as { compacted?: boolean }).compacted === true
+
+  it('leaves the history alone without contextTokens', async () => {
+    const r = await run([big('b1', 100), big('b2', 5700), answer('ok')], { allow: ['big'] })
+    expect(r.result.status).toBe('completed')
+    expect(lastToolMessages(r.requests[2]).map(isCompacted)).toEqual([false, false])
+    expect(r.events.some((e) => e.type === 'context_compacted')).toBe(false)
+    expect(r.events.find((e) => e.type === 'model_request')).not.toHaveProperty('promptEstimate')
+  })
+
+  for (const reported of [true, false]) {
+    it(`compacts the oldest tool result before the window fills (usage ${reported ? 'reported' : 'missing'})`, async () => {
+      const r = await run([big('b1', reported ? 100 : null), big('b2', reported ? 5700 : null), answer('ok')], {
+        allow: ['big'], limits: { contextTokens: 14_000 },
+      })
+      expect(r.result.status).toBe('completed')
+      // Request 2: one 16 kB result fits. Request 3: two do not, so the older one is replaced by a stub.
+      expect(lastToolMessages(r.requests[1]).map(isCompacted)).toEqual([false])
+      const third = lastToolMessages(r.requests[2])
+      expect(third.map(isCompacted)).toEqual([true, false])
+      expect(JSON.parse(third[0].content).content).toMatch(/call the tool again/)
+      const ev = r.events.find((e) => e.type === 'context_compacted')
+      expect(ev).toMatchObject({ turn: 3, messages: 1 })
+      expect(ev?.estimateAfter).toBeLessThan(ev?.estimateBefore as number)
+      expect(r.events.filter((e) => e.type === 'model_request').at(-1)).toMatchObject({ turn: 3, promptEstimate: ev?.estimateAfter })
+      // The request never asks for more output than the window leaves.
+      expect(r.requests[2].body.max_tokens).toBeLessThanOrEqual(14_000 - (ev?.estimateAfter as number))
+      // Removed text is credited at the sparse end (4 chars/token), never more generously than that.
+      if (reported) expect((ev?.estimateBefore as number) - (ev?.estimateAfter as number)).toBeLessThanOrEqual((ev?.bytes as number) / 4)
+    })
+  }
+
+  it('stops with CONTEXT_EXHAUSTED when even a compacted history leaves no room, without another request', async () => {
+    const r = await run([big('b1', 100), answer('never')], { allow: ['big'], limits: { contextTokens: 6000 } })
+    expect(r.result.status).toBe('budget_exceeded')
+    expect(r.result.error?.code).toBe('CONTEXT_EXHAUSTED')
+    expect(r.requests).toHaveLength(1)
   })
 })

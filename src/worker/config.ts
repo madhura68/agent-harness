@@ -20,6 +20,7 @@ export const WorkerConfigSchema = z
         maxOutputTokens: z.number().int().positive().default(DEFAULT_LIMITS.maxOutputTokens),
         maxWallSeconds: z.number().int().positive().default(DEFAULT_LIMITS.maxWallSeconds),
         maxToolErrors: z.number().int().nonnegative().default(DEFAULT_LIMITS.maxToolErrors),
+        contextTokens: z.number().int().positive().optional(),
       })
       .default(DEFAULT_LIMITS),
     waitSeconds: z.number().int().min(1).max(600).default(300),

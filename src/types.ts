@@ -42,6 +42,7 @@ export type ErrorCode =
   | 'MODEL_ERROR'
   | 'TOO_MANY_TOOL_ERRORS'
   | 'PROBE_REQUIRED'
+  | 'CONTEXT_EXHAUSTED'
 
 // Tool contracts live here so run.ts and registry.ts share the same types.
 export type ServerSpec = { command: string; args: string[]; env?: Record<string, string> } // = Manifest.tools.server
