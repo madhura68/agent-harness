@@ -1,24 +1,43 @@
 import { execFile } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import { commitAll, diffGitAdmin, snapshotGitAdmin, type GitAdminSnapshot } from '../src/worker/host-git.js'
 
 const execFileAsync = promisify(execFile)
 
+// Kept separate from `cleanupDirs`: this config dir must outlive every single test (it holds the git
+// identity every setup commit in this file relies on), and is removed once in `afterAll`, never per test.
+// Fix round 1, issue 1: `cleanupDirs` used to hold it too, so the very first `afterEach` deleted it — every
+// later `git commit` fell back to a hostname-derived identity, which only "worked" on this Mac because the
+// hostname contains a dot. On `node:24-bookworm` (no dot in the container hostname) that fallback fails
+// outright with "unable to auto-detect email address".
+let configDir: string
 let globalConfigPath: string
 const cleanupDirs: string[] = []
 
 beforeAll(() => {
-  const configDir = mkdtempSync(join(tmpdir(), 'host-git-cfg-'))
+  configDir = mkdtempSync(join(tmpdir(), 'host-git-cfg-'))
   globalConfigPath = join(configDir, 'gitconfig')
   writeFileSync(
     globalConfigPath,
     '[user]\n\tname = Test User\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n',
   )
-  cleanupDirs.push(configDir)
+})
+
+afterAll(() => {
+  rmSync(configDir, { recursive: true, force: true })
 })
 
 afterEach(() => {
@@ -139,6 +158,53 @@ describe('snapshotGitAdmin (fs only)', () => {
     const snap = await snapshotGitAdmin(dir)
     expect(snap.get('node_modules/x/.git')?.type).toBe('dir')
   })
+
+  // Fix round 1, issue 5: basename comparison was case-sensitive, so a `.GIT` item (a perfectly valid
+  // name on a case-sensitive filesystem, i.e. exactly what the harness runs on and what the containers
+  // write into) slipped past unrecorded.
+  it('recognizes a .GIT item case-insensitively', async () => {
+    const dir = tmp('casing')
+    writeFileSync(join(dir, '.GIT'), 'gitdir: /somewhere\n')
+    const snap = await snapshotGitAdmin(dir)
+    expect(snap.has('.GIT')).toBe(true)
+  })
+})
+
+// Fix round 1, issue 2: an unreadable directory used to be silently skipped (a bare `continue` on a
+// `readdir`/`lstat` failure), so `chmod 000 node_modules/evil` (hiding a `.git`) came back as a clean
+// scan instead of a refusal. Now every such failure throws; only a genuine readdir/lstat TOCTOU race
+// (`ENOENT` on an entry that vanished between the two calls) is tolerated.
+describe('snapshotGitAdmin refuses rather than silently reporting clean', () => {
+  it('throws when a subdirectory is unreadable (chmod 000)', async () => {
+    const dir = tmp('chmod000')
+    const evilDir = join(dir, 'node_modules', 'evil')
+    mkdirSync(evilDir, { recursive: true })
+    writeFileSync(join(evilDir, '.git'), 'gitdir: /somewhere\n')
+    chmodSync(evilDir, 0o000)
+    try {
+      await expect(snapshotGitAdmin(dir)).rejects.toThrow()
+    } finally {
+      chmodSync(evilDir, 0o755) // restore before cleanup, otherwise afterEach's rmSync can't recurse into it
+    }
+  })
+
+  it('throws when a subdirectory is execute-only (mode 0111, no read)', async () => {
+    const dir = tmp('mode0111')
+    const evilDir = join(dir, 'node_modules', 'evil')
+    mkdirSync(evilDir, { recursive: true })
+    writeFileSync(join(evilDir, '.git'), 'gitdir: /somewhere\n')
+    chmodSync(evilDir, 0o111)
+    try {
+      await expect(snapshotGitAdmin(dir)).rejects.toThrow()
+    } finally {
+      chmodSync(evilDir, 0o755)
+    }
+  })
+
+  it('throws when the root does not exist', async () => {
+    const missingRoot = join(tmpdir(), `host-git-missing-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+    await expect(snapshotGitAdmin(missingRoot)).rejects.toThrow()
+  })
 })
 
 describe('commitAll against real temp repos', () => {
@@ -225,40 +291,83 @@ describe('commitAll against real temp repos', () => {
     const after = await snapshotGitAdmin(worktreeDir)
     expect(diffGitAdmin(before, after)).toContain('changed: vendor/sub/.git')
 
+    // Fix round 1, issue 4: RED — plain git (setup helper, no safe flags: fsmonitor is left to the
+    // (redirected) repo config) really does invoke the hook and touch the marker. Without this step the
+    // GREEN assertion below could pass for the wrong reason (e.g. a scenario that never triggers fsmonitor
+    // at all, regardless of the flag).
+    await git(worktreeDir, ['status'])
+    expect(existsSync(markerPath)).toBe(true)
+    rmSync(markerPath, { force: true })
+
+    // GREEN: commitAll (core.fsmonitor=false among the rest of SAFE_GIT_CONFIG) must not trigger it.
     writeFileSync(join(worktreeDir, 'triggered.txt'), 'x\n')
     const result = await commitAll(worktreeDir, 'test: safe commit with a redirected submodule gitlink')
     expect(result.committed).toBe(true)
     expect(existsSync(markerPath)).toBe(false)
   })
 
-  it('regression: a repo-local core.hooksPath pre-commit marker does not fire through commitAll, though administration is unchanged (RED: a plain git commit does fire it)', async () => {
+  // Fix round 1, issue 3: the original version of this test only planted a `.husky/pre-commit` marker.
+  // `--no-verify` alone (which commitAll always passes) already suppresses pre-commit, so the test stayed
+  // green even with `core.hooksPath=/dev/null` removed from SAFE_GIT_CONFIG — it wasn't discriminating at
+  // all. post-commit and prepare-commit-msg are NOT covered by `--no-verify`, so they are the ones that
+  // actually prove the hooksPath override matters.
+  it('regression: repo-local core.hooksPath fires hooks --no-verify does not cover (post-commit, prepare-commit-msg) unless the safe flags are used', async () => {
     const { worktreeDir } = await setupRepoWithWorktree()
-    const markerPath = join(worktreeDir, 'hook-marker')
     const huskyDir = join(worktreeDir, '.husky')
     mkdirSync(huskyDir)
-    const preCommit = join(huskyDir, 'pre-commit')
-    writeFileSync(preCommit, `#!/bin/sh\ntouch "${markerPath}"\n`)
-    chmodSync(preCommit, 0o755)
+
+    const preCommitMarker = join(worktreeDir, 'pre-commit-marker')
+    const postCommitMarker = join(worktreeDir, 'post-commit-marker')
+    const prepareMsgMarker = join(worktreeDir, 'prepare-commit-msg-marker')
+
+    writeFileSync(join(huskyDir, 'pre-commit'), `#!/bin/sh\ntouch "${preCommitMarker}"\n`)
+    writeFileSync(join(huskyDir, 'post-commit'), `#!/bin/sh\ntouch "${postCommitMarker}"\n`)
+    writeFileSync(join(huskyDir, 'prepare-commit-msg'), `#!/bin/sh\ntouch "${prepareMsgMarker}"\n`)
+    chmodSync(join(huskyDir, 'pre-commit'), 0o755)
+    chmodSync(join(huskyDir, 'post-commit'), 0o755)
+    chmodSync(join(huskyDir, 'prepare-commit-msg'), 0o755)
+
     await git(worktreeDir, ['config', 'core.hooksPath', huskyDir])
 
     const before = await snapshotGitAdmin(worktreeDir)
 
-    // RED: plain git (setup helper, no safe flags) runs the repo-local hook.
+    // RED: plain git, with --no-verify (like commitAll) but WITHOUT the hooksPath override. pre-commit is
+    // skipped by --no-verify; post-commit and prepare-commit-msg are not, and DO fire.
     writeFileSync(join(worktreeDir, 'red-check.txt'), 'red\n')
     await git(worktreeDir, ['add', '-A'])
-    await git(worktreeDir, ['commit', '-q', '-m', 'red check'])
-    expect(existsSync(markerPath)).toBe(true)
-    rmSync(markerPath, { force: true })
+    await git(worktreeDir, ['commit', '--no-verify', '-q', '-m', 'red check'])
+    expect(existsSync(preCommitMarker)).toBe(false)
+    expect(existsSync(postCommitMarker)).toBe(true)
+    expect(existsSync(prepareMsgMarker)).toBe(true)
+    rmSync(postCommitMarker, { force: true })
+    rmSync(prepareMsgMarker, { force: true })
 
-    // The administration itself (the .git-named items) is unchanged: core.hooksPath lives in the
-    // shared clone config, not in any item this scan records.
+    // The administration itself (the .git-named items) is unchanged: core.hooksPath lives in the shared
+    // clone config, not in any item this scan records.
     const after = await snapshotGitAdmin(worktreeDir)
     expect(diffGitAdmin(before, after)).toEqual([])
 
-    // GREEN: commitAll must not run the hook.
+    // GREEN: commitAll (full SAFE_GIT_CONFIG, including core.hooksPath=/dev/null) must not run any of them.
     writeFileSync(join(worktreeDir, 'green-check.txt'), 'green\n')
     const result = await commitAll(worktreeDir, 'test: safe commit despite core.hooksPath')
     expect(result.committed).toBe(true)
-    expect(existsSync(markerPath)).toBe(false)
+    expect(existsSync(preCommitMarker)).toBe(false)
+    expect(existsSync(postCommitMarker)).toBe(false)
+    expect(existsSync(prepareMsgMarker)).toBe(false)
+  })
+})
+
+// Fix round 1, issue 1 (proof): placed last on purpose — by the time this runs, every earlier test's
+// `afterEach` has already drained `cleanupDirs` several times over. If `configDir` were still sharing that
+// stack (the original bug), it would have been removed after the very first test, and every setup commit
+// since would have fallen back to a hostname-derived identity instead of this one.
+describe('shared test git identity', () => {
+  it('the global config used by every setup commit in this file is still there, and still the one commits actually use', async () => {
+    expect(existsSync(globalConfigPath)).toBe(true)
+    expect(readFileSync(globalConfigPath, 'utf8')).toContain('test@example.com')
+
+    const { worktreeDir } = await setupRepoWithWorktree()
+    const authorEmail = await git(worktreeDir, ['log', '-1', '--format=%ae'])
+    expect(authorEmail.stdout.trim()).toBe('test@example.com')
   })
 })

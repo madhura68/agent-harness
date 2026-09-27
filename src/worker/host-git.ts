@@ -72,14 +72,27 @@ function toRelativePosix(worktree: string, absPath: string): string {
   return relative(worktree, absPath).split(sep).join('/')
 }
 
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function isEnoent(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && (err as NodeJS.ErrnoException).code === 'ENOENT'
+}
+
 /**
- * Walks the worktree with `fs` only — never git — recording one entry per item named `.git`: the
- * worktree's own gitlink, every submodule gitlink, and any `.git` file/dir/symlink planted anywhere else
- * (e.g. `node_modules/x/.git`). Iterative (an explicit queue, not recursion) and processes entries one
- * directory at a time, so it cannot blow the stack or open unbounded file handles on a large
- * `node_modules`. Never follows symlinks: a symlinked `.git` is recorded (as type `symlink`) rather than
- * entered, and any other symlink is skipped outright. Descends into every other directory, but never
- * into one named `.git`.
+ * Walks the worktree with `fs` only — never git — recording one entry per item whose basename is `.git`
+ * (compared case-insensitively, so `.GIT` is caught too): the worktree's own gitlink, every submodule
+ * gitlink, and any `.git` file/dir/symlink planted anywhere else (e.g. `node_modules/x/.git`). Iterative
+ * (an explicit queue, not recursion) and processes entries one directory at a time, so it cannot blow the
+ * stack or open unbounded file handles on a large `node_modules`. Never follows symlinks: a symlinked
+ * `.git` is recorded (as type `symlink`) rather than entered, and any other symlink is skipped outright.
+ * Descends into every other directory, but never into one named `.git`.
+ *
+ * A directory (including the root itself) that cannot be read throws rather than being treated as empty
+ * — an unreadable `node_modules/evil` must never come back as a clean scan just because it silently
+ * contributed nothing. The only tolerated failure is `lstat` returning `ENOENT` for an entry that vanished
+ * between the `readdir` that listed it and the `lstat` that inspected it: a genuine race, not a hidden one.
  */
 export async function snapshotGitAdmin(worktree: string): Promise<GitAdminSnapshot> {
   const snapshot: GitAdminSnapshot = new Map()
@@ -90,18 +103,19 @@ export async function snapshotGitAdmin(worktree: string): Promise<GitAdminSnapsh
     let entries: Dirent[]
     try {
       entries = await readdir(dir, { withFileTypes: true })
-    } catch {
-      continue // vanished or unreadable mid-walk; nothing more to record here
+    } catch (err) {
+      throw new Error(`snapshotGitAdmin: kan map niet lezen (${dir}): ${message(err)}`)
     }
     for (const entry of entries) {
       const absPath = join(dir, entry.name)
       let stats: Stats
       try {
         stats = await lstat(absPath)
-      } catch {
-        continue // vanished between readdir and lstat
+      } catch (err) {
+        if (isEnoent(err)) continue // vanished between readdir and lstat: a real race, not a hidden failure
+        throw new Error(`snapshotGitAdmin: kan item niet lezen (${absPath}): ${message(err)}`)
       }
-      if (entry.name === '.git') {
+      if (entry.name.toLowerCase() === '.git') {
         snapshot.set(toRelativePosix(worktree, absPath), await hashGitItem(absPath, stats))
         continue // never descend into a .git item, even if it is a directory
       }
