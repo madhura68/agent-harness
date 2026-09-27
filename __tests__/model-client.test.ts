@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { createModelClient, ModelError } from '../src/model-client.js'
+import { createModelClient, ModelError, transportTimeouts } from '../src/model-client.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 
 type Fake = Awaited<ReturnType<typeof startFakeModelServer>>
@@ -138,5 +138,27 @@ describe('reasoningEffort', () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
     await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
     expect(fake.requests[0].body).not.toHaveProperty('reasoning_effort')
+  })
+})
+
+// Node's fetch (undici) has headersTimeout/bodyTimeout of 300 s. With stream:false the headers only arrive after the
+// whole generation, so a thinking model that takes > 5 min per turn failed with "fetch failed" (spike 2026-09-27).
+describe('transport timeouts', () => {
+  it('sets no transport timeout by default: the run deadline (signal) is the only bound', () => {
+    expect(transportTimeouts({})).toEqual({ headersTimeout: 0, bodyTimeout: 0 })
+    expect(transportTimeouts({ headersTimeoutMs: 1500 })).toEqual({ headersTimeout: 1500, bodyTimeout: 1500 })
+  })
+
+  it('applies an explicit headersTimeoutMs to the request', async () => {
+    // undici's timers have ~1 s resolution, so the gap between timeout and delay is generous.
+    fake = await startFakeModelServer([{ body: completion({ content: 'late' }), delayMs: 3000 }])
+    const c = createModelClient({ baseUrl: fake.baseUrl, name: 'm', headersTimeoutMs: 500 })
+    await expect(c.complete(msgs, opts())).rejects.toThrow(ModelError)
+  })
+
+  it('waits for a slow response when no timeout is set', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'late' }), delayMs: 800 }])
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    expect(r.message.content).toBe('late')
   })
 })
