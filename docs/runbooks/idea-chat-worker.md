@@ -8,6 +8,8 @@ last_updated: 2026-09-27
 
 Recept voor `harness worker` en het live bewijs van M2 ([spec](../specs/2026-09-26-idea-chat-local-llm-design.md), [plan](../plans/M2-idea-chat-local-llm.md)).
 
+Sinds M3 kan dezelfde worker ook `TASK_IMPLEMENTATION`-jobs met `required_capability: 'local_llm'` claimen (een `task`-blok in de config); zie [task-worker.md](task-worker.md) voor dat recept, de faalredenen en de volgorde-eis.
+
 ## Voorwaarden
 
 1. **scrum4me-mcp met de `local_llm`-isolatie.** De worker draait zijn MCP-kindproces uit `~/Development/scrum4me-mcp-stable`. Die checkout moet de M2-MCP-wijziging bevatten (claimfilter + `chat.pending_user_message_ids`); zonder isolatie claimt een `['local_llm']`-worker via het generieke filter ook gewone jobs. Na de merge: `git -C ~/Development/scrum4me-mcp-stable pull --ff-only && npm --prefix ~/Development/scrum4me-mcp-stable ci`.

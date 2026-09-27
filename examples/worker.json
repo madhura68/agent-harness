@@ -13,7 +13,13 @@
     "env": {
       "SCRUM4ME_TOKEN": "${SCRUM4ME_TOKEN}",
       "DATABASE_URL": "${DATABASE_URL}",
-      "DIRECT_URL": "${DIRECT_URL}"
+      "DIRECT_URL": "${DIRECT_URL}",
+      "GIT_ASKPASS": "/etc/agent-harness/forgejo-askpass.sh",
+      "GIT_TERMINAL_PROMPT": "0",
+      "FORGEJO_PUSH_TOKEN": "${FORGEJO_PUSH_TOKEN}",
+      "SCRUM4ME_AGENT_WORKTREE_DIR": "/var/lib/agent-harness/worktrees",
+      "SCRUM4ME_REPO_ROOT_cmuhjw9e80003mt7rq4w3sauu": "/var/lib/agent-harness/repos/agent-harness",
+      "SCRUM4ME_REPO_ROOT_REPO_scrum4me-mcp": "/var/lib/agent-harness/repos/scrum4me-mcp"
     }
   },
   "allow": [
@@ -29,5 +35,30 @@
     "maxToolErrors": 2,
     "contextTokens": 32768
   },
-  "waitSeconds": 300
+  "waitSeconds": 300,
+  "task": {
+    "limits": {
+      "maxTurns": 40,
+      "maxOutputTokens": 80000,
+      "maxWallSeconds": 2400,
+      "maxToolErrors": 8,
+      "contextTokens": 65536
+    },
+    "image": "node:24-bookworm",
+    "uid": 1000,
+    "gid": 1000,
+    "npmCacheDir": "/var/lib/agent-harness/npm-cache",
+    "recipes": [
+      {
+        "repoUrl": "https://git.jp-visser.nl/janpeter/agent-harness.git",
+        "prepare": ["npm ci"],
+        "verify": "npm run verify"
+      },
+      {
+        "repoUrl": "https://git.jp-visser.nl/janpeter/scrum4me-mcp.git",
+        "prepare": ["npm ci", "npm run prisma:generate"],
+        "verify": "npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts"
+      }
+    ]
+  }
 }
