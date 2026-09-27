@@ -209,6 +209,7 @@ describe('context budget (limits.contextTokens)', () => {
     expect(r.result.status).toBe('completed')
     expect(lastToolMessages(r.requests[2]).map(isCompacted)).toEqual([false, false])
     expect(r.events.some((e) => e.type === 'context_compacted')).toBe(false)
+    expect(r.events.find((e) => e.type === 'model_request')).not.toHaveProperty('promptEstimate')
   })
 
   for (const reported of [true, false]) {
@@ -225,6 +226,7 @@ describe('context budget (limits.contextTokens)', () => {
       const ev = r.events.find((e) => e.type === 'context_compacted')
       expect(ev).toMatchObject({ turn: 3, messages: 1 })
       expect(ev?.estimateAfter).toBeLessThan(ev?.estimateBefore as number)
+      expect(r.events.filter((e) => e.type === 'model_request').at(-1)).toMatchObject({ turn: 3, promptEstimate: ev?.estimateAfter })
       // The request never asks for more output than the window leaves.
       expect(r.requests[2].body.max_tokens).toBeLessThanOrEqual(14_000 - (ev?.estimateAfter as number))
       // Removed text is credited at the sparse end (4 chars/token), never more generously than that.

@@ -199,7 +199,10 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       }
       turns++
 
-      trace.event({ type: 'model_request', turn: turns, messages: messages.length, tools: tools.length, maxTokens })
+      trace.event({
+        type: 'model_request', turn: turns, messages: messages.length, tools: tools.length, maxTokens,
+        ...(limits.contextTokens !== undefined ? { promptEstimate: estimate() } : {}),
+      })
       const signal = within(deadline - now())
       const charsAtRequest = charsOf(messages)
       let res

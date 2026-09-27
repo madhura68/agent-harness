@@ -5,7 +5,7 @@ import type { ErrorCode, RunStatus, ToolCall, Usage } from './types.js'
 export type TraceEvent =
   | { type: 'run_start'; manifest: unknown; probeSkipped?: boolean; job?: { jobId: string; ideaId: string } } // manifest after redactManifest
   | { type: 'tool_snapshot'; names: string[]; hash: string }
-  | { type: 'model_request'; turn: number; messages: number; tools: number; maxTokens: number }
+  | { type: 'model_request'; turn: number; messages: number; tools: number; maxTokens: number; promptEstimate?: number }
   | { type: 'context_compacted'; turn: number; messages: number; bytes: number; estimateBefore: number; estimateAfter: number }
   | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage }
   | { type: 'tool_call'; callId: string; name: string; arguments: string; argumentsWasObject: boolean }
