@@ -25,7 +25,7 @@ export type RunDeps = {
   /** External stop (worker: Ctrl-C or lost job ownership). Ends the run as failed/HARNESS_ERROR 'aborted'. */
   signal?: AbortSignal
   /** Worker context recorded on run_start as `job`. */
-  runStartExtra?: { jobId: string; ideaId: string }
+  runStartExtra?: { jobId: string; ideaId?: string; taskId?: string }
   /**
    * Called when the model gives a final answer (no tool calls, finishReason !== 'length'). Runs within the same
    * deadline and within()-signal as everything else; an abort during the hook ends the run like a model abort

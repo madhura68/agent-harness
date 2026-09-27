@@ -44,8 +44,11 @@ export interface ControlChannel {
   updateStatus(jobId: string, input: StatusUpdate): Promise<StatusOutcome>
   updateTaskStatus(taskId: string, status: 'in_progress' | 'review' | 'todo'): Promise<{ ok: boolean; message?: string }>
   verifyTaskAgainstPlan(taskId: string, worktreePath: string): Promise<{ ok: boolean; result?: 'aligned' | 'partial' | 'empty' | 'divergent'; message?: string }>
-  /** Best-effort: a tool error or a rejected call is logged (never thrown) and never blocks the caller. */
-  log(kind: 'implementation' | 'commit' | 'test', args: LogArgs): Promise<void>
+  /**
+   * Best-effort: a tool error or a rejected call is never thrown; it comes back as `ok: false` so the caller
+   * can report it through its own logger (the worker's `deps.log`).
+   */
+  log(kind: 'implementation' | 'commit' | 'test', args: LogArgs): Promise<{ ok: boolean; message?: string }>
 }
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
@@ -158,9 +161,9 @@ export function createControlChannel(client: Client, opts: { requestTimeoutMs?: 
       }
       try {
         const res = await client.callTool({ name: toolName, arguments: toolArgs })
-        if (res.isError) console.error(`${toolName} mislukt: ${text(res)}`)
+        return res.isError ? { ok: false, message: `${toolName} mislukt: ${text(res)}` } : { ok: true }
       } catch (err) {
-        console.error(`${toolName} mislukt: ${message(err)}`)
+        return { ok: false, message: `${toolName} mislukt: ${message(err)}` }
       }
     },
   }

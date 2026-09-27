@@ -392,19 +392,23 @@ describe('createControlChannel', () => {
     ])
   })
 
-  it('log is best-effort: a tool error or a rejected call never throws', async () => {
+  it('log is best-effort: a tool error or a rejected call never throws and never writes to the console', async () => {
     mcp = await startFakeScrum4meMcp()
     const control = createControlChannel(mcp.client)
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     vi.spyOn(mcp.client, 'callTool').mockResolvedValueOnce({ isError: true, content: [{ type: 'text', text: 'kapot' }] })
-    await expect(control.log('implementation', { storyId: 'story-1', taskId: 'task-1', content: 'x' })).resolves.toBeUndefined()
+    await expect(control.log('implementation', { storyId: 'story-1', taskId: 'task-1', content: 'x' })).resolves.toEqual({ ok: false, message: 'log_implementation mislukt: kapot' })
     vi.spyOn(mcp.client, 'callTool').mockRejectedValueOnce(new Error('verbinding weg'))
-    await expect(control.log('commit', { storyId: 'story-1', taskId: 'task-1', content: 'x', commitHash: 'a', commitMessage: 'm' })).resolves.toBeUndefined()
+    await expect(control.log('commit', { storyId: 'story-1', taskId: 'task-1', content: 'x', commitHash: 'a', commitMessage: 'm' })).resolves.toEqual({ ok: false, message: 'log_commit mislukt: verbinding weg' })
+    expect(await control.log('test', { storyId: 'story-1', taskId: 'task-1', content: 'x', status: 'PASSED' })).toEqual({ ok: true })
+    expect(consoleError).not.toHaveBeenCalled()
+    consoleError.mockRestore()
   })
 })
 
 describe('runWorker — review fixes', () => {
   it('stops after an unsupported kind: a wrong claim filter must not drain the queue', async () => {
-    const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'TASK_IMPLEMENTATION' }), job()], script: [answer('nee')], once: false })
+    const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'PR_REVIEW' }), job()], script: [answer('nee')], once: false })
     const r = await t.run()
     expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
     expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
