@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Manifest } from '../src/manifest.js'
 import { createModelClient } from '../src/model-client.js'
-import { runManifest } from '../src/run.js'
+import { runManifest, type AfterAnswerResult } from '../src/run.js'
 import { connectRegistry } from '../src/tools/registry.js'
 import { openTrace } from '../src/trace.js'
 import type { ToolRegistry } from '../src/types.js'
@@ -27,7 +27,12 @@ const answer = (text: string): FakeTurn => ({ body: completion({ content: text }
 
 async function run(
   script: FakeTurn[],
-  opts: { allow?: string[]; limits?: Partial<typeof limits>; connect?: (signal: AbortSignal) => Promise<ToolRegistry> } = {},
+  opts: {
+    allow?: string[]
+    limits?: Partial<typeof limits>
+    connect?: (signal: AbortSignal) => Promise<ToolRegistry>
+    afterAnswer?: (answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>
+  } = {},
 ) {
   fake = await startFakeModelServer(script)
   const mcp = await startFakeMcp()
@@ -41,7 +46,12 @@ async function run(
   }
   const trace = openTrace(tmp('tools'), m.id)
   const connect = vi.fn(opts.connect ?? (async () => connectRegistry(mcp.client, allow)))
-  const result = await runManifest(m, { client: createModelClient({ baseUrl: fake.baseUrl, name: 'm' }), trace, connectRegistry: connect })
+  const result = await runManifest(m, {
+    client: createModelClient({ baseUrl: fake.baseUrl, name: 'm' }),
+    trace,
+    connectRegistry: connect,
+    ...(opts.afterAnswer ? { afterAnswer: opts.afterAnswer } : {}),
+  })
   return { result, trace, requests: fake.requests, mcpCalls: mcp.calls, connect, events: readTrace(trace.dir) }
 }
 
@@ -239,5 +249,56 @@ describe('context budget (limits.contextTokens)', () => {
     expect(r.result.status).toBe('budget_exceeded')
     expect(r.result.error?.code).toBe('CONTEXT_EXHAUSTED')
     expect(r.requests).toHaveLength(1)
+  })
+})
+
+describe('afterAnswer hook', () => {
+  it('without the hook, behaviour is unchanged', async () => {
+    const r = await run([answer('Klaar.')])
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'Klaar.' })
+    expect(r.events.some((e) => e.type === 'after_answer')).toBe(false)
+  })
+
+  it('accept ends the run as completed with the model answer', async () => {
+    const afterAnswer = vi.fn(async (): Promise<AfterAnswerResult> => ({ kind: 'accept' }))
+    const r = await run([answer('Klaar.')], { afterAnswer })
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'Klaar.' })
+    expect(afterAnswer).toHaveBeenCalledTimes(1)
+    expect(afterAnswer.mock.calls[0][0]).toBe('Klaar.')
+    expect(r.requests).toHaveLength(1)
+    expect(r.events.find((e) => e.type === 'after_answer')).toMatchObject({ turn: 1, outcome: 'accept' })
+  })
+
+  it('retry adds a user message and lets a second answer accept', async () => {
+    const afterAnswer = vi.fn<(answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>>()
+      .mockResolvedValueOnce({ kind: 'retry', message: 'Nog niet klaar, probeer opnieuw.' })
+      .mockResolvedValueOnce({ kind: 'accept' })
+    const r = await run([answer('Eerste antwoord.'), answer('Tweede antwoord.')], { afterAnswer })
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'Tweede antwoord.' })
+    expect(afterAnswer).toHaveBeenCalledTimes(2)
+    expect(afterAnswer.mock.calls[1][0]).toBe('Tweede antwoord.')
+    expect(r.requests).toHaveLength(2)
+    const secondRequestMessages = r.requests[1].body.messages as Array<{ role: string; content: string }>
+    expect(secondRequestMessages.at(-1)).toEqual({ role: 'user', content: 'Nog niet klaar, probeer opnieuw.' })
+    expect(r.events.filter((e) => e.type === 'after_answer').map((e) => e.outcome)).toEqual(['retry', 'accept'])
+  })
+
+  it('fail ends the run as failed with VERIFY_FAILED', async () => {
+    const afterAnswer = vi.fn(async (): Promise<AfterAnswerResult> => ({ kind: 'fail', code: 'VERIFY_FAILED', message: 'model produceerde geen wijzigingen' }))
+    const r = await run([answer('Klaar.')], { afterAnswer })
+    expect(r.result).toMatchObject({ status: 'failed', error: { code: 'VERIFY_FAILED', message: 'model produceerde geen wijzigingen' } })
+    expect(r.requests).toHaveLength(1)
+    expect(r.events.find((e) => e.type === 'after_answer')).toMatchObject({ outcome: 'fail' })
+  })
+
+  it('an abort during the hook ends the run without a further model call', async () => {
+    const started = Date.now()
+    const r = await run([answer('Klaar.')], {
+      limits: { maxWallSeconds: 1 },
+      afterAnswer: () => new Promise<AfterAnswerResult>(() => undefined), // hangs forever
+    })
+    expect(r.result.status).toBe('timed_out')
+    expect(r.requests).toHaveLength(1)
+    expect(Date.now() - started).toBeLessThan(2500)
   })
 })

@@ -6,6 +6,11 @@ import { RegistryError } from './tools/registry.js'
 import { redactManifest, type RunResult, type TraceWriter } from './trace.js'
 import type { ChatMessage, ErrorCode, RunStatus, ToolCall, ToolDef, ToolExecResult, ToolRegistry } from './types.js'
 
+export type AfterAnswerResult =
+  | { kind: 'accept' } // run ends as completed with this answer
+  | { kind: 'retry'; message: string } // added as a user message; the loop continues
+  | { kind: 'fail'; code: 'VERIFY_FAILED'; message: string } // run ends as failed
+
 export type RunDeps = {
   client: ModelClient
   trace: TraceWriter
@@ -21,6 +26,13 @@ export type RunDeps = {
   signal?: AbortSignal
   /** Worker context recorded on run_start as `job`. */
   runStartExtra?: { jobId: string; ideaId: string }
+  /**
+   * Called when the model gives a final answer (no tool calls, finishReason !== 'length'). Runs within the same
+   * deadline and within()-signal as everything else; an abort during the hook ends the run like a model abort
+   * (ABORTED or timed_out). A 'retry' does not consume a turn itself — the next model call does, and the usual
+   * maxTurns/context/output budgets apply to it as normal. Task 11 wires the verify gate through this hook.
+   */
+  afterAnswer?: (answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>
 }
 
 type Terminal = { status: RunStatus; answer?: string; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
@@ -56,6 +68,25 @@ function compactedStub(content: string): string {
     // keep ok = true
   }
   return JSON.stringify({ compacted: true, ok, content: COMPACTED_NOTE(Buffer.byteLength(content)) })
+}
+
+/** Resolves with the value, or rejects when the signal aborts first (a late result is simply dropped). */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(new Error('aborted'))
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort)
+        if (!signal.aborted) resolve(v)
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err)
+      },
+    )
+  })
 }
 
 /** Resolves with the connected registry, or rejects when the signal aborts first; a late registry is closed. */
@@ -232,7 +263,24 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       if (outputTokens > limits.maxOutputTokens) return { status: 'budget_exceeded' }
       if (res.message.toolCalls.length === 0) {
         if (res.finishReason === 'length') return { status: 'budget_exceeded' }
-        return { status: 'completed', answer: res.message.content ?? '' }
+        const answerText = res.message.content ?? ''
+        if (!deps.afterAnswer) return { status: 'completed', answer: answerText }
+        if (aborted()) return ABORTED
+        if (now() >= deadline) return { status: 'timed_out' }
+        const hookSignal = within(deadline - now())
+        let hookResult: AfterAnswerResult
+        try {
+          hookResult = await raceAbort(deps.afterAnswer(answerText, hookSignal), hookSignal)
+        } catch (err) {
+          if (aborted()) return ABORTED
+          if (hookSignal.aborted || now() >= deadline) return { status: 'timed_out' }
+          throw err
+        }
+        trace.event({ type: 'after_answer', turn: turns, outcome: hookResult.kind })
+        if (hookResult.kind === 'accept') return { status: 'completed', answer: answerText }
+        if (hookResult.kind === 'fail') return { status: 'failed', error: { code: hookResult.code, message: hookResult.message } }
+        messages.push({ role: 'user', content: hookResult.message })
+        continue
       }
 
       // Assign unique call ids: the model may omit them or repeat them.

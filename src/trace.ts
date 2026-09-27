@@ -10,6 +10,9 @@ export type TraceEvent =
   | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage }
   | { type: 'tool_call'; callId: string; name: string; arguments: string; argumentsWasObject: boolean }
   | { type: 'tool_result'; callId: string; ok: boolean; errorCode?: ErrorCode; truncated: boolean; sha256: string; bytes: number }
+  | { type: 'after_answer'; turn: number; outcome: 'accept' | 'retry' | 'fail' }
+  // Written by the Task 11 task handler on the same trace as the run (prepare/verify containers around the gate).
+  | { type: 'container'; kind: 'prepare' | 'verify'; source: 'prepare' | 'run_tests' | 'gate'; exitCode: number | null; timedOut: boolean; durationMs: number }
   | { type: 'run_end'; status: RunStatus; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 // Exact spec §4.
