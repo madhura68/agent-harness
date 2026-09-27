@@ -32,6 +32,8 @@ export const ManifestSchema = z
       maxOutputTokens: z.number().int().positive(),
       maxWallSeconds: z.number().int().positive(),
       maxToolErrors: z.number().int().nonnegative(),
+      /** The model's context window (Ollama: OLLAMA_CONTEXT_LENGTH). Unset = no context bookkeeping. */
+      contextTokens: z.number().int().positive().optional(),
     }),
   })
   .superRefine((m, ctx) => {

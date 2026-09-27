@@ -55,6 +55,12 @@ describe('loadManifest', () => {
     expect(() => loadManifest(write({ ...answer, limits: { ...limits, maxTurns: 0 } }))).toThrow(/maxTurns/)
   })
 
+  it('accepts an optional positive contextTokens', () => {
+    expect(loadManifest(write({ ...answer, limits: { ...limits, contextTokens: 32768 } })).limits.contextTokens).toBe(32768)
+    expect(loadManifest(write(answer)).limits.contextTokens).toBeUndefined()
+    expect(() => loadManifest(write({ ...answer, limits: { ...limits, contextTokens: 0 } }))).toThrow(/contextTokens/)
+  })
+
   it('reports invalid JSON and a missing file as ManifestError', () => {
     expect(() => loadManifest(write('{ nope'))).toThrow(ManifestError)
     expect(() => loadManifest('/nonexistent/m.json')).toThrow(ManifestError)

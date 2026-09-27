@@ -23,7 +23,7 @@ De worker draait als systemd-service op max2, naast Ollama: geen tunnel, altijd 
 |---|---|
 | Unit | `/etc/systemd/system/agent-harness-worker.service` (`User=janpeter`, `Restart=always`, `RestartSec=30`, `KillSignal=SIGINT`, na `ollama.service`) |
 | Code | `~/Development/agent-harness` (gebouwd: `dist/cli.js`) en `~/Development/scrum4me-mcp-stable` (MCP-kindproces via `tsx`) |
-| Config | `/etc/agent-harness/worker.json`: model `qwen3.8-gsq-rco:27b-iq3_s-text`, baseUrl `http://127.0.0.1:11434/v1`, thinking aan, `maxTurns 8`, `maxOutputTokens 4096` |
+| Config | `/etc/agent-harness/worker.json`: model `qwen3.8-gsq-rco:27b-iq3_s-text`, baseUrl `http://127.0.0.1:11434/v1`, thinking aan, `maxTurns 8`, `maxOutputTokens 4096`. `limits.contextTokens` (zie [probe-and-run-max2](probe-and-run-max2.md#contextvenster-en-lange-beurten)) staat er nog niet in; het voorbeeld in `examples/worker.json` heeft `32768` |
 | Secrets | `/etc/agent-harness/worker.env` (root, 0600): `SCRUM4ME_TOKEN` = eigen token `agent-harness-local-llm-max2`; `DATABASE_URL`/`DIRECT_URL` = beperkte worker-rol uit `worker-idea.env` |
 | Runs en probe | `/var/lib/agent-harness/runs/` (probe voor het model moet hier staan) |
 

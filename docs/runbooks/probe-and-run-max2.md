@@ -104,3 +104,11 @@ De zin over "gebruikerservaring" is een algemene opvulling van het model zonder 
 Een herhaling van dezelfde run om 00:25 UTC eindigde als **`timed_out`** na precies 300 s. Oorzaak: een andere gebruiker draaide tegelijk `qwen3.6:35b-a3b-coding` op max2, en met `OLLAMA_MAX_LOADED_MODELS=1` laadt Ollama per verzoek het gevraagde model opnieuw. Beurt 1 duurde daardoor 75 s en beurt 2 155 s, tegen 21 s in de eerste run. Beide toolcalls slaagden. Beurt 3 werd bij de deadline afgebroken; er volgde geen verdere aanroep. Bewijs: [evidence/sprint-summary-contention.trace.jsonl](evidence/sprint-summary-contention.trace.jsonl).
 
 Dit is het gedrag dat de spec eist (§6: een vastgelopen model trekt de run niet over `maxWallSeconds`). Voor proeven: kijk eerst met `ssh max2 'curl -s localhost:11434/api/ps'` of er een ander model geladen is.
+
+### Contextvenster en lange beurten
+
+Ollama op max2 draait met `OLLAMA_CONTEXT_LENGTH=32768`. Een prompt die groter wordt, kapt Ollama van voren af; de chat-template vindt dan geen gebruikersbericht meer en het verzoek faalt met HTTP 500 `no user query found in messages`. In de spike van 2026-09-27 gebeurde dat bij ongeveer 30,8k prompt-tokens.
+
+Zet daarom `limits.contextTokens` op de contextlengte van de server (`32768` op max2). De harness schat dan vóór elke beurt de promptgrootte: de laatste door de provider gemelde `prompt_tokens` plus de tekens die sindsdien zijn toegevoegd, gedeeld door 3. Past de prompt samen met een outputreserve (een kwart van het venster, of minder als het outputbudget kleiner is) niet, dan vervangt de harness de oudste toolresultaten die het model al gezien heeft door een korte stub (`{"compacted": true, …}`) en meldt dat met een `context_compacted`-event in de trace. `max_tokens` per verzoek wordt begrensd op de ruimte die over is. Blijft er minder dan 1024 tokens over, dan eindigt de run als `budget_exceeded` met `CONTEXT_EXHAUSTED`, zonder nog een verzoek.
+
+De model-client heeft geen eigen transporttimeout meer. Node's fetch (undici) brak een verzoek na 300 s zonder headers af, en met `stream: false` komen de headers pas na de hele generatie: een denkende beurt van meer dan vijf minuten eindigde als `fetch failed`. `maxWallSeconds` begrenst nu elk verzoek.

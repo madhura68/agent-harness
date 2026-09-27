@@ -29,6 +29,32 @@ const sha256 = (s: string) => createHash('sha256').update(s).digest('hex')
 
 const ABORTED: Terminal = { status: 'failed', error: { code: 'HARNESS_ERROR', message: 'aborted' } }
 
+// Context bookkeeping (limits.contextTokens). Code and JSON run at roughly 3.5-4 characters per token; 3 keeps a margin.
+const CHARS_PER_TOKEN = 3
+/** Below this much room a turn cannot produce anything useful. */
+const MIN_TURN_TOKENS = 1024
+const charsOf = (value: unknown) => JSON.stringify(value).length
+const COMPACTED_NOTE = (bytes: number) =>
+  `[earlier tool output of ${bytes} bytes was left out to stay within the context window; call the tool again if you still need it]`
+
+function isCompacted(content: string): boolean {
+  try {
+    return (JSON.parse(content) as { compacted?: unknown }).compacted === true
+  } catch {
+    return false
+  }
+}
+
+function compactedStub(content: string): string {
+  let ok = true
+  try {
+    ok = (JSON.parse(content) as { ok?: unknown }).ok !== false
+  } catch {
+    // keep ok = true
+  }
+  return JSON.stringify({ compacted: true, ok, content: COMPACTED_NOTE(Buffer.byteLength(content)) })
+}
+
 /** Resolves with the connected registry, or rejects when the signal aborts first; a late registry is closed. */
 function connectWithin(connect: Promise<ToolRegistry>, signal: AbortSignal): Promise<ToolRegistry> {
   return new Promise((resolve, reject) => {
@@ -75,6 +101,8 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   let registry: ToolRegistry | undefined
   let policy: Policy | undefined
   const seenCallIds = new Set<string>()
+  // Last provider-reported prompt size and the message characters it was measured on; the estimate adds the change since.
+  let calibration: { tokens: number; chars: number } | undefined
 
   trace.event({
     type: 'run_start', manifest: redactManifest(manifest),
@@ -111,17 +139,61 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
     const messages: ChatMessage[] = []
     if (manifest.system) messages.push({ role: 'system', content: manifest.system })
     messages.push({ role: 'user', content: manifest.prompt })
+    const toolsChars = tools.length > 0 ? charsOf(tools) : 0
+
+    const estimate = (): number =>
+      calibration
+        ? calibration.tokens + Math.ceil((charsOf(messages) - calibration.chars) / CHARS_PER_TOKEN)
+        : Math.ceil((charsOf(messages) + toolsChars) / CHARS_PER_TOKEN)
+
+    /**
+     * Keeps the next prompt plus an output reserve inside contextTokens by replacing the oldest tool results with a
+     * stub. Results the model has not seen yet (after the last assistant message) stay. Returns the room left for
+     * output, or undefined when there is no window to respect.
+     */
+    const fitContext = (maxTokens: number): number | undefined => {
+      const window = limits.contextTokens
+      if (window === undefined) return undefined
+      const reserve = Math.min(maxTokens, Math.floor(window / 4))
+      const before = estimate()
+      if (before + reserve <= window) return window - before
+      let lastAssistant = messages.length - 1
+      while (lastAssistant >= 0 && messages[lastAssistant].role !== 'assistant') lastAssistant--
+      let count = 0
+      let bytes = 0
+      for (let i = 0; i < lastAssistant && estimate() + reserve > window; i++) {
+        const m = messages[i]
+        if (m.role !== 'tool' || isCompacted(m.content)) continue
+        bytes += Buffer.byteLength(m.content)
+        messages[i] = { ...m, content: compactedStub(m.content) }
+        count++
+      }
+      const after = estimate()
+      if (count > 0) trace.event({ type: 'context_compacted', turn: turns + 1, messages: count, bytes, estimateBefore: before, estimateAfter: after })
+      return window - after
+    }
 
     for (;;) {
       if (aborted()) return ABORTED
       if (turns + 1 > limits.maxTurns) return { status: 'budget_exceeded' }
       if (now() >= deadline) return { status: 'timed_out' }
-      const maxTokens = limits.maxOutputTokens - outputTokens
+      let maxTokens = limits.maxOutputTokens - outputTokens
       if (maxTokens <= 0) return { status: 'budget_exceeded' }
+      const room = fitContext(maxTokens)
+      if (room !== undefined) {
+        if (room < MIN_TURN_TOKENS) {
+          return {
+            status: 'budget_exceeded',
+            error: { code: 'CONTEXT_EXHAUSTED', message: `prompt of ~${estimate()} tokens leaves ${room} of contextTokens=${limits.contextTokens}` },
+          }
+        }
+        maxTokens = Math.min(maxTokens, room)
+      }
       turns++
 
       trace.event({ type: 'model_request', turn: turns, messages: messages.length, tools: tools.length, maxTokens })
       const signal = within(deadline - now())
+      const charsAtRequest = charsOf(messages)
       let res
       try {
         res = await client.complete(messages, { signal, maxTokens, tools })
@@ -134,6 +206,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       responses++
       if (res.model) reportedModel = res.model
       if (res.usage.source === 'provider_reported') {
+        calibration = { tokens: res.usage.inputTokens, chars: charsAtRequest }
         inputTokens += res.usage.inputTokens
         outputTokens += res.usage.outputTokens
       } else {

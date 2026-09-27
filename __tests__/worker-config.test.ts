@@ -32,6 +32,12 @@ describe('WorkerConfigSchema', () => {
     expect(msg).toContain(tool)
   })
 
+  it('passes an optional contextTokens through to the limits', () => {
+    const limits = { maxTurns: 8, maxOutputTokens: 4096, maxWallSeconds: 240, maxToolErrors: 2, contextTokens: 32768 }
+    expect(WorkerConfigSchema.parse({ ...base, limits }).limits).toEqual(limits)
+    expect(WorkerConfigSchema.safeParse({ ...base, limits: { ...limits, contextTokens: -1 } }).success).toBe(false)
+  })
+
   it('accepts a subset of the doc tools', () => {
     expect(WorkerConfigSchema.parse({ ...base, allow: ['get_product_doc'] }).allow).toEqual(['get_product_doc'])
   })
