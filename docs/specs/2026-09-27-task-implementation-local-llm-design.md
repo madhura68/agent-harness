@@ -2,7 +2,7 @@
 title: "Agent-harness M3 — TASK_IMPLEMENTATION-jobs via het lokale model op max2"
 status: reviewed
 last_updated: 2026-09-27
-revision: 4
+revision: 5
 ---
 
 # Agent-harness M3 — TASK_IMPLEMENTATION-jobs via het lokale model op max2
