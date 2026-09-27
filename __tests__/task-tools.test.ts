@@ -12,6 +12,10 @@ function tools(root: string, runVerify: (signal: AbortSignal) => Promise<VerifyR
   return createTaskTools({ root, runVerify })
 }
 
+function toolsWithSearchLimits(root: string, searchLimits: { totalBytesCap?: number; timeoutMs?: number; perFileTimeoutMs?: number }) {
+  return createTaskTools({ root, runVerify: neverVerify, searchLimits })
+}
+
 describe('createTaskTools: path containment', () => {
   it('refuses ".." escaping the worktree', async () => {
     const root = tmp('root')
@@ -324,6 +328,92 @@ describe('search', () => {
     const r = await reg.execute('search', { pattern: 'TOPSECRET' }, sig())
     expect(r.ok).toBe(true)
     expect(r.content).not.toContain('content')
+  })
+})
+
+describe('search: incremental matching over large trees (fix round 2, Important)', () => {
+  it('finds a match in a late-sorted directory even when the tree has far more lines than the old fixed candidate cap', async () => {
+    const root = tmp('root')
+    // "aaa" and "bbb" sort — and so get walked — before "zzz". Round 1 stopped COLLECTING candidate
+    // lines once a fixed total (50 000) was reached, so a repo with more lines than that never even
+    // reached files past that point: the real match below would have been silently missed.
+    const fillerLine = 'filler line, nothing to see here\n'
+    mkdirSync(join(root, 'aaa'), { recursive: true })
+    writeFileSync(join(root, 'aaa', 'big1.txt'), fillerLine.repeat(30_000))
+    mkdirSync(join(root, 'bbb'), { recursive: true })
+    writeFileSync(join(root, 'bbb', 'big2.txt'), fillerLine.repeat(30_000))
+    mkdirSync(join(root, 'zzz'), { recursive: true })
+    writeFileSync(join(root, 'zzz', 'target.txt'), 'needle-in-a-haystack-marker\n')
+
+    const reg = tools(root)
+    const r = await reg.execute('search', { pattern: 'needle-in-a-haystack-marker' }, AbortSignal.timeout(15_000))
+    expect(r.ok).toBe(true)
+    expect(r.content).toBe('zzz/target.txt:1: needle-in-a-haystack-marker')
+  }, 20_000)
+
+  it('never reports "geen treffers" when a real hit exists but a time bound cut the search short', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'a.txt'), 'nothing interesting here\n')
+    writeFileSync(join(root, 'b.txt'), 'TARGET should never be reached\n')
+    // An effectively-zero overall budget: the very first file already exceeds it, so the walk stops
+    // before ever reaching b.txt — this must be reported, never silently look like "no matches anywhere".
+    const reg = toolsWithSearchLimits(root, { timeoutMs: 1, perFileTimeoutMs: 1 })
+    const r = await reg.execute('search', { pattern: 'TARGET' }, sig())
+    expect(r.ok).toBe(true)
+    expect(r.content).toContain('(zoekopdracht afgekapt: timeout; beperk met path)')
+  })
+
+  it('never reports "geen treffers" when a real hit exists but the byte budget cut the search short', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'a.txt'), 'this file alone already exceeds the tiny byte budget\n')
+    writeFileSync(join(root, 'b.txt'), 'TARGET should never be reached\n')
+    const reg = toolsWithSearchLimits(root, { totalBytesCap: 10 })
+    const r = await reg.execute('search', { pattern: 'TARGET' }, sig())
+    expect(r.ok).toBe(true)
+    expect(r.content).toContain('(zoekopdracht afgekapt: datalimiet; beperk met path)')
+  })
+
+  it('does not append a truncation notice for an ordinary, complete search', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'a.txt'), 'TARGET\n')
+    const reg = tools(root)
+    const r = await reg.execute('search', { pattern: 'TARGET' }, sig())
+    expect(r.content).toBe('a.txt:1: TARGET')
+    expect(r.content).not.toContain('afgekapt')
+  })
+
+  it('a genuinely empty result over a small, fully-searched tree stays a plain "geen treffers" (no false notice)', async () => {
+    const root = tmp('root')
+    writeFileSync(join(root, 'a.txt'), 'nothing to find here\n')
+    const reg = tools(root)
+    const r = await reg.execute('search', { pattern: 'NEEDLE_NOT_PRESENT' }, sig())
+    expect(r.content).toBe('geen treffers voor NEEDLE_NOT_PRESENT')
+  })
+})
+
+describe('createTaskTools: symlinked worktree root (fix round 2, Minor)', () => {
+  it('list_files works when the worktree root itself is a symlink', async () => {
+    const realRootDir = tmp('realroot')
+    writeFileSync(join(realRootDir, 'a.txt'), 'hi')
+    const parent = tmp('linkparent')
+    const linkRoot = join(parent, 'root-link')
+    symlinkSync(realRootDir, linkRoot)
+
+    const reg = tools(linkRoot)
+    const r = await reg.execute('list_files', {}, sig())
+    expect(r).toMatchObject({ ok: true, content: 'a.txt' })
+  })
+
+  it('search works when the worktree root itself is a symlink', async () => {
+    const realRootDir = tmp('realroot')
+    writeFileSync(join(realRootDir, 'a.txt'), 'TARGET here')
+    const parent = tmp('linkparent')
+    const linkRoot = join(parent, 'root-link')
+    symlinkSync(realRootDir, linkRoot)
+
+    const reg = tools(linkRoot)
+    const r = await reg.execute('search', { pattern: 'TARGET' }, sig())
+    expect(r).toMatchObject({ ok: true, content: 'a.txt:1: TARGET here' })
   })
 })
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { closeSync, constants as fsConstants, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { closeSync, constants as fsConstants, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, type Stats } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { TOOL_OUTPUT_LIMIT } from '../tools/registry.js'
@@ -19,6 +19,13 @@ export type TaskToolsOptions = {
   /** Worktree root; every path argument is resolved against it and may never escape it. */
   root: string
   runVerify: (signal: AbortSignal) => Promise<VerifyRun>
+  /**
+   * Test-only overrides for `search`'s internal bounds. Production callers never set this — each field
+   * defaults to the real constant below. It exists so a test can deterministically exercise the
+   * "a bound cut the search short" notice path in milliseconds, instead of needing an actual 5 s wall
+   * clock or 200 MB of files to genuinely hit the production limits.
+   */
+  searchLimits?: { totalBytesCap?: number; timeoutMs?: number; perFileTimeoutMs?: number }
 }
 
 const GIT_SEGMENT_ERROR = 'pad met .git is niet toegestaan'
@@ -30,9 +37,17 @@ const MAX_READ_CHARS = 20_000
 const READ_TRUNCATED_NOTE = '\n\n[afgekapt, gebruik offset/limit]'
 const MAX_READ_FILE_BYTES = 5 * 1024 * 1024 // read_file refuses a file bigger than this outright
 const MAX_SEARCH_FILE_BYTES = 1 * 1024 * 1024 // search silently skips a file bigger than this
-const MAX_SEARCH_CANDIDATE_LINES = 50_000 // safety cap on lines handed to the matching worker per call
+// Total bytes matched per search() call, not lines: a byte budget scales with real file sizes, unlike a
+// fixed line count that a large-but-ordinary repo can exhaust long before reaching files later in the
+// (alphabetical) walk order — silently missing real matches there with no indication anything was cut.
+const MAX_SEARCH_TOTAL_BYTES = 200 * 1024 * 1024
 const MAX_SEARCH_HITS = 100
 const SEARCH_TIMEOUT_MS = 5000
+// A single file's worth of matching taking anywhere near this long only happens for catastrophic regex
+// backtracking on one of its lines — normal matching of even a full MAX_SEARCH_FILE_BYTES file is well
+// under a millisecond, so this lets a genuine ReDoS hang be told apart from simply running out of the
+// overall SEARCH_TIMEOUT_MS budget while steadily making progress through a large tree.
+const SEARCH_PER_FILE_TIMEOUT_MS = 2000
 const RUN_TESTS_TAIL = 6000
 
 function message(err: unknown): string {
@@ -58,6 +73,16 @@ function capBytes(result: ToolExecResult, limit: number): ToolExecResult {
 
 function relPosix(root: string, target: string): string {
   return relative(root, target).split(sep).join('/')
+}
+
+/**
+ * Type-checking stat for a resolved top-level path: `lstat`, except exactly at the root itself, where
+ * `resolvePath`'s own containment check already exempts a symlinked root (`ancestor !== root`) — using
+ * `lstat` there too would see the symlink instead of what it points to and wrongly report "not a
+ * directory" for a worktree whose root happens to be reached through a symlink.
+ */
+function topLevelStat(root: string, target: string): Stats {
+  return target === root ? statSync(target) : lstatSync(target)
 }
 
 /** Opens for reading without following a final-component symlink; a FIFO/socket never blocks the open itself. */
@@ -168,7 +193,7 @@ function listFiles(root: string, realRoot: string, rawPath: unknown): ToolExecRe
   if (!resolved.ok) return resolved.error
   let st
   try {
-    st = lstatSync(resolved.target)
+    st = topLevelStat(root, resolved.target)
   } catch (err) {
     return toolError(`pad bestaat niet: ${message(err)}`)
   }
@@ -278,7 +303,7 @@ function editFile(root: string, realRoot: string, args: Record<string, unknown>)
 }
 
 type SearchLine = { file: string; lineNo: number; text: string }
-type SearchWorkerResult = { ok: true; hits: string[] } | { ok: false; error: string }
+type MatchOutcome = { ok: true; hits: string[] } | { ok: false; error: string } | { ok: false; error: 'timeout' }
 
 // Regex *matching* against untrusted, model-chosen patterns can blow up (catastrophic backtracking,
 // e.g. /^(a+)+$/ against "aaaa...!"), and that is a synchronous, uninterruptible loop on whichever
@@ -286,50 +311,86 @@ type SearchWorkerResult = { ok: true; hits: string[] } | { ok: false; error: str
 // worker thread lets a hard wall-clock timeout actually stop it via terminate(), which forcibly ends
 // the thread regardless of what synchronous JS is stuck inside it. The eval'd source (not a separate
 // compiled file) keeps this working identically under tsx/vitest and the tsc build.
+//
+// The walk stays on the main thread — that is where every path guard already lives (symlinks never
+// followed, node_modules/.git excluded, plain files only, per-file byte cap) — and one persistent
+// worker is fed one file's lines per message, matching incrementally so a single huge repo cannot
+// silently truncate the search space before ever reaching a match (round-1's fixed-line-count cap did
+// exactly that). The worker itself is spawned fresh per search() call and torn down at the end.
 const SEARCH_WORKER_SOURCE = `
-import('node:worker_threads').then(({ parentPort, workerData }) => {
-  const { pattern, lines, maxHits } = workerData
-  const hits = []
-  try {
-    const re = new RegExp(pattern)
-    for (const { file, lineNo, text } of lines) {
-      if (hits.length >= maxHits) break
-      if (re.test(text)) hits.push(file + ':' + lineNo + ': ' + text)
+import('node:worker_threads').then(({ parentPort }) => {
+  parentPort.on('message', (msg) => {
+    const { pattern, lines, maxHits } = msg
+    const hits = []
+    try {
+      const re = new RegExp(pattern)
+      for (const { file, lineNo, text } of lines) {
+        if (hits.length >= maxHits) break
+        if (re.test(text)) hits.push(file + ':' + lineNo + ': ' + text)
+      }
+      parentPort.postMessage({ ok: true, hits })
+    } catch (err) {
+      parentPort.postMessage({ ok: false, error: err && err.message ? err.message : String(err) })
     }
-    parentPort.postMessage({ ok: true, hits })
-  } catch (err) {
-    parentPort.postMessage({ ok: false, error: err && err.message ? err.message : String(err) })
-  }
+  })
 })
 `
 
-function runSearchWorker(pattern: string, lines: SearchLine[], maxHits: number, signal: AbortSignal): Promise<SearchWorkerResult | { ok: false; error: 'timeout' }> {
+/** One request/response cycle against an already-running worker. On timeout the caller must terminate
+ * the worker (never reused afterwards) — the very reason a request can outlast `timeoutMs` is that the
+ * worker is stuck inside a synchronous `re.test()` call that will never yield back to its event loop. */
+function matchInWorker(worker: Worker, pattern: string, lines: SearchLine[], maxHits: number, timeoutMs: number): Promise<MatchOutcome> {
   return new Promise((resolvePromise) => {
-    // addEventListener('abort', ...) below never fires for a signal that was already aborted before it
-    // was attached, so that case has to be checked up front rather than relying only on the listener.
-    if (signal.aborted) {
-      resolvePromise({ ok: false, error: 'timeout' })
-      return
-    }
-    const worker = new Worker(SEARCH_WORKER_SOURCE, { eval: true, workerData: { pattern, lines, maxHits } })
     let settled = false
-    const finish = (result: SearchWorkerResult | { ok: false; error: 'timeout' }) => {
+    const finish = (result: MatchOutcome) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      signal.removeEventListener('abort', onAbort)
-      void worker.terminate()
+      worker.off('message', onMessage)
+      worker.off('error', onError)
       resolvePromise(result)
     }
-    const timer = setTimeout(() => finish({ ok: false, error: 'timeout' }), SEARCH_TIMEOUT_MS)
-    const onAbort = () => finish({ ok: false, error: 'timeout' })
-    signal.addEventListener('abort', onAbort, { once: true })
-    worker.once('message', (msg: SearchWorkerResult) => finish(msg))
-    worker.once('error', (err: Error) => finish({ ok: false, error: err.message }))
+    const timer = setTimeout(() => finish({ ok: false, error: 'timeout' }), timeoutMs)
+    const onMessage = (msg: MatchOutcome) => finish(msg)
+    const onError = (err: Error) => finish({ ok: false, error: err.message })
+    worker.once('message', onMessage)
+    worker.once('error', onError)
+    worker.postMessage({ pattern, lines, maxHits })
   })
 }
 
-async function search(root: string, realRoot: string, args: Record<string, unknown>, signal: AbortSignal): Promise<ToolExecResult> {
+async function* walkSearchableFiles(dir: string): AsyncGenerator<string> {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name))
+  for (const entry of entries) {
+    if (SKIP_DIR_NAMES.has(entry.name)) continue
+    // Never follow a symlink discovered while recursing (see the matching comment in listFiles): it
+    // could point outside the root and readFileSync/readdirSync would silently follow it.
+    if (entry.isSymbolicLink()) continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) yield* walkSearchableFiles(full)
+    else yield full
+  }
+}
+
+async function* singleSearchableFile(path: string): AsyncGenerator<string> {
+  yield path
+}
+
+type SearchBounds = { totalBytesCap: number; timeoutMs: number; perFileTimeoutMs: number }
+
+async function search(
+  root: string,
+  realRoot: string,
+  args: Record<string, unknown>,
+  signal: AbortSignal,
+  bounds: SearchBounds,
+): Promise<ToolExecResult> {
   const pattern = typeof args.pattern === 'string' ? args.pattern : ''
   try {
     void new RegExp(pattern) // syntax-only check; matching itself happens in the worker
@@ -340,65 +401,75 @@ async function search(root: string, realRoot: string, args: Record<string, unkno
   if (!resolved.ok) return resolved.error
   let stat
   try {
-    stat = lstatSync(resolved.target)
+    stat = topLevelStat(root, resolved.target)
   } catch (err) {
     return toolError(`pad bestaat niet: ${message(err)}`)
   }
 
-  const candidates: SearchLine[] = []
-  const collectFile = (full: string): void => {
-    if (candidates.length >= MAX_SEARCH_CANDIDATE_LINES) return
-    let st
-    try {
-      st = lstatSync(full)
-    } catch {
-      return
+  const deadline = Date.now() + bounds.timeoutMs
+  const worker = new Worker(SEARCH_WORKER_SOURCE, { eval: true })
+  const hits: string[] = []
+  let totalBytes = 0
+  let truncatedReason: string | null = null
+  let redosError: string | null = null
+
+  try {
+    const files = stat.isDirectory() ? walkSearchableFiles(resolved.target) : singleSearchableFile(resolved.target)
+    for await (const full of files) {
+      if (hits.length >= MAX_SEARCH_HITS) break // the documented output cap, not a search-space cut — no notice needed
+      if (signal.aborted || Date.now() >= deadline) {
+        truncatedReason = 'timeout'
+        break
+      }
+
+      let st
+      try {
+        st = lstatSync(full)
+      } catch {
+        continue
+      }
+      // Never anything but a plain file: a FIFO/socket/device can block or misbehave on open/read
+      // regardless of size, so its type alone disqualifies it (symlinks are already excluded by the walk).
+      if (!st.isFile() || st.size > MAX_SEARCH_FILE_BYTES) continue
+      if (totalBytes + st.size > bounds.totalBytesCap) {
+        truncatedReason = 'datalimiet'
+        break
+      }
+
+      let text: string
+      try {
+        text = readFileNoFollow(full)
+      } catch {
+        continue // unreadable/binary/gone: skip rather than fail the whole search
+      }
+      totalBytes += st.size
+      const relFile = relPosix(root, full)
+      const lines: SearchLine[] = text.split('\n').map((t, i) => ({ file: relFile, lineNo: i + 1, text: t }))
+
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        truncatedReason = 'timeout'
+        break
+      }
+      const outcome = await matchInWorker(worker, pattern, lines, MAX_SEARCH_HITS - hits.length, Math.min(bounds.perFileTimeoutMs, remaining))
+      if (!outcome.ok) {
+        // A per-file timeout with the overall budget also gone is a shortage of time, not evidence the
+        // regex itself is pathological — that stays a truncation notice, never the hard ReDoS error.
+        if (outcome.error === 'timeout' && Date.now() >= deadline) truncatedReason = 'timeout'
+        else redosError = outcome.error
+        break
+      }
+      hits.push(...outcome.hits)
     }
-    // Never a symlink (see walk()), and never anything but a plain file: a FIFO/socket/device can
-    // block or misbehave on open/read regardless of size, so its type alone disqualifies it.
-    if (!st.isFile() || st.size > MAX_SEARCH_FILE_BYTES) return
-    let text: string
-    try {
-      text = readFileNoFollow(full)
-    } catch {
-      return // unreadable/binary/gone: skip rather than fail the whole search
-    }
-    const relFile = relPosix(root, full)
-    const lines = text.split('\n')
-    for (let i = 0; i < lines.length && candidates.length < MAX_SEARCH_CANDIDATE_LINES; i++) {
-      candidates.push({ file: relFile, lineNo: i + 1, text: lines[i] })
-    }
-  }
-  const walk = (dir: string): void => {
-    if (candidates.length >= MAX_SEARCH_CANDIDATE_LINES) return
-    let entries
-    try {
-      entries = readdirSync(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-    entries.sort((a, b) => a.name.localeCompare(b.name))
-    for (const entry of entries) {
-      if (candidates.length >= MAX_SEARCH_CANDIDATE_LINES) return
-      if (SKIP_DIR_NAMES.has(entry.name)) continue
-      // Never follow a symlink discovered while recursing (see the matching comment in listFiles):
-      // it could point outside the root and readFileSync/readdirSync would silently follow it.
-      if (entry.isSymbolicLink()) continue
-      const full = join(dir, entry.name)
-      if (entry.isDirectory()) walk(full)
-      else collectFile(full)
-    }
+  } finally {
+    await worker.terminate()
   }
 
-  if (stat.isDirectory()) walk(resolved.target)
-  else collectFile(resolved.target)
-
-  const result = await runSearchWorker(pattern, candidates, MAX_SEARCH_HITS, signal)
-  if (!result.ok) {
-    if (result.error === 'timeout') return toolError('search afgebroken: timeout')
-    return toolError(`search mislukt: ${result.error}`)
+  if (redosError !== null) {
+    return toolError(redosError === 'timeout' ? 'search afgebroken: timeout' : `search mislukt: ${redosError}`)
   }
-  const content = result.hits.length > 0 ? result.hits.join('\n') : `geen treffers voor ${pattern}`
+  let content = hits.length > 0 ? hits.join('\n') : `geen treffers voor ${pattern}`
+  if (truncatedReason) content += `\n(zoekopdracht afgekapt: ${truncatedReason}; beperk met path)`
   return capBytes(toolOk(content), TOOL_OUTPUT_LIMIT)
 }
 
@@ -476,6 +547,11 @@ const TOOL_DEFS: Array<{ name: string; description: string; inputSchema: Record<
 export function createTaskTools(opts: TaskToolsOptions): ToolRegistry {
   const root = resolve(opts.root)
   const realRoot = realpathSync(root)
+  const searchBounds: SearchBounds = {
+    totalBytesCap: opts.searchLimits?.totalBytesCap ?? MAX_SEARCH_TOTAL_BYTES,
+    timeoutMs: opts.searchLimits?.timeoutMs ?? SEARCH_TIMEOUT_MS,
+    perFileTimeoutMs: opts.searchLimits?.perFileTimeoutMs ?? SEARCH_PER_FILE_TIMEOUT_MS,
+  }
 
   const entries: ToolSnapshotEntry[] = [...TOOL_DEFS]
     .sort((a, b) => a.name.localeCompare(b.name))
@@ -504,7 +580,7 @@ export function createTaskTools(opts: TaskToolsOptions): ToolRegistry {
         case 'edit_file':
           return editFile(root, realRoot, args)
         case 'search':
-          return search(root, realRoot, args, signal)
+          return search(root, realRoot, args, signal, searchBounds)
         case 'run_tests':
           return runTests(opts.runVerify, signal)
         default:
