@@ -1,5 +1,7 @@
 # M3 — TASK_IMPLEMENTATION-jobs via het lokale model op max2: implementatieplan
 
+_Status: reviewed — dubbel GO (plan-ronde 4, 2026-09-27). Technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Een Claude-sessie kan een losse Scrum4Me-taak met `dispatch_job({kind:'TASK_IMPLEMENTATION', task_id, required_capability:'local_llm'})` uitbesteden aan `qwen3.8-gsq-rco:27b-iq3_s-text` op max2 en krijgt hem terug als geverifieerde, door `agent-harness` gepushte branch.
@@ -329,7 +331,7 @@ export async function commitAll(worktree: string, message: string): Promise<{ co
 - Consumes: alles uit Taak 6–10; `WorkerDeps` (bestaand) plus `taskDeps?: { spawn?: SpawnFn }` voor tests.
 - Produces:
   - `heartbeat.ts`: `startHeartbeat(control, jobId, ms, onLost: () => void): () => void` (de bestaande logica uit `runOneJob`: weigering ⇒ lost, twee fouten op rij ⇒ lost).
-  - `worker.ts`: `runWorker` roept bij de start (alleen met `config.task`) `killLeftoverContainers` aan en bewaart de uitkomst als `taskReady` (`'clean'` ⇒ true). Idea-chat hangt hier niet van af. Vóór elke taakjob: is `taskReady` false, dan eerst opnieuw `killLeftoverContainers`; blijft het `'uncertain'`, dan sluit `runTaskJob` de job direct af als `failed` ("achtergebleven harness-container niet aantoonbaar opgeruimd; geen taak uitgevoerd") zonder prepare, container, modelaanroep of git, en de worker gaat door (idea-chat blijft werken). `runOneJob` routeert: `IDEA_CHAT` ⇒ bestaande flow (ongewijzigd gedrag, nu met `startHeartbeat`); `TASK_IMPLEMENTATION` ⇒ `runTaskJob`; anders `ClaimFilterError` zoals nu.
+  - `worker.ts`: `runWorker` roept bij de start (alleen met `config.task`) `killLeftoverContainers` aan en bewaart de uitkomst als `taskReady` (`'clean'` ⇒ true). Idea-chat hangt hier niet van af. Vóór elke taakjob: is `taskReady` false, dan eerst opnieuw `killLeftoverContainers`; blijft het `'uncertain'`, dan sluit `runTaskJob` de job in stap 1 (naast "geen recept" en "geen task-config", dus vóór `update_task_status in_progress`; de taak blijft `todo` en is direct opnieuw te dispatchen) af als `failed` ("achtergebleven harness-container niet aantoonbaar opgeruimd; geen taak uitgevoerd") zonder prepare, container, modelaanroep of git, en de worker gaat door (idea-chat blijft werken). `runOneJob` routeert: `IDEA_CHAT` ⇒ bestaande flow (ongewijzigd gedrag, nu met `startHeartbeat`); `TASK_IMPLEMENTATION` ⇒ `runTaskJob`; anders `ClaimFilterError` zoals nu.
   - `task-impl.ts`: `TaskPayloadSchema` (zod: `job_id`, `kind: 'TASK_IMPLEMENTATION'`, `task {id, title, description?: string | null, implementation_plan?: string | null, repo_url?: string | null}`, `story {id, title, description?: string | null, acceptance_criteria?: string | null}`, `product {id, repo_url?: string | null}`, `worktree_path`, `branch_name`), `TASK_SYSTEM_PROMPT`, `renderTaskPrompt(payload): string`, `buildSummary(answer, verifyCommand): string`, `class ContainerUncertainError extends Error`, `runTaskJob(deps, claim): Promise<JobOutcome>`.
 
 **Flow van `runTaskJob`** (spec §4.3; elke stap die faalt ⇒ faalpad):
@@ -374,7 +376,7 @@ Voeg geen dependencies toe; de tests draaien zonder netwerk. Wijzig niets buiten
   - SIGINT tijdens verify ⇒ `docker kill`, `failed` "worker gestopt"; SIGINT na de commit ⇒ `done`;
   - `cleanup: 'uncertain'` afzonderlijk via prepare, via een `run_tests`-aanroep van het model en via de gate ⇒ telkens `failed` met de onzeker-melding, geen volgend modelverzoek, geen verdere container, geen `commitAll`/scan, `runWorker` exit 1; met tegelijk verloren heartbeat ⇒ geen update, wel exit 1;
   - `docker ps` faalt bij de start ⇒ de worker claimt en beantwoordt nog steeds een `IDEA_CHAT`-job;
-  - startup-opruiming `'uncertain'` (bijvoorbeeld `rm -f` faalt voor een achtergebleven container) en de fake `spawn` zou een nieuwe `docker run` wel laten slagen ⇒ een geclaimde taakjob eindigt `failed` met de melding hierboven, zonder één `docker run`; is de hercontrole vóór de taak wél `'clean'`, dan loopt de taak normaal;
+  - startup-opruiming `'uncertain'` (bijvoorbeeld `rm -f` faalt voor een achtergebleven container) en de fake `spawn` zou een nieuwe `docker run` wel laten slagen ⇒ een geclaimde taakjob eindigt `failed` met de melding hierboven, zonder één `docker run` en zonder `update_task_status`-aanroep; is de hercontrole vóór de taak wél `'clean'`, dan loopt de taak normaal;
   - een prepare-fout laat een `container`-event met `kind: 'prepare'` in de trace achter;
   - `buildSummary` met antwoorden van 3 990, 4 000 en 10 000 tekens ⇒ altijd ≤ 4000 en eindigt op de verify-suffix; de fake MCP accepteert de `done`;
   - payload met `description`, `implementation_plan`, `repo_url` en `acceptance_criteria` op `null` ⇒ geldig; de prompt laat die kopjes weg;
@@ -463,3 +465,10 @@ Het Scrum4Me-webrecept, een sprint-branch als `baseRef`, voorrang voor idea-chat
 - **Geaccepteerd (codex MAJOR):** een mislukte startup-opruiming werd alleen gelogd, waarna taakjobs weer containers konden starten naast een mogelijk nog levende oude container; de onzeker-grens gold dan maar tot de volgende herstart. → `killLeftoverContainers` geeft `'clean' | 'uncertain'` (controle ná `rm -f`); de worker houdt `taskReady` bij, controleert opnieuw vóór elke taakjob, en laat bij blijvende onzekerheid de taakjob falen zonder container, model of git; idea-chat blijft werken (Taak 9, 11), met de tegengestelde test.
 - **Geaccepteerd (claude MINOR):** de merge-regel voor scrum4me-mcp-branches (alleen via PR met groene CI, want verify sluit git-geschiedenistests uit) staat in de runbook (Taak 12).
 - **Scope-delta:** geen nieuwe taken.
+
+### Ronde 4 — revisie 4 (`97acf9c`), 2026-09-27
+
+- **Reviewers:** `mac:claude` **GO** (0 / 0 / 1 MINOR), `mac:codex` **GO** (0 / 0 / 0). Ronde-3-reparaties "held" bij beide.
+- **Na GO verwerkt (claude MINOR, eigen reparatievoorstel, geen nieuwe eis):** de weigering bij onzekere startup-opruiming staat in stap 1, vóór `update_task_status in_progress`, zodat de taak `todo` blijft; de test controleert dat er geen `update_task_status`-aanroep is (Taak 11).
+- **Scope-delta:** geen.
+- **Status:** plan-fase afgerond met dubbel GO. Volgende stap is JP's gate vóór de ceremonie.
