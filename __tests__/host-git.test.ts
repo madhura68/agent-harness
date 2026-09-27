@@ -37,7 +37,7 @@ beforeAll(() => {
 })
 
 afterAll(() => {
-  rmSync(configDir, { recursive: true, force: true })
+  if (configDir) rmSync(configDir, { recursive: true, force: true })
 })
 
 afterEach(() => {
@@ -174,8 +174,15 @@ describe('snapshotGitAdmin (fs only)', () => {
 // `readdir`/`lstat` failure), so `chmod 000 node_modules/evil` (hiding a `.git`) came back as a clean
 // scan instead of a refusal. Now every such failure throws; only a genuine readdir/lstat TOCTOU race
 // (`ENOENT` on an entry that vanished between the two calls) is tolerated.
+//
+// Fix round 2: the two chmod-based tests below only prove anything under a non-root user — root bypasses
+// Unix DAC checks entirely, so a `chmod 000`/`0111` directory stays readable to it and the scan (rightly,
+// for root) succeeds. Skipped rather than left to fail red when this file runs as root (e.g. the default
+// user in `node:24-bookworm`), so a root run reports 14 passed + 2 skipped instead of 2 false reds.
+const isRoot = process.getuid?.() === 0
+
 describe('snapshotGitAdmin refuses rather than silently reporting clean', () => {
-  it('throws when a subdirectory is unreadable (chmod 000)', async () => {
+  it.skipIf(isRoot)('throws when a subdirectory is unreadable (chmod 000)', async () => {
     const dir = tmp('chmod000')
     const evilDir = join(dir, 'node_modules', 'evil')
     mkdirSync(evilDir, { recursive: true })
@@ -188,7 +195,7 @@ describe('snapshotGitAdmin refuses rather than silently reporting clean', () => 
     }
   })
 
-  it('throws when a subdirectory is execute-only (mode 0111, no read)', async () => {
+  it.skipIf(isRoot)('throws when a subdirectory is execute-only (mode 0111, no read)', async () => {
     const dir = tmp('mode0111')
     const evilDir = join(dir, 'node_modules', 'evil')
     mkdirSync(evilDir, { recursive: true })
