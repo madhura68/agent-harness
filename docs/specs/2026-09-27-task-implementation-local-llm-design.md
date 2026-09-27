@@ -2,6 +2,7 @@
 title: "Agent-harness M3 — TASK_IMPLEMENTATION-jobs via het lokale model op max2"
 status: draft
 last_updated: 2026-09-27
+revision: 2
 ---
 
 # Agent-harness M3 — TASK_IMPLEMENTATION-jobs via het lokale model op max2
@@ -12,12 +13,16 @@ Vervolg op [M2](2026-09-26-idea-chat-local-llm-design.md). Brainstorm met JP op 
 
 **Doel (JP):** een Claude-sessie die een Scrum4Me-sprint uitvoert, kan losse taken uitbesteden aan het lokale model op max2 en krijgt ze terug als geverifieerde branch om te reviewen en in te mergen.
 
-**Eerst bruikbare resultaat:** één echte Notes-taak (bijvoorbeeld de MCP-tool voor notes in scrum4me-mcp) loopt via een `TASK_IMPLEMENTATION`-job door `qwen3.8-gsq-rco:27b-iq3_s-text`, komt groen door de verify-gate, staat als branch op Forgejo, en de sessie merget hem na review in de sprint-branch.
+**Eerst bruikbare resultaat:** één echte Notes-taak in scrum4me-mcp (bijvoorbeeld de MCP-tool voor notes) loopt via een `TASK_IMPLEMENTATION`-job door `qwen3.8-gsq-rco:27b-iq3_s-text`, komt groen door de verify-gate, staat als branch op Forgejo, en de sessie merget hem na review in de sprint-branch.
+
+**Welke taak komt in aanmerking.** De worktree van een lokale taak begint op de default-branch van de repo (`wait-for-job.ts` geeft geen `baseRef` mee), niet op de sprint-branch van de sessie. Een taak komt daarom alleen in aanmerking als hij bouwt en groen verifieert vanaf de default-branch: alles waarvan hij afhangt (voor de notes-tool: het Prisma-schema van Notes, gevendored in scrum4me-mcp) staat daar al. Dit is een planningsregel voor het Notes-plan.
 
 **Niet-doelen:**
 - sprint-runs of `SPRINT_BATCH` via het lokale model;
 - het managed-dispatch-pad `dispatch_task` (IDEA-213);
 - taken die het databaseschema migreren of dependencies toevoegen;
+- taken in de Scrum4Me-webrepo (recept uitgesteld, zie §6);
+- een sprint-branch als basis van de worktree;
 - een UI-knop "lokaal uitvoeren";
 - automatische terugval naar Claude als het lokale model faalt (de sessie beslist);
 - de hele Notes-feature lokaal bouwen;
@@ -25,56 +30,64 @@ Vervolg op [M2](2026-09-26-idea-chat-local-llm-design.md). Brainstorm met JP op 
 
 **Zichtbaar bewijs:** de job op het jobs-board (DONE, lokaal model als `model_id`, verify-samenvatting), de branch op Forgejo gepusht door de gebruiker `agent-harness`, de trace, en de merge door de sessie.
 
-## 2. Besluiten uit de brainstorm
+## 2. Besluiten
 
 | # | Vraag | Besluit |
 |---|---|---|
-| 1 | Rol van IDEA-226 | Claude plant Notes via de gewone pipeline; per taak wordt gekozen wat lokaal draait (optie B) |
-| 2 | Toewijzing aan het lokale model | Bij het dispatchen: `dispatch_job` krijgt `required_capability: 'local_llm'` (optie A). Reden: Scrum4Me staat op `pr_strategy = SPRINT_BATCH` (één job per sprint-run, geen per-taak-jobs) en sinds juli draaien Claude-sessies de sprints, niet de vloot |
-| 3 | Wanneer is een taak klaar | Harness-gate (verify groen, `verify_task_against_plan` ≠ EMPTY) plus review door de Claude-sessie vóór de merge (optie A) |
-| 4 | Waar draait code van het model | Alleen verify in een wegwerpcontainer zonder netwerk en zonder secrets; werktools in de harness op de host, begrensd tot de worktree (optie A) |
-| 5 | Push-identiteit | Aparte Forgejo-gebruiker `agent-harness` met schrijfrecht op alleen de benodigde repo's (optie A) |
-| 6 | Aanpak | De bestaande worker uitbreiden; één service voor `IDEA_CHAT` en `TASK_IMPLEMENTATION` (aanpak 1) |
+| 1 | Rol van IDEA-226 | Claude plant Notes via de gewone pipeline; per taak wordt gekozen wat lokaal draait (JP, optie B) |
+| 2 | Toewijzing aan het lokale model | Bij het dispatchen: `dispatch_job` krijgt `required_capability: 'local_llm'` (JP, optie A). Reden: Scrum4Me staat op `pr_strategy = SPRINT_BATCH` (één job per sprint-run) en sinds juli draaien Claude-sessies de sprints, niet de vloot |
+| 3 | Wanneer is een taak klaar | Harness-gate (verify groen, `verify_task_against_plan` levert `ALIGNED`/`PARTIAL`) plus review door de Claude-sessie vóór de merge (JP, optie A) |
+| 4 | Waar draait code uit de repo | Nooit op de host. Verify én voorbereiding (`npm ci`, codegen) draaien in wegwerpcontainers zonder secrets; werktools in de harness op de host, begrensd tot de worktree; host-git zonder hooks (JP koos optie A; review ronde 1 breidde de containergrens uit van alleen verify naar ook voorbereiding) |
+| 5 | Push-identiteit | Aparte Forgejo-gebruiker `agent-harness` met schrijfrecht op alleen de benodigde repo's (JP, optie A) |
+| 6 | Aanpak | De bestaande worker uitbreiden; één service voor `IDEA_CHAT` en `TASK_IMPLEMENTATION` (JP, aanpak 1) |
+| 7 | Status na afloop | De MCP laat bij `local_llm`-taakjobs de normale DONE/FAILED-doorwerking naar story, PBI en sprint en de PBI-fail-cascade achterwege; de harness zet de taak zelf op `review` (groen) of laat hem op `in_progress` (fout) |
 
 ## 3. Architectuur en stroom
 
 ```
 Claude-sessie (Notes-sprint)
   └─ dispatch_job {kind: TASK_IMPLEMENTATION, task_id, required_capability: 'local_llm'}
-       → ClaudeJob QUEUED, required_capability = 'local_llm', geen auto-PR
+       → ClaudeJob QUEUED, source COPILOT, required_capability 'local_llm'
 agent-harness-worker (max2, systemd)
-  ├─ control: wait_for_job → claim; MCP maakt worktree op feat/story-<id8>
-  ├─ prepare (host, netwerk, onveranderde base-commit): recept van de repo
+  ├─ control: wait_for_job → claim (MCP: worktree op feat/story-<id8>, zonder prepare:worktree-hook)
+  ├─ heartbeat loopt vanaf de claim tot en met de afsluitende update
+  ├─ prepare-container (netwerk, geen env): recept van de repo
   ├─ modelloop: werktools + doc-leestools, contextTokens 65536
-  │    └─ run_tests / eindgate → verify in container (--network none, geen env)
-  ├─ groen: git commit → verify_task_against_plan → update_job_status done (MCP pusht)
-  └─ rood/budget/fout: update_job_status failed (backup-push M38)
+  │    └─ run_tests / eindgate → verify-container (--network none, geen env)
+  ├─ groen: host-git commit zonder hooks → verify_task_against_plan → update_job_status done
+  │        (MCP pusht zonder hooks) → bevestigde DONE → update_task_status review
+  └─ fout: update_job_status failed (backup-push M38); taak blijft in_progress
 Claude-sessie
   └─ get_job_status → review diff tegen taak → merge story-branch in sprint-branch, of afwijzen
 ```
 
 ## 4. Harness
 
-### 4.1 Claim en config
+### 4.1 Claim, config en control-kanaal
 
-- `src/worker/worker.ts`: de tweede grendel accepteert `IDEA_CHAT` en `TASK_IMPLEMENTATION`. Elke andere soort blijft `ClaimFilterError` (job sluiten, worker stopt met exit 1).
+- `src/worker/worker.ts`: de tweede grendel accepteert `IDEA_CHAT` en `TASK_IMPLEMENTATION`. Elke andere soort blijft `ClaimFilterError` (job sluiten, worker stopt met exit 1). Het echte filter zit in de MCP (§5.1).
 - `src/worker/config.ts`: nieuw optioneel blok `task`:
 
 ```ts
 task?: {
   limits: { maxTurns; maxOutputTokens; maxWallSeconds; maxToolErrors; contextTokens }  // voorbeeld 40 / 80000 / 2400 / 8 / 65536
-  verifyImage: string                   // vast node-image, zelfde major als de host-node
-  verifyTimeoutSeconds: number          // standaard 600
-  maxVerifyRepairs: number              // standaard 3
+  image: string                 // vast node-image, zelfde major als de host-node (v24)
+  uid: number; gid: number      // container-gebruiker = eigenaar van de worktree
+  npmCacheDir: string           // host-map, alleen in de prepare-container gemount
+  prepareTimeoutSeconds: number // standaard 900
+  verifyTimeoutSeconds: number  // standaard 600
+  maxVerifyRepairs: number      // standaard 3
   recipes: Array<{
-    repoUrl: string                     // exacte match op task.repo_url ?? product.repo_url
-    prepare: string[]                   // host, met netwerk, in de worktree, vóór het model
-    verify: string                      // in de container
+    repoUrl: string             // exacte match op task.repo_url ?? product.repo_url
+    prepare: string[]           // in de prepare-container, in de worktree
+    verify: string              // in de verify-container
   }>
 }
 ```
 
-Beide soorten delen de capability `local_llm`, dus een worker zonder `task`-blok kan een taakjob toch claimen. Hij sluit die dan direct als `failed` met "worker heeft geen task-config", zonder modelbeurten en zonder de taak aan te raken. Een aparte capability per soort is niet nodig: alleen de lokale worker claimt `local_llm`.
+  Beide soorten delen de capability `local_llm`, dus een worker zonder `task`-blok kan een taakjob toch claimen. Hij sluit die dan als `failed` ("worker heeft geen task-config"), zonder modelbeurten. Omdat de MCP bij `local_llm` geen statusdoorwerking doet (§5.2), raakt dat de taak niet.
+- `src/worker/control.ts`: `CONTROL_TOOLS` en `ControlChannel` krijgen `update_task_status`, `verify_task_against_plan`, `log_implementation`, `log_commit` en `log_test_result`. `updateStatus` geeft de werkelijke uitkomst van `update_job_status` terug (status, branch, `pushed_at`, fout uit het JSON-antwoord), niet alleen "geen `isError`".
+- Heartbeat: loopt vanaf de claim, door `prepare` en de modelloop heen, tot en met de afsluitende update.
 
 ### 4.2 Werktools (`src/worker/task-tools.ts`)
 
@@ -87,82 +100,121 @@ Een `ToolRegistry` in het harness-proces (geen MCP-kind), gecombineerd met de vi
 | `write_file {path, content}` | maakt mappen aan |
 | `edit_file {path, old_string, new_string}` | `old_string` moet precies één keer voorkomen |
 | `search {pattern, path?}` | regex, max 100 treffers `bestand:regel: tekst` |
-| `run_tests {}` | het verify-commando van het recept in de container (§4.4); exitcode plus de laatste 6 000 tekens |
+| `run_tests {}` | het verify-commando in de verify-container (§4.4); antwoord `ok: true` met exitcode en de laatste 6 000 tekens, ook bij rode tests; `ok: false` alleen als de runner zelf faalt |
 
-Elk pad wordt opgelost via `realpath` van de dichtstbijzijnde bestaande voorouder en moet binnen de worktree vallen; anders een toolfout. Geen git- of shell-tool voor het model.
+Elk pad wordt opgelost via `realpath` van de dichtstbijzijnde bestaande voorouder en moet binnen de worktree vallen. Paden met een segment `.git` zijn verboden. Geen git- of shell-tool voor het model.
 
 ### 4.3 Afhandeling per taakjob (`src/worker/task-impl.ts`)
 
 Het model schrijft niets naar Scrum4Me; de harness doet dat deterministisch:
 
-1. Payload valideren (Zod: `task`, `story`, `worktree_path`, `branch_name`, repo-URL). Recept kiezen; geen recept → `failed` ("geen recept voor <repo>"), taak ongemoeid.
-2. `update_job_status running`, `update_task_status in_progress`.
-3. `prepare`-commando's op de host in de worktree, met netwerk, op de onveranderde base-commit. Faalt er een → `failed` met de laatste 2 000 tekens log.
+1. Payload valideren (Zod: `task`, `story`, `worktree_path`, `branch_name`, repo-URL). De inhoud van het gitlink-bestand `<worktree>/.git` vastleggen. Recept kiezen; geen recept → `failed` ("geen recept voor <repo>").
+2. `update_job_status running`, `update_task_status in_progress`, `log_implementation` (start).
+3. `prepare`-commando's in de prepare-container (§4.4). Faalt er een → `failed` met de laatste 2 000 tekens log.
 4. Modelloop (§4.4) met de systeemprompt uit de spike plus taak, plan, story en acceptatiecriteria als data.
-5. Na groene verify: `git add -A && git commit` met auteur `agent-harness` en de taaktitel als boodschap; geen wijzigingen → `failed` ("model produceerde geen wijzigingen").
-6. `verify_task_against_plan`. `ALIGNED`/`PARTIAL` → verder; `EMPTY` of `DIVERGENT` → `failed` met die reden (protocol `worker-idempotency`).
-7. `log_commit`, `log_test_result PASSED`, `update_job_status done` met summary = eindantwoord van het model (ingekort) plus de verify-uitslag, en `update_task_status review`. De MCP pusht de branch.
-8. Elk faalpad na stap 2: `log_test_result FAILED` waar van toepassing, `update_job_status failed` met leesbare reden, en de taak blijft `in_progress` (protocol: handmatig onderzoeken). De sessie zet hem op `to_do` als ze opnieuw wil dispatchen.
+5. Na groene verify: controleren dat `<worktree>/.git` ongewijzigd is (anders `failed`, "gitlink gewijzigd"); dan host-git `git -c core.hooksPath=/dev/null commit --no-verify` met auteur `agent-harness` en de taaktitel als boodschap. Geen wijzigingen → `failed` ("model produceerde geen wijzigingen").
+6. `verify_task_against_plan`. `ALIGNED`/`PARTIAL` → verder; `EMPTY` of `DIVERGENT` → `failed` met die reden.
+7. `log_commit`, `log_test_result PASSED`, `update_job_status done` met summary = eindantwoord van het model (ingekort) plus de verify-uitslag.
+8. Alleen als het antwoord een bevestigde DONE met `pushed_at` is: `update_task_status review`. Weigert de MCP `done` (verify-gate) of eindigt de job als FAILED (pushfout): de harness stuurt niet nogmaals een terminale update als de job al terminaal is; anders `update_job_status failed` met de weigeringstekst. De taak blijft `in_progress`.
+9. Elk faalpad na stap 2: `log_test_result FAILED` waar van toepassing, `update_job_status failed` met leesbare reden. De taak blijft `in_progress`; wil de sessie opnieuw dispatchen, dan zet ze hem op `todo` (API-spelling).
 
-Stop of verlies van eigenaarschap: zoals M2 — niet afsluiten; de lease-sweep zet de job terug in de wachtrij.
+**Stoppen:** verlies van eigenaarschap → zoals M2: niet afsluiten, de lease-sweep zet de job terug in de wachtrij. SIGINT (systemd-stop) tijdens een taak → de lopende stap afbreken, de verify-container killen, `update_job_status failed` ("worker gestopt"), taak `in_progress`. Idea-chat houdt het bestaande M2-gedrag.
 
-### 4.4 Verify-lus en container
+### 4.4 Containers en de verify-lus
 
+- **Prepare-container:** `docker run --rm --cpus 8 --memory 8g --user <uid>:<gid> -v <worktree>:<worktree> -v <npmCacheDir>:/npm-cache -e npm_config_cache=/npm-cache -w <worktree> <image> sh -c "<prepare-commando's>"`. Netwerk aan (npm-registry), verder geen env, geen andere mounts, harde timeout.
+- **Verify-container:** hetzelfde zonder npm-cache-mount en met `--network none`, harde timeout (`verifyTimeoutSeconds`, daarna `docker kill`). Timeout telt als rood.
+- Omdat verify geen netwerk heeft, faalt het als het model dependencies toevoegt; dat hoort bij de niet-doelen.
 - `src/run.ts` krijgt een optionele haak `afterAnswer(answer): Promise<string | null>`. Geeft het model een eindantwoord, dan roept de loop de haak aan; een string wordt als user-bericht toegevoegd en de loop gaat door binnen dezelfde limieten; `null` sluit af als `completed`. Zonder haak verandert er niets (idea-chat).
 - De taak-handler implementeert de haak: verify draaien; groen → `null`; rood → "Verify faalt (poging n van maxVerifyRepairs): <uitvoer>"; na `maxVerifyRepairs` keer rood → de run eindigt als `failed` met code `VERIFY_FAILED`.
-- Container-runner (`src/worker/verify-container.ts`): `docker run --rm --network none --cpus 8 --memory 8g --user <uid>:<gid> -v <worktree>:<worktree> -w <worktree> <verifyImage> sh -c "<verify>"`, zonder `-e`/`--env-file`, met een harde timeout (`verifyTimeoutSeconds`, daarna `docker kill`). Timeout telt als rood.
-- Omdat de container geen netwerk heeft, faalt verify als het model dependencies toevoegt; dat hoort bij de niet-doelen.
 
-### 4.5 Trace en secrets
+### 4.5 Beveiligingsmodel
 
-Trace zoals v0/M2, plus events voor `prepare` (commando, exitcode, duur) en elke verify (bron `run_tests`/`gate`, exitcode, duur). Het Forgejo-token staat alleen in de env van het MCP-kind (§5, §6); de werktools, het model en de verify-container zien het nooit. `prepare` erft de env van de worker niet: de runner geeft alleen `PATH`, `HOME` en npm-cache-variabelen door.
+- **Code uit de repo draait alleen in containers.** Dat geldt voor alles wat het model kan beïnvloeden: `package.json`-scripts, lifecycle-hooks, codegen, tests. Ook bij een hergebruikte story-branch met eerdere, ongereviewde modelcommits.
+- **Host-git draait zonder hooks.** Harness-commit met `core.hooksPath=/dev/null` en `--no-verify`; de MCP-push voor `local_llm`-jobs met dezelfde vlaggen (§5.3). Git-config en de gitdir staan buiten de worktree; het gitlink-bestand wordt vóór elke host-git-operatie gecontroleerd.
+- **Secrets:** het Forgejo-token en de DB-credentials staan alleen in de env van de worker en het MCP-kind. Werktools, model en containers zien ze nooit; containers krijgen geen `-e` of `--env-file` behalve de npm-cache-variabele.
+- **Restrisico:** de prepare-container heeft netwerk en draait mogelijk door het model gewijzigde scripts. Hij heeft geen secrets en alleen de worktree en de npm-cache gemount; Ollama en de ops-agent op max2 zijn niet zonder token of vanaf het docker-netwerk bereikbaar. De npm-cache kan door zo'n script vervuild raken; hij staat apart van de cache van de gebruiker.
+- **Trace:** zoals v0/M2, plus events voor `prepare` en elke verify (bron `run_tests`/`gate`, exitcode, duur).
 
 ## 5. Wijzigingen in scrum4me-mcp
 
-- `dispatch_job`: optionele `required_capability`, enum `['local_llm']`, alleen toegestaan bij `kind: 'TASK_IMPLEMENTATION'` (anders validatiefout). `dispatchTaskImplementation` schrijft hem op de job.
-- `update_job_status`: geen auto-PR (`maybeCreateAutoPr`) als `required_capability = 'local_llm'`. De push en de backup-push bij `failed` blijven.
-- Claim-isolatie bestaat al (`eligibility.ts`, lokale worker claimt alleen `local_llm`; vloot slaat `local_llm` over).
-- Tests: dispatch slaat de capability op; een andere soort met capability wordt geweigerd; done met `local_llm` roept geen auto-PR aan; een worker zonder `local_llm` claimt de job niet.
+### 5.1 Dispatch en claim
+
+- `dispatch_job`: optionele `required_capability`, enum `['local_llm']`, alleen toegestaan bij `kind: 'TASK_IMPLEMENTATION'` (anders validatiefout). `dispatchTaskImplementation` schrijft hem op de job (source blijft `COPILOT`).
+- Claimfilter: de `local_llm`-tak in `src/dispatch/eligibility.ts` staat nu alleen `kind = 'IDEA_CHAT' AND source = 'SYSTEM'` toe. Hij wordt uitgebreid naar twee combinaties: de bestaande, en `kind = 'TASK_IMPLEMENTATION' AND source = 'COPILOT' AND sprint_run_id IS NULL`. Alle representaties van die tak gaan mee: de string-builder, `claimConditions.capability` (SQL-fragment), de predicate-evaluator en de higher-tier-peer-guard.
+- Runtime: de worker registreert als `CLAUDE` en het filter matcht op `cj.runtime`; de job krijgt zijn runtime uit de config-snapshot. Voor het product moet de runtime van `TASK_IMPLEMENTATION` dus `CLAUDE` zijn (standaard).
+
+### 5.2 Afsluiten zonder doorwerking
+
+Voor `TASK_IMPLEMENTATION` met `required_capability = 'local_llm'` slaat `update_job_status`:
+- `maybeCreateAutoPr` over;
+- `propagateStatusUpwards` (DONE/FAILED naar taak, story, PBI, sprint en SprintRun) over;
+- `cancelPbiOnFailure` over.
+
+Push, backup-push bij `failed` (M38), verify-gate, jobregistratie en tokenvelden blijven. De taakstatus beheert de harness zelf (§4.3).
+
+### 5.3 Worktree en push zonder repo-code
+
+Voor jobs met `required_capability = 'local_llm'`:
+- `createWorktreeForJob` roept de `prepare:worktree`-hook niet aan (die draait nu met `exec` in het MCP-proces, met diens env);
+- `pushBranchForJob` en de backup-push draaien `git -c core.hooksPath=/dev/null push --no-verify`.
+
+### 5.4 Tests
+
+Dispatch slaat de capability op en weigert hem bij een andere soort; de lokale worker (`['local_llm']`) claimt een `TASK_IMPLEMENTATION`/`COPILOT`/`local_llm`-job en een IDEA_CHAT-job, maar geen gewone taakjob; een gewone worker claimt de lokale taakjob niet; done en failed met `local_llm` roepen geen auto-PR, geen doorwerking en geen PBI-cascade aan (met een tweede actieve job onder dezelfde PBI die actief blijft); worktree-aanmaak met `local_llm` draait geen `prepare:worktree`; push met `local_llm` bevat de hook-vlaggen.
 
 ## 6. Inrichting max2 (serveracties, op JP's go)
 
-- Forgejo-gebruiker `agent-harness` met schrijfrecht op Scrum4Me, scrum4me-mcp en agent-harness; token in `/etc/agent-harness/worker.env` als `FORGEJO_PUSH_TOKEN`. De worker-config geeft het MCP-kind `GIT_ASKPASS=<script>` en het token; git-identiteit `agent-harness`.
+- Forgejo-gebruiker `agent-harness` met schrijfrecht op scrum4me-mcp en agent-harness; token in `/etc/agent-harness/worker.env` als `FORGEJO_PUSH_TOKEN`. De worker-config geeft het MCP-kind `GIT_ASKPASS=<script>` en het token; git-identiteit `agent-harness`.
 - `scoped_products` van het worker-token uitbreiden met Scrum4Me (`cmohrysyj0000rd17clnjy4tc`).
-- Verse clones in `/var/lib/agent-harness/repos/`; worktrees in `/var/lib/agent-harness/worktrees/` via `SCRUM4ME_REPO_ROOT_<product>` / `repoRoots` en `SCRUM4ME_AGENT_WORKTREE_DIR`. Een taak met `task.repo_url` (scrum4me-mcp) krijgt een clone via de bestaande override.
-- Verify-image eenmalig pullen; `uid`/`gid` van `janpeter` in de config.
-- Recepten (exacte commando's in het plan, na een losse proef op max2): agent-harness (`npm ci` / `npm run verify`), scrum4me-mcp (`npm ci` met Prisma-generate / `npm run typecheck && npm test`), Scrum4Me (submodule, `npm ci`, Prisma-generate / `npm run verify`).
+- Verse clones in `/var/lib/agent-harness/repos/`; worktrees in `/var/lib/agent-harness/worktrees/` via `SCRUM4ME_AGENT_WORKTREE_DIR`. Repo-roots via `SCRUM4ME_REPO_ROOT_<productId>` (product) en `SCRUM4ME_REPO_ROOT_REPO_<repoName>` (taak met `task.repo_url`, zoals scrum4me-mcp).
+- Image eenmalig pullen; `uid`/`gid` van `janpeter` en een eigen npm-cachemap in de config.
+- Recepten (exacte commando's in het plan, na een recept-proef op max2): agent-harness (`npm ci` / `npm run verify`) en scrum4me-mcp (`npm ci` met Prisma-generate / `npm run typecheck && npm test`). **Scrum4Me-web is uitgesteld**: husky, submodule, Prisma en `postinstall` maken dat recept het lastigst, en geen van de acceptatiecriteria heeft het nodig.
 
 ## 7. Uitrol en bouwvolgorde
 
-1. Harness-PR (§4) en MCP-PR (§5), beide door JP gemerged.
-2. Inrichting max2 (§6) op JP's go; recept-proef per repo met een lege worktree (prepare + verify groen op main).
-3. Acceptatie 1–3 (§9).
-4. Notes (IDEA-226) via de gewone pipeline: spec, plan, ceremonie. De eerste lokale taak is acceptatie 4.
+1. MCP-PR (§5) en harness-PR (§4), beide door JP gemerged. De MCP-PR gaat eerst: zonder de filterwijziging blijft een lokale taakjob QUEUED.
+2. Inrichting max2 (§6) op JP's go; vloot en `scrum4me-mcp-stable` naar de nieuwe MCP; recept-proef per repo met een lege worktree op main (prepare + verify groen).
+3. Acceptatie 1–4 (§9). Pas daarna dispatcht een sessie echte taken met `local_llm`.
+4. Notes (IDEA-226) via de gewone pipeline: spec, plan, ceremonie, met de planningsregel uit §1. De eerste lokale taak is acceptatie 5.
 
 ## 8. Tests (zonder netwerk)
 
-- Werktools: padbegrenzing (`..`, absoluut pad, symlink naar buiten), `edit_file` uniek/niet-uniek, `read_file` met bereik en afkapmelding, `list_files` slaat `node_modules` over.
-- `run.ts`: `afterAnswer` rood → verder → groen; 3× rood → `failed`/`VERIFY_FAILED`; zonder haak ongewijzigd gedrag.
-- Container-runner: gebouwde `docker`-argumenten bevatten `--network none`, geen `-e`/`--env-file`, de juiste mount; timeout → rood (injecteerbare process-runner).
-- Taak-handler tegen nep-control en nep-model: volgorde van control-aanroepen op het groene pad; elk faalpad uit §4.3 met de juiste job- en taakstatus; geen recept; geen wijzigingen; `DIVERGENT`.
+- Werktools: padbegrenzing (`..`, absoluut pad, symlink naar buiten, `.git`-segment), `edit_file` uniek/niet-uniek, `read_file` met bereik en afkapmelding, `list_files` slaat `node_modules` over.
+- `run.ts`: `afterAnswer` rood → verder → groen; 3× rood → `failed`/`VERIFY_FAILED`; zonder haak ongewijzigd gedrag; een rode `run_tests` telt niet als toolfout.
+- Container-runner: gebouwde `docker`-argumenten voor prepare (netwerk, npm-cache, geen andere env) en verify (`--network none`, geen `-e`/`--env-file`); timeout → rood (injecteerbare process-runner).
+- Host-git: de gebouwde commit-argumenten bevatten `core.hooksPath=/dev/null` en `--no-verify`; een gewijzigd gitlink-bestand geeft `failed` vóór de commit.
+- Taak-handler tegen nep-control en nep-model: volgorde van control-aanroepen op het groene pad; elk faalpad uit §4.3 met de juiste job- en taakstatus; `done` geweigerd; `done` die als FAILED terugkomt (pushfout) zet de taak niet op `review`; SIGINT tijdens de modelloop.
 - Worker: claimfilter accepteert beide soorten; een taakjob zonder `task`-config → `failed`; idea-chat-regressie.
 
 ## 9. Acceptatiecriteria
 
-1. Een kleine echte taak in agent-harness, gedispatcht met `local_llm`: job DONE met lokaal `model_id` en verify-samenvatting, branch gepusht door `agent-harness`, geen PR, taak op `review` (live).
-2. Een taak waarvan verify niet groen kan worden: job FAILED met de verify-uitvoer, taak `in_progress`, geen PR (live).
-3. De verify-container heeft geen netwerk en geen secrets: een proef-verify met `env` en een netwerkaanroep toont geen token en een mislukte verbinding (live).
-4. De eerste Notes-taak: de sessie reviewt de branch en merget hem in de Notes-sprint-branch (live).
-5. Idea-chat blijft werken (regressietest en één live bericht).
+1. Een kleine echte taak in agent-harness, gedispatcht met `local_llm`: job DONE met lokaal `model_id` en verify-samenvatting, branch gepusht door `agent-harness`, geen PR, taak op `review`, story/PBI/sprint ongewijzigd (live).
+2. Een taak waarvan verify niet groen kan worden: job FAILED met de verify-uitvoer, taak `in_progress`, geen PR, geen doorwerking naar story/PBI/sprint (live).
+3. Isolatie: een proef-verify met `env` en een netwerkaanroep toont geen token en een mislukte verbinding; een door de proeftaak gewijzigde `.husky/pre-commit` met een onschuldige marker draait niet bij de host-commit (live).
+4. Tweede claim op dezelfde story-branch: de door de eerste job gecommitte wijziging aan een `prepare`-script draait alleen in de prepare-container, niet op de host (live, met marker).
+5. De eerste Notes-taak in scrum4me-mcp: de sessie reviewt de branch en merget hem in de Notes-sprint-branch (live).
+6. Idea-chat blijft werken (regressietest en één live bericht).
 
 ## 10. Risico's en open punten
 
-- **Modelkwaliteit:** de spike haalde 7/9 op kleine taken; echte Notes-taken zijn groter. Mitigatie: taken klein snijden in het Notes-plan, verify-gate, review door de sessie.
-- **Scrum4Me-verify in een verse worktree** (geen `.env`, Prisma-client, submodule) was eerder lastig; eerst bewijzen in de recept-proef (§7 stap 2) vóór een Scrum4Me-taak.
+- **Modelkwaliteit:** de spike haalde 7/9 op kleine taken; echte Notes-taken zijn groter. Mitigatie: taken klein snijden, verify-gate, review door de sessie.
+- **Basis op de default-branch:** taken die op ongemergd sprintwerk leunen komen niet in aanmerking (§1). Een sprint-branch als `baseRef` is een latere uitbreiding.
 - **Doorlooptijd:** één job tegelijk; een taak (tot 40 minuten) houdt idea-chat op.
 - **GPU-delen:** TEI blijft uit; een toekomstige embedding-job moet de GPU vrijmaken of elders draaien.
 - **Docker-groep:** `janpeter` in de docker-groep is root-equivalent op max2; alleen de harness roept docker aan, nooit het model.
+- **Scrum4Me-web:** uitgesteld tot een eigen recept-proef bewijst dat verify in een verse worktree groen is.
 
 ## Review record
 
-_(wordt per ronde bijgewerkt)_
+### Ronde 1 — revisie 1 (`93433aa`), 2026-09-27
+
+- **Reviewers:** `mac:claude` NO-GO (3 BLOCKER / 2 MAJOR / 4 MINOR), `mac:codex` NO-GO (4 BLOCKER / 2 MAJOR / 2 MINOR).
+- **Convergent, geaccepteerd en bevestigd in de tree:**
+  - claimfilter `local_llm` staat alleen `IDEA_CHAT`/`SYSTEM` toe (`eligibility.ts:83-96`, ook SQL-fragment, predicate en peer-guard) → §5.1 breidt uit, positieve claimtest;
+  - `update_job_status` werkt voor COPILOT-taakjobs door naar story/PBI/sprint en draait bij FAILED de PBI-cascade (`update-job-status.ts:1304-1314`, `:1607`) → §5.2 slaat beide over, harness beheert de taakstatus;
+  - host-commit en MCP-push draaien git-hooks (husky) → hooks uit voor host-git (§4.3 stap 5, §5.3), gitlink-controle, acceptatie 3;
+  - voorbereiding kan ongereviewde branchcode op de host draaien, ook via `prepare:worktree` in het MCP-proces (`worktree.ts:34`) → prepare in een container (§4.4), MCP slaat de hook over (§5.3), acceptatie 4.
+- **Enkelvoudig, geaccepteerd:** basis op de default-branch als planningsregel (claude, MAJOR → §1, §10); geweigerde of als FAILED teruggekomen `done` (claude MINOR + codex MAJOR → §4.1, §4.3 stap 8); control-kanaal en heartbeat (claude MINOR → §4.1); rode `run_tests` geen toolfout (claude MINOR → §4.2); runtime `CLAUDE` en env-namen (claude MINOR → §5.1, §6); stoppen versus eigenaarschap (codex MINOR → §4.3); startlog en API-spelling `todo` (codex MINOR → §4.3).
+- **Afgewezen, ter beoordeling in ronde 2:** codex MAJOR "SKIPPED-pad ontbreekt". In deze route dispatcht alleen de sessie zelf, één taak tegelijk, en werkt ze niet parallel aan dezelfde taak; "al aanwezig op main" is geen realistisch pad. Met §5.2 heeft een FAILED zonder wijzigingen geen doorwerking meer: de taak blijft `in_progress` en de sessie kijkt. Een betrouwbaar "al aanwezig"-bewijs vergt meer dan een lege diff (codex zegt dat zelf) en voegt een pad toe zonder concreet faalgeval binnen dit doel.
+- **Scope-delta:** Scrum4Me-webrecept uitgesteld (claude-suggestie; geen acceptatiecriterium heeft het nodig) → minder hostrisico; containergrens uitgebreid van alleen verify naar ook prepare (strengere bescherming, zelfde doel); MCP-wijzigingen gegroeid van twee naar vier punten (§5.1–5.3). Eerste bruikbare resultaat en eerste praktijkproef ongewijzigd.
