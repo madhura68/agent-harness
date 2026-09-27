@@ -2,7 +2,7 @@
 title: "Agent-harness M3 — TASK_IMPLEMENTATION-jobs via het lokale model op max2"
 status: draft
 last_updated: 2026-09-27
-revision: 3
+revision: 4
 ---
 
 # Agent-harness M3 — TASK_IMPLEMENTATION-jobs via het lokale model op max2
@@ -56,7 +56,7 @@ agent-harness-worker (max2, systemd)
   │    └─ run_tests / eindgate → verify-container (--network none, geen env)
   ├─ groen: host-git commit zonder hooks → verify_task_against_plan → update_job_status done
   │        (MCP pusht zonder hooks) → bevestigde DONE → update_task_status review
-  └─ fout: update_job_status failed (backup-push M38); taak blijft in_progress
+  └─ fout: update_job_status failed, zonder git in de worktree (geen backup-push); taak blijft in_progress
 Claude-sessie
   └─ get_job_status → review diff tegen taak → merge story-branch in sprint-branch, of afwijzen
 ```
@@ -112,11 +112,11 @@ Het model schrijft niets naar Scrum4Me; de harness doet dat deterministisch:
 2. `update_job_status running`, `update_task_status in_progress`, `log_implementation` (start).
 3. `prepare`-commando's in de prepare-container (§4.4). Faalt er een → `failed` met de laatste 2 000 tekens log.
 4. Modelloop (§4.4) met de systeemprompt uit de spike plus taak, plan, story en acceptatiecriteria als data.
-5. Na groene verify (er draait dan geen container meer): de git-administratie opnieuw scannen, ook in `node_modules`, en vergelijken met de snapshot; een gewijzigd of nieuw `.git`-item → `failed` ("git-administratie gewijzigd"), zonder verdere git-operatie. Dan met veilige host-git (§4.5) `git add -A` en `git commit --no-verify` met auteur `agent-harness` en de taaktitel als boodschap. Geen gestagede wijzigingen → `failed` ("model produceerde geen wijzigingen").
+5. Na groene verify (er draait dan geen container meer): de git-administratie opnieuw scannen, ook in `node_modules`, en vergelijken met de snapshot; een gewijzigd, nieuw of verdwenen `.git`-item → `failed` ("git-administratie gewijzigd"), zonder verdere git-operatie. Dan met veilige host-git (§4.5) `git add -A` en `git commit --no-verify` met auteur `agent-harness` en de taaktitel als boodschap. Geen gestagede wijzigingen → `failed` ("model produceerde geen wijzigingen").
 6. `verify_task_against_plan`. `ALIGNED`/`PARTIAL` → verder; `EMPTY` of `DIVERGENT` → `failed` met die reden.
 7. `log_commit`, `log_test_result PASSED`, `update_job_status done` met summary = eindantwoord van het model (ingekort) plus de verify-uitslag.
 8. Alleen als het antwoord een bevestigde DONE met `pushed_at` is: `update_task_status review`. Weigert de MCP `done` (verify-gate) of eindigt de job als FAILED (pushfout): de harness stuurt niet nogmaals een terminale update als de job al terminaal is; anders `update_job_status failed` met de weigeringstekst. De taak blijft `in_progress`.
-9. Elk faalpad na stap 2: `log_test_result FAILED` waar van toepassing, `update_job_status failed` met leesbare reden. De taak blijft `in_progress`; wil de sessie opnieuw dispatchen, dan zet ze hem op `todo` (API-spelling).
+9. Elk faalpad na stap 2 (prepare-fout, rode verify, budget, timeout, stop, gewijzigde git-administratie, geweigerde `done`): eerst elke lopende container killen; dan `log_test_result FAILED` waar van toepassing en `update_job_status failed` met leesbare reden. De harness doet op deze paden geen enkele git-operatie, en de MCP ook niet (§5.3). De worktree blijft staan voor onderzoek. Een commit bestaat alleen na een groene verify en een geslaagde scan (stap 5); faalt daarna nog iets, dan staat die commit op de story-branch in de clone en neemt de volgende claim op die story hem mee. De taak blijft `in_progress`; wil de sessie opnieuw dispatchen, dan zet ze hem op `todo` (API-spelling).
 
 **Stoppen:** verlies van eigenaarschap → zoals M2: niet afsluiten, de lease-sweep zet de job terug in de wachtrij. SIGINT (systemd-stop) tijdens een taak → de lopende stap afbreken, de verify-container killen, `update_job_status failed` ("worker gestopt"), taak `in_progress`. Idea-chat houdt het bestaande M2-gedrag.
 
@@ -131,7 +131,7 @@ Het model schrijft niets naar Scrum4Me; de harness doet dat deterministisch:
 ### 4.5 Beveiligingsmodel
 
 - **Code uit de repo draait alleen in containers.** Dat geldt voor alles wat het model kan beïnvloeden: `package.json`-scripts, lifecycle-hooks, codegen, tests. Ook bij een hergebruikte story-branch met eerdere, ongereviewde modelcommits.
-- **Veilige host-git.** Elke git-aanroep op de host tegen een `local_llm`-worktree (harness én MCP, §5.3) gebruikt `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c diff.ignoreSubmodules=all -c status.submoduleSummary=false -c submodule.recurse=false` en, waar van toepassing, `--no-verify`. De gitdir en config van de repo staan buiten de worktree; de containers kunnen wel gitlinks in de worktree wijzigen (ook van submodules) en daarmee git naar zelfgemaakte administratie met uitvoerbare config laten wijzen. Daarom scant de harness vóór de eerste host-git-operatie na een container alle `.git`-items tegen de snapshot van de claim (§4.3 stap 1 en 5); pas daarna mogen harness en MCP (`verify_task_against_plan`, push) de worktree aanraken.
+- **Veilige host-git.** Elke git-aanroep op de host tegen een `local_llm`-worktree (harness én MCP, §5.3) gebruikt `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c diff.ignoreSubmodules=all -c status.submoduleSummary=false -c submodule.recurse=false` en, waar van toepassing, `--no-verify`. De gitdir en config van de repo staan buiten de worktree; de containers kunnen wel gitlinks in de worktree wijzigen (ook van submodules) en daarmee git naar zelfgemaakte administratie met uitvoerbare config laten wijzen. Daarom geldt: **de scan is de controle, de vlaggen zijn een extra laag** (een omgebogen gitlink levert git een complete, door de container gemaakte config, en een vlaggenlijst kan niet alles uitschakelen, bijvoorbeeld `core.sshCommand`). Git draait met de worktree als werkmap alleen op het groene pad, nadat de harness alle `.git`-items tegen de snapshot van de claim heeft gescand (§4.3 stap 1 en 5): harness-commit, `verify_task_against_plan` en de push bij `done`. Op elk ander pad (failed, stop, requeue, opruimen) draait noch de harness noch de MCP git in die worktree (§4.3 stap 9, §5.3).
 - **Secrets:** het Forgejo-token en de DB-credentials staan alleen in de env van de worker en het MCP-kind. Werktools, model en containers zien ze nooit; containers krijgen geen `-e` of `--env-file` behalve de npm-cache-variabele.
 - **Restrisico:** de prepare-container heeft netwerk en draait mogelijk door het model gewijzigde scripts. Hij heeft geen secrets en alleen de worktree en de npm-cache gemount. Dat Ollama (alleen `127.0.0.1`) en de ops-agent (bearer-token) vanuit de container niet bruikbaar zijn, is een verwachting die acceptatie 4 live bewijst. De npm-cache kan door zo'n script vervuild raken; hij staat apart van de cache van de gebruiker.
 - **Trace:** zoals v0/M2, plus events voor `prepare` en elke verify (bron `run_tests`/`gate`, exitcode, duur).
@@ -151,18 +151,20 @@ Voor `TASK_IMPLEMENTATION` met `required_capability = 'local_llm'` slaat `update
 - `propagateStatusUpwards` (DONE/FAILED naar taak, story, PBI, sprint en SprintRun) over;
 - `cancelPbiOnFailure` over.
 
-Push, backup-push bij `failed` (M38), verify-gate, jobregistratie en tokenvelden blijven. De taakstatus beheert de harness zelf (§4.3).
+Push bij `done`, verify-gate, jobregistratie en tokenvelden blijven. De backup-push bij `failed` (M38) vervalt voor `local_llm` (§5.3). De taakstatus beheert de harness zelf (§4.3).
 
 ### 5.3 Worktree en push zonder repo-code
 
 Voor jobs met `required_capability = 'local_llm'`:
 - `createWorktreeForJob` roept de `prepare:worktree`-hook niet aan (die draait nu met `exec` in het MCP-proces, met diens env);
 - `initSubmodules` (`git submodule update --init --recursive`, host, met de push-credentials) draait alleen als `.gitmodules` in de worktree gelijk is aan die op de default-branch; anders faalt de claim met een leesbare reden. Een door het model gewijzigde submodule-URL kan zo geen andere host laten benaderen;
-- alle git-aanroepen van de MCP op die worktree (`getGitDiff` voor `verify_task_against_plan`, `pushBranchForJob`, de backup-push en de `rev-parse`-aanroepen daarin) gebruiken de veilige vlaggen uit §4.5, de push ook `--no-verify`.
+- de git-aanroepen van de MCP op het groene pad (`getGitDiff` voor `verify_task_against_plan`, `pushBranchForJob` bij `done`, en de `rev-parse`- en `remote set-head`-aanroepen daarin) gebruiken de veilige vlaggen uit §4.5, de push ook `--no-verify`;
+- geen git met de worktree als werkmap op de andere paden: `backupPushOnFailure` bij `failed` (`update-job-status.ts:184-199`), `maybeBackupPush` bij rollback en stale-reset/requeue (`wait-for-job.ts:276`, `:595`) worden overgeslagen;
+- opruimen van een `local_llm`-worktree: map verwijderen via het bestandssysteem en daarna `git worktree prune` vanuit de clone-root (met de veilige vlaggen); nooit `git worktree remove` of een andere git-aanroep in de worktree zelf.
 
 ### 5.4 Tests
 
-Dispatch slaat de capability op en weigert hem bij een andere soort; de lokale worker (`['local_llm']`) claimt een `TASK_IMPLEMENTATION`/`COPILOT`/`local_llm`-job en een IDEA_CHAT-job, maar geen gewone taakjob; een gewone worker claimt de lokale taakjob niet; done en failed met `local_llm` roepen geen auto-PR, geen doorwerking en geen PBI-cascade aan (met een tweede actieve job onder dezelfde PBI die actief blijft); worktree-aanmaak met `local_llm` draait geen `prepare:worktree` en slaat `initSubmodules` over (met foutmelding) als `.gitmodules` afwijkt van de default-branch; diff, push en backup-push met `local_llm` bevatten de veilige vlaggen; de lokale dispatch zet `runtime` expliciet op `CLAUDE`.
+Dispatch slaat de capability op en weigert hem bij een andere soort; de lokale worker (`['local_llm']`) claimt een `TASK_IMPLEMENTATION`/`COPILOT`/`local_llm`-job en een IDEA_CHAT-job, maar geen gewone taakjob; een gewone worker claimt de lokale taakjob niet; done en failed met `local_llm` roepen geen auto-PR, geen doorwerking en geen PBI-cascade aan (met een tweede actieve job onder dezelfde PBI die actief blijft); worktree-aanmaak met `local_llm` draait geen `prepare:worktree` en slaat `initSubmodules` over (met foutmelding) als `.gitmodules` afwijkt van de default-branch; diff en push bij `done` met `local_llm` bevatten de veilige vlaggen; `failed`, rollback, stale-reset en opruimen met `local_llm` voeren geen git-aanroep uit met de worktree als werkmap; de lokale dispatch zet `runtime` expliciet op `CLAUDE`.
 
 ## 6. Inrichting max2 (serveracties, op JP's go)
 
@@ -185,7 +187,8 @@ Dispatch slaat de capability op en weigert hem bij een andere soort; de lokale w
 - Werktools: padbegrenzing (`..`, absoluut pad, symlink naar buiten, `.git`-segment), `edit_file` uniek/niet-uniek, `read_file` met bereik en afkapmelding, `list_files` slaat `node_modules` over.
 - `run.ts`: `afterAnswer` rood → verder → groen; 3× rood → `failed`/`VERIFY_FAILED`; zonder haak ongewijzigd gedrag; een rode `run_tests` telt niet als toolfout.
 - Container-runner: gebouwde `docker`-argumenten voor prepare (netwerk, npm-cache, geen andere env) en verify (`--network none`, geen `-e`/`--env-file`); timeout → rood (injecteerbare process-runner).
-- Host-git tegen een echte tijdelijke repo (niet alleen gebouwde argumenten): een gewijzigd bestaand bestand én een nieuw bestand komen in de commit; een gewijzigde gitlink van de worktree of van een submodule, of een nieuw `.git`-item, geeft `failed` vóór enige git-aanroep; met een submodule-gitlink die naar administratie met `core.fsmonitor`-marker wijst, draait de marker niet (regressietest van het ronde-2-bewijs).
+- Host-git tegen een echte tijdelijke repo (niet alleen gebouwde argumenten): een gewijzigd bestaand bestand én een nieuw bestand komen in de commit; een gewijzigde gitlink van de worktree of van een submodule, een nieuw `.git`-item of een verdwenen submodule-gitlink geeft `failed` vóór enige git-aanroep; met een submodule-gitlink die naar administratie met `core.fsmonitor`-marker wijst, draait de marker niet (regressietest van het ronde-2-bewijs).
+- Keten harness → echte MCP-handler `update_job_status failed` → backup/opruimen, met een omgebogen worktree-gitlink naar administratie met een `core.sshCommand`- en `core.fsmonitor`-marker: de marker ontstaat nooit.
 - Taak-handler tegen nep-control en nep-model: volgorde van control-aanroepen op het groene pad; elk faalpad uit §4.3 met de juiste job- en taakstatus; `done` geweigerd; `done` die als FAILED terugkomt (pushfout) zet de taak niet op `review`; SIGINT tijdens de modelloop.
 - Worker: claimfilter accepteert beide soorten; een taakjob zonder `task`-config → `failed`; idea-chat-regressie.
 
@@ -193,7 +196,7 @@ Dispatch slaat de capability op en weigert hem bij een andere soort; de lokale w
 
 1. Een kleine echte taak in agent-harness, gedispatcht met `local_llm`: job DONE met lokaal `model_id` en verify-samenvatting, branch gepusht door `agent-harness`, geen PR, taak op `review`, story/PBI/sprint ongewijzigd (live).
 2. Een taak waarvan verify niet groen kan worden: job FAILED met de verify-uitvoer, taak `in_progress`, geen PR, geen doorwerking naar story/PBI/sprint (live).
-3. Isolatie: een proef-verify met `env` en een netwerkaanroep toont geen token en een mislukte verbinding; een door de proeftaak gewijzigde `.husky/pre-commit` met een onschuldige marker draait niet bij de host-commit; een door de container omgebogen submodule-gitlink laat de job falen vóór enige host-git (live).
+3. Isolatie: een proef-verify met `env` en een netwerkaanroep toont geen token en een mislukte verbinding; een door de proeftaak gewijzigde `.husky/pre-commit` met een onschuldige marker draait niet bij de host-commit; een door de container omgebogen submodule- of worktree-gitlink laat de job falen zonder dat er daarna nog git in de worktree draait, ook niet via de MCP (live, met marker).
 4. Tweede claim op dezelfde story-branch: de door de eerste job gecommitte wijziging aan een `prepare`-script draait alleen in de prepare-container, niet op de host; een door de eerste job gewijzigde `.gitmodules` laat de tweede claim falen zonder submodule-init; vanuit de prepare-container zijn de Ollama-poort en de ops-agent op de host-gateway niet bereikbaar (weigering vastgelegd) (live, met markers).
 5. De eerste Notes-taak in scrum4me-mcp: de sessie reviewt de branch en merget hem in de Notes-sprint-branch (live).
 6. Idea-chat blijft werken (regressietest en één live bericht).
@@ -231,3 +234,10 @@ Dispatch slaat de capability op en weigert hem bij een andere soort; de lokale w
   - claude MAJOR — `initSubmodules` draait op de host met push-credentials en een URL uit de branch (`worktree.ts:102-117`) → alleen bij `.gitmodules` gelijk aan de default-branch (§5.3), askpass alleen voor de Forgejo-host (§6), live-proef (§9.4).
 - **MINORs geaccepteerd:** hergebruik van de story-branch in de basisregel (codex, §1); runtime via DB-default, lokale dispatch zet `CLAUDE` expliciet (codex, §5.1); clones zonder `node_modules` (claude, §6); netwerkclaim prepare-container live bewijzen (claude, §4.5, §9.4); geen `local_llm`-dispatch vóór de nieuwe harness draait (claude, §7); product-scope met beide producten (claude, §6).
 - **Scope-delta:** kleiner in uitrol — alleen de MCP-checkouts op max2 en de Mac, niet de vloot (codex-suggestie, §7). Groter in bescherming: git-administratiescan en veilige git-vlaggen in harness en MCP. Eerste bruikbare resultaat en eerste praktijkproef ongewijzigd.
+
+### Ronde 3 — revisie 3 (`6ff937b`), 2026-09-27
+
+- **Reviewers:** `mac:claude` NO-GO (1 BLOCKER / 0 MAJOR / 1 MINOR), `mac:codex` NO-GO (1 BLOCKER / 0 MAJOR / 0 MINOR). Ronde-2-reparaties: `git add` en submodule-init "held" bij beide, git-administratie "partially held" bij beide.
+- **Convergent BLOCKER, geaccepteerd en bevestigd in de tree:** op de faalpaden (failed, stop, requeue) draait de MCP nog git met de worktree als werkmap zonder scan: `backupPushOnFailure` (`update-job-status.ts:184-199`), `maybeBackupPush` bij rollback en stale-reset (`wait-for-job.ts:276`, `:595`), met `remote set-head` en `push`. Codex bewees met een marker dat een omgebogen gitlink naar administratie met `core.sshCommand` ondanks alle §4.5-vlaggen code start. → Voor `local_llm` geen git in de worktree buiten het gescande groene pad: backup-pushes vervallen, opruimen zonder git in de worktree (§4.3 stap 9, §4.5, §5.2, §5.3); de scan is de controle, de vlaggen een extra laag; keten-test met marker (§8) en live-proef (§9.3). Er gaat niets verloren: een commit ontstaat pas na groene verify en scan.
+- **MINOR geaccepteerd:** een verdwenen `.git`-item telt ook als afwijking (claude, §4.3 stap 5, §8).
+- **Scope-delta:** kleiner — de M38-backup-push en de git-gebaseerde opruiming vallen weg voor `local_llm`; geen nieuw subsysteem. Eerste bruikbare resultaat en eerste praktijkproef ongewijzigd.
