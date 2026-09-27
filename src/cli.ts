@@ -116,7 +116,7 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
   }
 
   const trace = openTrace(out, manifest.id)
-  const client = createModelClient({ baseUrl: manifest.model.baseUrl, name: manifest.model.name, apiKey: manifest.model.apiKey })
+  const client = createModelClient(manifest.model)
   const result = await runManifest(manifest, { client, trace, connectRegistry, ...(skipProbe && manifest.profile === 'tools' ? { probeSkipped: true } : {}) })
   const u = result.usage
   process.stdout.write(
@@ -153,7 +153,7 @@ async function cmdWorker(values: Values): Promise<number> {
     const { exitCode, jobs } = await runWorker({
       control: createControlChannel(client),
       registryView: (signal) => createRegistryView(client, config.allow, signal),
-      modelClient: createModelClient({ baseUrl: config.model.baseUrl, name: config.model.name, apiKey: config.model.apiKey }),
+      modelClient: createModelClient(config.model),
       config,
       out,
       once: values.once === true,

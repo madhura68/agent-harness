@@ -84,3 +84,12 @@ describe('expandEnv / resolveServerEnv', () => {
     expect(resolveServerEnv(loadManifest(write(answer)), {})).toEqual({})
   })
 })
+
+describe('model.reasoningEffort in a manifest', () => {
+  it('accepts a known effort and rejects an unknown one', async () => {
+    const { ManifestSchema } = await import('../src/manifest.js')
+    const m = { id: 'x', profile: 'answer', prompt: 'p', model: { baseUrl: 'http://127.0.0.1:1/v1', name: 'm', reasoningEffort: 'none' }, limits: { maxTurns: 1, maxOutputTokens: 1, maxWallSeconds: 1, maxToolErrors: 0 } }
+    expect(ManifestSchema.parse(m).model.reasoningEffort).toBe('none')
+    expect(ManifestSchema.safeParse({ ...m, model: { ...m.model, reasoningEffort: 'off' } }).success).toBe(false)
+  })
+})

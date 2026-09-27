@@ -1,7 +1,7 @@
 {
   "model": {
     "baseUrl": "http://127.0.0.1:11434/v1",
-    "name": "qwen3.6:35b-a3b-coding"
+    "name": "qwen3.8-gsq-rco:27b-iq3_s-text"
   },
   "mcp": {
     "command": "/Users/janpetervisser/Development/scrum4me-mcp-stable/node_modules/.bin/tsx",
@@ -23,8 +23,8 @@
     "related_product_docs"
   ],
   "limits": {
-    "maxTurns": 6,
-    "maxOutputTokens": 2048,
+    "maxTurns": 8,
+    "maxOutputTokens": 4096,
     "maxWallSeconds": 240,
     "maxToolErrors": 2
   },

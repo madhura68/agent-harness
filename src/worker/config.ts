@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { z } from 'zod'
-import { expandEnv, ManifestError } from '../manifest.js'
+import { expandEnv, ManifestError, ModelSpecSchema } from '../manifest.js'
 
 /** The only tools the model may see in worker mode: read-only product docs. */
 export const DOC_TOOLS = ['search_product_docs', 'get_product_doc', 'list_product_docs', 'related_product_docs'] as const
@@ -11,7 +11,7 @@ const DEFAULT_LIMITS = { maxTurns: 6, maxOutputTokens: 2048, maxWallSeconds: 240
 
 export const WorkerConfigSchema = z
   .object({
-    model: z.object({ baseUrl: z.string().url(), name: z.string().min(1), apiKey: z.string().optional() }),
+    model: ModelSpecSchema,
     mcp: z.object({ command: z.string().min(1), args: z.array(z.string()), env: z.record(z.string(), z.string()).optional() }),
     allow: z.array(z.string().min(1)).min(1).default([...DOC_TOOLS]),
     limits: z

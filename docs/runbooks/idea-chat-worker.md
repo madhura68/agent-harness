@@ -12,7 +12,7 @@ Recept voor `harness worker` en het live bewijs van M2 ([spec](../specs/2026-09-
 
 1. **scrum4me-mcp met de `local_llm`-isolatie.** De worker draait zijn MCP-kindproces uit `~/Development/scrum4me-mcp-stable`. Die checkout moet de M2-MCP-wijziging bevatten (claimfilter + `chat.pending_user_message_ids`); zonder isolatie claimt een `['local_llm']`-worker via het generieke filter ook gewone jobs. Na de merge: `git -C ~/Development/scrum4me-mcp-stable pull --ff-only && npm --prefix ~/Development/scrum4me-mcp-stable ci`.
 2. **Tunnel naar max2:** `ssh -N -L 127.0.0.1:11434:127.0.0.1:11434 max2`. Controleer vóór een proef met `curl -s http://127.0.0.1:11434/api/tags` of het model nog op max2 staat (qwen3-coder:30b was op 2026-09-27 verwijderd) en met `api/ps` welk model geladen is (`OLLAMA_MAX_LOADED_MODELS=1`: een ander model betekent een swap en een trage eerste beurt).
-3. **Probe:** `runs/probe-<model>/probe.json` met `tool_calling: reliable` voor het model uit de config (`harness probe --base-url http://127.0.0.1:11434/v1 --model qwen3.6:35b-a3b-coding --out runs`). Een ander model = eerst een nieuwe probe.
+3. **Probe:** `runs/probe-<model>/probe.json` met `tool_calling: reliable` voor het model uit de config (`harness probe --base-url http://127.0.0.1:11434/v1 --model qwen3.8-gsq-rco:27b-iq3_s-text --out runs`). Een ander model = eerst een nieuwe probe.
 4. **Omgeving:** `SCRUM4ME_TOKEN`, `DATABASE_URL`, `DIRECT_URL` in de shell (dezelfde als de scrum4me-MCP van de Mac). Waarden nooit in config, trace of dit runbook.
 
 ## Starten
@@ -65,3 +65,18 @@ Promptgrootte (spec §10): de grootste beurt was 2046 inputtokens, ruim binnen `
 Kwaliteit: het tweede antwoord stelt dat de docs "meestal onder `docs/`" in de repo staan zonder dat te controleren (geen toolcall). Zichtbaar zwakker dan Claude, zoals spec §10 verwacht.
 
 Nevenbevinding: de CLAUDE-vloot op scrum4me-server en max2 draait een te oude Claude Code (2.1.197) voor het jobmodel; gewone jobs pendelen daardoor tussen CLAIMED en QUEUED (ISS-36). De web-uitrol liep daarom rechtstreeks via de ops-agent-flow `update_scrum4me_web` in plaats van via een DEPLOY-job. Raakt de lokale worker niet.
+
+## Modelkeuze (2026-09-27, TEI uit)
+
+Uitgangspunt: benchmark in `janpeter/max2` PR #13 (`llm-bench/results/`). Met TEI aan is `qwen3.6:35b-a3b-coding` (MoE) de enige snelle optie; met TEI uit past `qwen3.8-gsq-rco:27b-iq3_s-text` (dense, ~12 GB) volledig op de GPU. Beide halen de harness-probe (`reliable`, 4/4).
+
+Vergelijking: de drie echte beurten van IDEA-224 opnieuw afgespeeld (zelfde prompt, zelfde doc-tools, alleen lezen), 2× per model per instelling. Bronnen: `runs/cmp-out/cmp-*` (thinking aan) en `runs/cmp-out/cmpn-*` (`reasoningEffort: none`), lokaal.
+
+| | qwen3.6, thinking aan | GSQ-RCO, thinking aan | qwen3.6, thinking uit | GSQ-RCO, thinking uit |
+|---|---|---|---|---|
+| Voltooid | 4/6 (2× `budget_exceeded`: 2048 tokens verborgen thinking, lege content) | **6/6** | 6/6 | 6/6 |
+| V1 "welke docs?" | juist (toolcall) | juist (toolcall) | **verzonnen**, geen toolcall | juist (toolcall) |
+| V2 "staan ze in de repo?" | gok zonder toolcall | **2/2 juist**, 6–8 toolcalls, 33–39 s | **verzonnen** | 1/2 juist, 10–19 s |
+| V3 "heb je de scrum4me-mcp?" | redelijk | precies (lezen ja, wijzigen nee) | kort, juist | juist |
+
+Besluit: `examples/worker.json` gebruikt GSQ-RCO IQ3_S-text met thinking aan, `maxTurns: 8` (V2 gebruikte tot 5 beurten) en `maxOutputTokens: 4096` (thinking telt mee; V2 gebruikte tot 1693). `reasoningEffort: none` blijft beschikbaar, maar niet aanbevolen voor deze modellen. Gaat TEI weer aan, dan terug naar qwen3.6 (GSQ-RCO zakt naast TEI naar 13–22 tok/s) met thinking aan en ruimer uitvoerbudget, en vóór gebruik opnieuw proeven.

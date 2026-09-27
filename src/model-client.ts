@@ -1,6 +1,9 @@
 import type { ChatMessage, CompleteResult, ToolCall, ToolDef, Usage } from './types.js'
 
-export type ModelClientOptions = { baseUrl: string; name: string; apiKey?: string }
+export const REASONING_EFFORTS = ['none', 'low', 'medium', 'high'] as const
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number]
+/** reasoningEffort goes out as OpenAI `reasoning_effort`; Ollama's /v1 turns thinking off with 'none' (its `think` field is ignored there). */
+export type ModelClientOptions = { baseUrl: string; name: string; apiKey?: string; reasoningEffort?: ReasoningEffort }
 export type CompleteOptions = { signal: AbortSignal; maxTokens: number; tools?: ToolDef[] }
 export type ModelClient = { complete(messages: ChatMessage[], options: CompleteOptions): Promise<CompleteResult> }
 
@@ -65,6 +68,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         stream: false,
       }
       if (options.tools && options.tools.length > 0) body.tools = options.tools
+      if (opts.reasoningEffort) body.reasoning_effort = opts.reasoningEffort
 
       let text: string
       let status: number
