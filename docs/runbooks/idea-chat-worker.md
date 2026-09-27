@@ -15,12 +15,50 @@ Recept voor `harness worker` en het live bewijs van M2 ([spec](../specs/2026-09-
 3. **Probe:** `runs/probe-<model>/probe.json` met `tool_calling: reliable` voor het model uit de config (`harness probe --base-url http://127.0.0.1:11434/v1 --model qwen3.8-gsq-rco:27b-iq3_s-text --out runs`). Een ander model = eerst een nieuwe probe.
 4. **Omgeving:** `SCRUM4ME_TOKEN`, `DATABASE_URL`, `DIRECT_URL` in de shell (dezelfde als de scrum4me-MCP van de Mac). Waarden nooit in config, trace of dit runbook.
 
-## Starten
+## Productie: service op max2 (sinds 2026-09-27)
+
+De worker draait als systemd-service op max2, naast Ollama: geen tunnel, altijd aan.
+
+| Onderdeel | Waar |
+|---|---|
+| Unit | `/etc/systemd/system/agent-harness-worker.service` (`User=janpeter`, `Restart=always`, `RestartSec=30`, `KillSignal=SIGINT`, na `ollama.service`) |
+| Code | `~/Development/agent-harness` (gebouwd: `dist/cli.js`) en `~/Development/scrum4me-mcp-stable` (MCP-kindproces via `tsx`) |
+| Config | `/etc/agent-harness/worker.json`: model `qwen3.8-gsq-rco:27b-iq3_s-text`, baseUrl `http://127.0.0.1:11434/v1`, thinking aan, `maxTurns 8`, `maxOutputTokens 4096` |
+| Secrets | `/etc/agent-harness/worker.env` (root, 0600): `SCRUM4ME_TOKEN` = eigen token `agent-harness-local-llm-max2`; `DATABASE_URL`/`DIRECT_URL` = beperkte worker-rol uit `worker-idea.env` |
+| Runs en probe | `/var/lib/agent-harness/runs/` (probe voor het model moet hier staan) |
+
+Beheer:
+
+```bash
+sudo systemctl status agent-harness-worker
+journalctl -u agent-harness-worker -f
+sudo systemctl restart agent-harness-worker   # SIGINT: lopende job → failed "worker gestopt"
+```
+
+Bijwerken na een merge (op max2; `git` vraagt de Forgejo-PAT, er is geen credential helper):
+
+```bash
+cd ~/Development/agent-harness && git pull --ff-only && npm ci && npm run build
+cd ~/Development/scrum4me-mcp-stable && git pull --ff-only && git submodule update --init && npm ci   # alleen bij MCP-wijzigingen
+sudo systemctl restart agent-harness-worker
+```
+
+Ander model: eerst `node dist/cli.js probe --base-url http://127.0.0.1:11434/v1 --model <naam> --out /var/lib/agent-harness/runs`, dan `worker.json` aanpassen en herstarten. Zonder `reliable`-probe start de worker niet (`PROBE_REQUIRED`).
+
+Bewijs: job `cmujtwnbj001qvz7rn2ytmgct` (IDEA-224, 2026-09-27 13:02) DONE in 12 s door de service (token `agent-harness-local-llm-max2`, `model_id qwen3.8-gsq-rco:27b-iq3_s-text`); beantwoordde beide openstaande berichten, ook dat van de eerder mislukte beurt.
+
+Aandachtspunten: het token is (nog) niet op Agent-harness gescopet; de MCP logt `MaxListenersExceededWarning` door een listener-lek in `wait_for_job` (ISS-8 op scrum4me-mcp, onschadelijk).
+
+## Lokaal draaien (Mac, ontwikkeling)
+
+Vereist de tunnel en de omgeving uit de voorwaarden hierboven.
 
 ```bash
 npm run dev -- worker --config examples/worker.json --out runs          # doorlopend
 npm run dev -- worker --config examples/worker.json --out runs --once   # één claim of één lege wachtronde
 ```
+
+Draai lokaal niet tegelijk met de service zonder reden: beide claimen dezelfde jobs.
 
 Stoppen: Ctrl-C (lopende job → `failed` "worker gestopt"; een al voltooid antwoord wordt nog als `done` afgesloten). Een tweede Ctrl-C breekt direct af: een lopende job blijft dan op RUNNING tot de lease-reset (≤ 5 minuten) hem terugzet.
 
@@ -29,7 +67,7 @@ Vangnet: krijgt de worker toch een andere soort dan IDEA_CHAT, of een IDEA_CHAT-
 ## Uitzetten
 
 1. Leeg `IDEA_CHAT_LOCAL_PRODUCT_IDS` in de env van de web-app en herstart die. Nieuwe chatbeurten gaan dan weer naar de gewone vloot.
-2. Jobs die al met `local_llm` op QUEUED/CLAIMED staan, worden niet omgerouteerd. Omdat een idee maar één actieve chatjob tegelijk heeft, blokkeert zo'n job verdere beurten in dat idee. Laat de worker draaien tot ze op zijn, of annuleer ze op het jobs-board.
+2. Stop de service (`sudo systemctl disable --now agent-harness-worker`) pas nadat de `local_llm`-jobs op zijn. Jobs die al met `local_llm` op QUEUED/CLAIMED staan, worden niet omgerouteerd. Omdat een idee maar één actieve chatjob tegelijk heeft, blokkeert zo'n job verdere beurten in dat idee. Laat de worker draaien tot ze op zijn, of annuleer ze op het jobs-board.
 
 ## Bekende grens
 
