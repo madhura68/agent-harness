@@ -23,7 +23,7 @@ De worker draait als systemd-service op max2, naast Ollama: geen tunnel, altijd 
 |---|---|
 | Unit | `/etc/systemd/system/agent-harness-worker.service` (`User=janpeter`, `Restart=always`, `RestartSec=30`, `KillSignal=SIGINT`, na `ollama.service`) |
 | Code | `~/Development/agent-harness` (gebouwd: `dist/cli.js`) en `~/Development/scrum4me-mcp-stable` (MCP-kindproces via `tsx`) |
-| Config | `/etc/agent-harness/worker.json`: model `qwen3.8-gsq-rco:27b-iq3_s-text`, baseUrl `http://127.0.0.1:11434/v1`, thinking aan, `maxTurns 8`, `maxOutputTokens 4096`. `limits.contextTokens` (zie [probe-and-run-max2](probe-and-run-max2.md#contextvenster-en-lange-beurten)) staat er nog niet in; het voorbeeld in `examples/worker.json` heeft `32768` |
+| Config | `/etc/agent-harness/worker.json`: model `qwen3.8-gsq-rco:27b-iq3_s-text`, baseUrl `http://127.0.0.1:11434/v1`, thinking aan, `maxTurns 8`, `maxOutputTokens 4096`, `contextTokens 65536`, gelijk aan `OLLAMA_CONTEXT_LENGTH` in `/etc/systemd/system/ollama.service.d/override.conf` (zie [contextvenster](probe-and-run-max2.md#contextvenster-en-lange-beurten) en [meetproef](probe-and-run-max2.md#meetproef-contextvenster-2026-09-27)). Pas de twee altijd samen aan |
 | Secrets | `/etc/agent-harness/worker.env` (root, 0600): `SCRUM4ME_TOKEN` = eigen token `agent-harness-local-llm-max2`; `DATABASE_URL`/`DIRECT_URL` = beperkte worker-rol uit `worker-idea.env` |
 | Runs en probe | `/var/lib/agent-harness/runs/` (probe voor het model moet hier staan) |
 
@@ -117,4 +117,4 @@ Vergelijking: de drie echte beurten van IDEA-224 opnieuw afgespeeld (zelfde prom
 | V2 "staan ze in de repo?" | gok zonder toolcall | **2/2 juist**, 6–8 toolcalls, 33–39 s | **verzonnen** | 1/2 juist, 10–19 s |
 | V3 "heb je de scrum4me-mcp?" | redelijk | precies (lezen ja, wijzigen nee) | kort, juist | juist |
 
-Besluit: `examples/worker.json` gebruikt GSQ-RCO IQ3_S-text met thinking aan, `maxTurns: 8` (V2 gebruikte tot 5 beurten) en `maxOutputTokens: 4096` (thinking telt mee; V2 gebruikte tot 1693). `reasoningEffort: none` blijft beschikbaar, maar niet aanbevolen voor deze modellen. Gaat TEI weer aan, dan terug naar qwen3.6 (GSQ-RCO zakt naast TEI naar 13–22 tok/s) met thinking aan en ruimer uitvoerbudget, en vóór gebruik opnieuw proeven.
+Besluit: `examples/worker.json` gebruikt GSQ-RCO IQ3_S-text met thinking aan, `maxTurns: 8` (V2 gebruikte tot 5 beurten) en `maxOutputTokens: 4096` (thinking telt mee; V2 gebruikte tot 1693). `reasoningEffort: none` blijft beschikbaar, maar niet aanbevolen voor deze modellen. TEI blijft voorlopig uit; voor de embeddings wordt een andere oplossing gezocht. Gaat TEI toch weer aan op deze GPU, dan terug naar qwen3.6 (GSQ-RCO zakt naast TEI naar 13–22 tok/s) met thinking aan en ruimer uitvoerbudget, het contextvenster opnieuw meten (64k past dan waarschijnlijk niet meer), en vóór gebruik opnieuw proeven.
