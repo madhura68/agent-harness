@@ -29,8 +29,11 @@ const sha256 = (s: string) => createHash('sha256').update(s).digest('hex')
 
 const ABORTED: Terminal = { status: 'failed', error: { code: 'HARNESS_ERROR', message: 'aborted' } }
 
-// Context bookkeeping (limits.contextTokens). Code and JSON run at roughly 3.5-4 characters per token; 3 keeps a margin.
-const CHARS_PER_TOKEN = 3
+// Context bookkeeping (limits.contextTokens). Characters per token, measured on 114 turns of real tool runs (JSON of
+// each message, spike 2026-09-27): p0 1.72, p50 3.06, p95 3.89. Added text counts at the dense end and removed text
+// at the sparse end, so the estimate errs high on both sides.
+const ADDED_CHARS_PER_TOKEN = 1.7
+const REMOVED_CHARS_PER_TOKEN = 4
 /** Below this much room a turn cannot produce anything useful. */
 const MIN_TURN_TOKENS = 1024
 const charsOf = (value: unknown) => JSON.stringify(value).length
@@ -103,6 +106,8 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   const seenCallIds = new Set<string>()
   // Last provider-reported prompt size and the message characters it was measured on; the estimate adds the change since.
   let calibration: { tokens: number; chars: number } | undefined
+  // Characters taken out by compaction since that measurement.
+  let removedChars = 0
 
   trace.event({
     type: 'run_start', manifest: redactManifest(manifest),
@@ -141,10 +146,11 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
     messages.push({ role: 'user', content: manifest.prompt })
     const toolsChars = tools.length > 0 ? charsOf(tools) : 0
 
-    const estimate = (): number =>
-      calibration
-        ? calibration.tokens + Math.ceil((charsOf(messages) - calibration.chars) / CHARS_PER_TOKEN)
-        : Math.ceil((charsOf(messages) + toolsChars) / CHARS_PER_TOKEN)
+    const estimate = (): number => {
+      if (!calibration) return Math.ceil((charsOf(messages) + toolsChars) / ADDED_CHARS_PER_TOKEN)
+      const added = Math.max(0, charsOf(messages) + removedChars - calibration.chars)
+      return calibration.tokens + Math.ceil(added / ADDED_CHARS_PER_TOKEN) - Math.floor(removedChars / REMOVED_CHARS_PER_TOKEN)
+    }
 
     /**
      * Keeps the next prompt plus an output reserve inside contextTokens by replacing the oldest tool results with a
@@ -165,7 +171,9 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         const m = messages[i]
         if (m.role !== 'tool' || isCompacted(m.content)) continue
         bytes += Buffer.byteLength(m.content)
-        messages[i] = { ...m, content: compactedStub(m.content) }
+        const stubbed = { ...m, content: compactedStub(m.content) }
+        removedChars += charsOf(m) - charsOf(stubbed)
+        messages[i] = stubbed
         count++
       }
       const after = estimate()
@@ -207,6 +215,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       if (res.model) reportedModel = res.model
       if (res.usage.source === 'provider_reported') {
         calibration = { tokens: res.usage.inputTokens, chars: charsAtRequest }
+        removedChars = 0
         inputTokens += res.usage.inputTokens
         outputTokens += res.usage.outputTokens
       } else {

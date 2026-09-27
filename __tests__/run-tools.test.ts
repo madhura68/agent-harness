@@ -214,7 +214,7 @@ describe('context budget (limits.contextTokens)', () => {
   for (const reported of [true, false]) {
     it(`compacts the oldest tool result before the window fills (usage ${reported ? 'reported' : 'missing'})`, async () => {
       const r = await run([big('b1', reported ? 100 : null), big('b2', reported ? 5700 : null), answer('ok')], {
-        allow: ['big'], limits: { contextTokens: 12_000 },
+        allow: ['big'], limits: { contextTokens: 14_000 },
       })
       expect(r.result.status).toBe('completed')
       // Request 2: one 16 kB result fits. Request 3: two do not, so the older one is replaced by a stub.
@@ -226,7 +226,9 @@ describe('context budget (limits.contextTokens)', () => {
       expect(ev).toMatchObject({ turn: 3, messages: 1 })
       expect(ev?.estimateAfter).toBeLessThan(ev?.estimateBefore as number)
       // The request never asks for more output than the window leaves.
-      expect(r.requests[2].body.max_tokens).toBeLessThanOrEqual(12_000 - (ev?.estimateAfter as number))
+      expect(r.requests[2].body.max_tokens).toBeLessThanOrEqual(14_000 - (ev?.estimateAfter as number))
+      // Removed text is credited at the sparse end (4 chars/token), never more generously than that.
+      if (reported) expect((ev?.estimateBefore as number) - (ev?.estimateAfter as number)).toBeLessThanOrEqual((ev?.bytes as number) / 4)
     })
   }
 
