@@ -74,3 +74,23 @@ describe('workerMcpEnv', () => {
     expect(workerMcpEnv(cfg, {})).toEqual({ SCRUM4ME_WORKER_CAPABILITIES: 'local_llm', SCRUM4ME_WORKER_RUNTIME: 'CLAUDE' })
   })
 })
+
+describe('model.reasoningEffort', () => {
+  it('accepts none/low/medium/high and leaves it unset by default', () => {
+    expect(WorkerConfigSchema.parse(base).model.reasoningEffort).toBeUndefined()
+    for (const e of ['none', 'low', 'medium', 'high']) {
+      expect(WorkerConfigSchema.parse({ ...base, model: { ...base.model, reasoningEffort: e } }).model.reasoningEffort).toBe(e)
+    }
+  })
+
+  it('rejects an unknown effort', () => {
+    expect(WorkerConfigSchema.safeParse({ ...base, model: { ...base.model, reasoningEffort: 'off' } }).success).toBe(false)
+  })
+
+  it('the example worker config uses GSQ-RCO with thinking on and room for thinking tokens', () => {
+    const cfg = loadWorkerConfig('examples/worker.json')
+    expect(cfg.model.name).toBe('qwen3.8-gsq-rco:27b-iq3_s-text')
+    expect(cfg.model.reasoningEffort).toBeUndefined()
+    expect(cfg.limits).toMatchObject({ maxTurns: 8, maxOutputTokens: 4096 })
+  })
+})

@@ -1,5 +1,14 @@
 import { readFileSync } from 'node:fs'
 import { z } from 'zod'
+import { REASONING_EFFORTS } from './model-client.js'
+
+/** Model block shared by run manifests and the worker config. */
+export const ModelSpecSchema = z.object({
+  baseUrl: z.string().url(),
+  name: z.string().min(1),
+  apiKey: z.string().optional(),
+  reasoningEffort: z.enum(REASONING_EFFORTS).optional(),
+})
 
 export const ManifestSchema = z
   .object({
@@ -7,7 +16,7 @@ export const ManifestSchema = z
     profile: z.enum(['answer', 'tools']),
     prompt: z.string().min(1),
     system: z.string().optional(),
-    model: z.object({ baseUrl: z.string().url(), name: z.string().min(1), apiKey: z.string().optional() }),
+    model: ModelSpecSchema,
     tools: z
       .object({
         server: z.object({

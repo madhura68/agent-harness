@@ -126,3 +126,17 @@ describe('createModelClient', () => {
     expect((err as Error).message).not.toContain('sk-test-secret')
   })
 })
+
+describe('reasoningEffort', () => {
+  it('sends reasoning_effort when set', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', reasoningEffort: 'none' }).complete(msgs, opts())
+    expect(fake.requests[0].body.reasoning_effort).toBe('none')
+  })
+
+  it('omits reasoning_effort when not set', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    expect(fake.requests[0].body).not.toHaveProperty('reasoning_effort')
+  })
+})

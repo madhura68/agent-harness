@@ -122,4 +122,16 @@ describe('harness worker', () => {
     expect(dirContains(out, 'sk-test-secret')).toBe(false)
     expect(stderr.join('')).not.toContain('sk-test-secret')
   })
+
+  it('passes model.reasoningEffort to the model request', async () => {
+    model = await startFakeModelServer([{ body: completion({ content: 'Antwoord.', model: 'qwen3-coder:30b' }) }])
+    const dir = tmp('cli-worker')
+    const out = join(dir, 'runs')
+    writeProbe(out, model.baseUrl)
+    process.env.SCRUM4ME_TOKEN = 'x'
+    claims = [{ job: ideaChatPayload() }]
+    const code = await main(['worker', '--config', workerConfig(dir, model.baseUrl, { model: { baseUrl: model.baseUrl, name: 'qwen3-coder:30b', reasoningEffort: 'none' } }), '--out', out, '--once'])
+    expect(code).toBe(0)
+    expect(model.requests[0].body.reasoning_effort).toBe('none')
+  })
 })

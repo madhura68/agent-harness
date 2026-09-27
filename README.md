@@ -45,6 +45,8 @@ SCRUM4ME_TOKEN=… DATABASE_URL=… DIRECT_URL=… harness worker --config examp
 
 De worker start één scrum4me-MCP-kindproces met de vaste identiteit `SCRUM4ME_WORKER_CAPABILITIES=local_llm` en `SCRUM4ME_WORKER_RUNTIME=CLAUDE`; de config kan die niet overschrijven. Daardoor claimt hij via `wait_for_job` uitsluitend `IDEA_CHAT`-jobs met `required_capability = 'local_llm'`: de web-app zet die capability voor producten in `IDEA_CHAT_LOCAL_PRODUCT_IDS`. Per job draait de v0-loop met alleen de vier doc-leestools (`allow` mag niets anders bevatten), en de harness sluit de job zelf af met `update_job_status`: `done` met het antwoord als chatbericht, `model_id` en tokens, of `failed` met een leesbare fout. Het model ziet `wait_for_job`, `job_heartbeat` en `update_job_status` nooit.
 
+`model.reasoningEffort` (`none` | `low` | `medium` | `high`, optioneel, ook in een run-manifest) gaat mee als OpenAI-`reasoning_effort`; Ollama's `/v1` zet thinking daarmee uit (`none`). Standaard staat thinking aan: zonder thinking sloegen beide geteste Qwen-modellen de doc-tools over en verzonnen ze antwoorden (zie de runbook). Denktokens tellen mee in `maxOutputTokens`.
+
 Elke claim krijgt een eigen run-dir `runs/job-<jobId>-<epoch-ms>/`. `--once` stopt na één claim of één lege wachtronde. Ctrl-C rondt een lopende job af als `failed` ("worker gestopt"); een tweede Ctrl-C breekt direct af. Dezelfde probe-gate als `harness run` geldt.
 
 Ontwerp en plan: [docs/specs/2026-09-26-idea-chat-local-llm-design.md](docs/specs/2026-09-26-idea-chat-local-llm-design.md), [docs/plans/M2-idea-chat-local-llm.md](docs/plans/M2-idea-chat-local-llm.md). Recept en praktijkbewijs: [docs/runbooks/idea-chat-worker.md](docs/runbooks/idea-chat-worker.md).
