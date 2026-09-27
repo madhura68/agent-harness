@@ -8,18 +8,29 @@ export type ClaimStep = { timeout: true } | { job: unknown } | { error: string }
 
 export type ToolCallRecord = { name: string; args: Record<string, unknown> }
 
+/** Overrides the real `update_job_status` answer body for a requested status (e.g. a `done` request that the MCP actually resolves as `failed` because the push failed). */
+export type UpdateOutcomeOverride = { status?: 'running' | 'done' | 'failed' | 'skipped'; branch?: string | null; pushed_at?: string | null; error?: string | null }
+
 const toolText = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }] })
 const toolError = (message: string) => ({ isError: true, content: [{ type: 'text' as const, text: message }] })
 
 /**
  * In-process stand-in for the scrum4me MCP: the control tools (wait_for_job, job_heartbeat,
- * update_job_status) plus the four doc tools. `calls` records every call the server received.
+ * update_job_status, update_task_status, verify_task_against_plan, log_implementation, log_commit,
+ * log_test_result) plus the four doc tools. `calls` records every call the server received.
  * Exhausted claim scripts answer with a timeout.
  */
-export async function startFakeScrum4meMcp(opts: { claims?: ClaimStep[]; failUpdate?: Array<'running' | 'done' | 'failed'> } = {}) {
+export async function startFakeScrum4meMcp(
+  opts: {
+    claims?: ClaimStep[]
+    failUpdate?: Array<'running' | 'done' | 'failed'>
+    updateOutcome?: Partial<Record<'running' | 'done' | 'failed' | 'skipped', UpdateOutcomeOverride>>
+    verifyResult?: 'aligned' | 'partial' | 'empty' | 'divergent'
+  } = {},
+) {
   const calls: ToolCallRecord[] = []
   const claims = [...(opts.claims ?? [])]
-  const state = { heartbeatOk: true, failUpdate: new Set(opts.failUpdate ?? []) }
+  const state = { heartbeatOk: true, failUpdate: new Set(opts.failUpdate ?? []), updateOutcome: opts.updateOutcome ?? {}, verifyResult: opts.verifyResult ?? 'aligned' }
   const server = new McpServer({ name: 'fake-scrum4me', version: '0.0.0' })
 
   server.registerTool('wait_for_job', { inputSchema: { wait_seconds: z.number().int().optional() } }, async (args) => {
@@ -53,8 +64,52 @@ export async function startFakeScrum4meMcp(opts: { claims?: ClaimStep[]; failUpd
     },
     async (args) => {
       calls.push({ name: 'update_job_status', args })
-      if (state.failUpdate.has(args.status as 'running' | 'done' | 'failed')) return toolError(`Job ${args.job_id} is already terminal`)
-      return toolText({ ok: true, status: args.status })
+      const requested = args.status as 'running' | 'done' | 'failed' | 'skipped'
+      if (state.failUpdate.has(requested as 'running' | 'done' | 'failed')) return toolError(`Job ${args.job_id} is already terminal`)
+      const override = state.updateOutcome[requested] ?? {}
+      return toolText({
+        job_id: args.job_id,
+        status: requested,
+        branch: null,
+        pushed_at: null,
+        pr_url: null,
+        verify_result: null,
+        summary: args.summary ?? null,
+        error: args.error ?? null,
+        ...override,
+      })
+    },
+  )
+  server.registerTool('update_task_status', { inputSchema: { task_id: z.string(), status: z.enum(['todo', 'in_progress', 'review', 'done', 'failed', 'excluded']) } }, async (args) => {
+    calls.push({ name: 'update_task_status', args })
+    return toolText({ ok: true, task_id: args.task_id, status: args.status })
+  })
+  server.registerTool('verify_task_against_plan', { inputSchema: { task_id: z.string(), worktree_path: z.string() } }, async (args) => {
+    calls.push({ name: 'verify_task_against_plan', args })
+    return toolText({ result: state.verifyResult, task_id: args.task_id })
+  })
+  server.registerTool(
+    'log_implementation',
+    { inputSchema: { story_id: z.string(), task_id: z.string().optional(), content: z.string() } },
+    async (args) => {
+      calls.push({ name: 'log_implementation', args })
+      return toolText({ ok: true })
+    },
+  )
+  server.registerTool(
+    'log_commit',
+    { inputSchema: { story_id: z.string(), task_id: z.string().optional(), content: z.string(), commit_hash: z.string(), commit_message: z.string() } },
+    async (args) => {
+      calls.push({ name: 'log_commit', args })
+      return toolText({ ok: true })
+    },
+  )
+  server.registerTool(
+    'log_test_result',
+    { inputSchema: { story_id: z.string(), task_id: z.string().optional(), content: z.string(), status: z.enum(['PASSED', 'FAILED']) } },
+    async (args) => {
+      calls.push({ name: 'log_test_result', args })
+      return toolText({ ok: true })
     },
   )
   server.registerTool('search_product_docs', { description: 'Search product docs', inputSchema: { product_id: z.string(), query: z.string() } }, async (args) => {

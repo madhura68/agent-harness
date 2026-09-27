@@ -5,9 +5,67 @@ import { expandEnv, ManifestError, ModelSpecSchema } from '../manifest.js'
 /** The only tools the model may see in worker mode: read-only product docs. */
 export const DOC_TOOLS = ['search_product_docs', 'get_product_doc', 'list_product_docs', 'related_product_docs'] as const
 /** Called by the harness alone, never offered to the model. */
-export const CONTROL_TOOLS = ['wait_for_job', 'job_heartbeat', 'update_job_status'] as const
+export const CONTROL_TOOLS = [
+  'wait_for_job',
+  'job_heartbeat',
+  'update_job_status',
+  'update_task_status',
+  'verify_task_against_plan',
+  'log_implementation',
+  'log_commit',
+  'log_test_result',
+] as const
 
 const DEFAULT_LIMITS = { maxTurns: 6, maxOutputTokens: 2048, maxWallSeconds: 240, maxToolErrors: 2 }
+
+const TASK_LIMITS = z.object({
+  maxTurns: z.number().int().positive(),
+  maxOutputTokens: z.number().int().positive(),
+  maxWallSeconds: z.number().int().positive(),
+  maxToolErrors: z.number().int().nonnegative(),
+  contextTokens: z.number().int().positive().optional(),
+})
+
+const RecipeSchema = z.object({
+  repoUrl: z.string().min(1),
+  prepare: z.array(z.string()),
+  verify: z.string().min(1),
+})
+
+/** Config for TASK_IMPLEMENTATION jobs: image/user, timeouts and the per-repo recipes. */
+export const TaskConfigSchema = z.object({
+  limits: TASK_LIMITS,
+  image: z.string().min(1),
+  uid: z.number().int().nonnegative(),
+  gid: z.number().int().nonnegative(),
+  npmCacheDir: z.string().min(1),
+  prepareTimeoutSeconds: z.number().int().positive().default(900),
+  verifyTimeoutSeconds: z.number().int().positive().default(600),
+  maxVerifyRepairs: z.number().int().nonnegative().default(3),
+  recipes: z.array(RecipeSchema).min(1),
+})
+
+export type TaskConfig = z.infer<typeof TaskConfigSchema>
+export type Recipe = z.infer<typeof RecipeSchema>
+
+/** Trims, lowercases the host and strips a trailing slash and `.git` suffix, so recipe matching is exact but forgiving of the usual repo-URL spellings. */
+export function normalizeRepoUrl(url: string): string {
+  let out = url.trim().replace(/\/+$/, '').replace(/\.git$/i, '')
+  try {
+    const u = new URL(out)
+    u.host = u.host.toLowerCase()
+    out = u.toString().replace(/\/+$/, '')
+  } catch {
+    // Not a parseable URL (e.g. an scp-like git remote): fall back to the trimmed string as-is.
+  }
+  return out
+}
+
+/** Finds the recipe whose `repoUrl` matches `repoUrl` after normalization. */
+export function findRecipe(task: TaskConfig, repoUrl: string): Recipe | undefined {
+  const target = normalizeRepoUrl(repoUrl)
+  return task.recipes.find((r) => normalizeRepoUrl(r.repoUrl) === target)
+}
 
 export const WorkerConfigSchema = z
   .object({
@@ -24,6 +82,7 @@ export const WorkerConfigSchema = z
       })
       .default(DEFAULT_LIMITS),
     waitSeconds: z.number().int().min(1).max(600).default(300),
+    task: TaskConfigSchema.optional(),
   })
   .superRefine((cfg, ctx) => {
     // Stricter than banning the control tools: anything outside the doc tools could write.
