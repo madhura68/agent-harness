@@ -180,3 +180,43 @@ export async function connectStdioRegistry(server: ServerSpec, allow: string[], 
     signal?.removeEventListener('abort', conn.kill)
   }
 }
+
+/**
+ * Merges independent registries (e.g. the in-process task tools and the MCP doc-tools view) into a
+ * single view for the model. A tool name offered by more than one part is a configuration error, caught
+ * eagerly here rather than at the first ambiguous call. close() closes every part.
+ */
+export function combineRegistries(parts: ToolRegistry[]): ToolRegistry {
+  const owner = new Map<string, ToolRegistry>()
+  const entries: ToolSnapshotEntry[] = []
+  for (const part of parts) {
+    for (const entry of part.snapshot.entries) {
+      if (owner.has(entry.name)) throw new Error(`duplicate tool name across registries: ${entry.name}`)
+      owner.set(entry.name, part)
+      entries.push(entry)
+    }
+  }
+  entries.sort((a, b) => a.name.localeCompare(b.name))
+  const snapshot: ToolSnapshot = Object.freeze({
+    entries,
+    hash: createHash('sha256').update(JSON.stringify(entries)).digest('hex'),
+  })
+
+  return {
+    snapshot,
+    toOpenAiTools(): ToolDef[] {
+      return entries.map((e) => ({
+        type: 'function',
+        function: { name: e.name, ...(e.description ? { description: e.description } : {}), parameters: e.inputSchema },
+      }))
+    },
+    async execute(name, args, signal): Promise<ToolExecResult> {
+      const part = owner.get(name)
+      if (!part) return { ok: false, errorCode: 'UNKNOWN_TOOL', content: 'tool not in snapshot', truncated: false }
+      return part.execute(name, args, signal)
+    },
+    async close(): Promise<void> {
+      await Promise.all(parts.map((p) => p.close()))
+    },
+  }
+}

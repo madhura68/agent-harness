@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { connectRegistry, createRegistryView, flattenContent, RegistryError, TOOL_OUTPUT_LIMIT } from '../src/tools/registry.js'
-import type { ToolRegistry } from '../src/types.js'
+import { combineRegistries, connectRegistry, createRegistryView, flattenContent, RegistryError, TOOL_OUTPUT_LIMIT } from '../src/tools/registry.js'
+import type { ToolExecResult, ToolRegistry, ToolSnapshotEntry } from '../src/types.js'
 import { startFakeMcp } from './fakes/fake-mcp-server.js'
 
 const open: Array<{ close(): Promise<void> }> = []
@@ -202,4 +202,60 @@ describe('connectStdioClient', () => {
       if (!closed) await conn.close()
     }
   }, 20_000)
+})
+
+function fakeRegistry(names: string[], opts?: { onClose?: () => void; onExecute?: (name: string) => void }): ToolRegistry {
+  const entries: ToolSnapshotEntry[] = names.map((name) => ({ name, inputSchema: { type: 'object', properties: {} } }))
+  return {
+    snapshot: { entries, hash: `hash-${names.join(',')}` },
+    toOpenAiTools() {
+      return entries.map((e) => ({ type: 'function', function: { name: e.name, parameters: e.inputSchema } }))
+    },
+    async execute(name): Promise<ToolExecResult> {
+      opts?.onExecute?.(name)
+      return { ok: true, content: `${name} called`, truncated: false }
+    },
+    async close(): Promise<void> {
+      opts?.onClose?.()
+    },
+  }
+}
+
+describe('combineRegistries', () => {
+  it('merges entries from all parts, sorted by name', () => {
+    const combined = combineRegistries([fakeRegistry(['b_tool']), fakeRegistry(['a_tool', 'c_tool'])])
+    expect(combined.snapshot.entries.map((e) => e.name)).toEqual(['a_tool', 'b_tool', 'c_tool'])
+  })
+
+  it('throws on a duplicate tool name across parts', () => {
+    expect(() => combineRegistries([fakeRegistry(['echo']), fakeRegistry(['echo'])])).toThrow(/echo/)
+  })
+
+  it('routes execute() to the owning part', async () => {
+    const calls: string[] = []
+    const a = fakeRegistry(['a_tool'], { onExecute: (n) => calls.push(`a:${n}`) })
+    const b = fakeRegistry(['b_tool'], { onExecute: (n) => calls.push(`b:${n}`) })
+    const combined = combineRegistries([a, b])
+    const r = await combined.execute('b_tool', {}, AbortSignal.timeout(1000))
+    expect(r).toEqual({ ok: true, content: 'b_tool called', truncated: false })
+    expect(calls).toEqual(['b:b_tool'])
+  })
+
+  it('reports UNKNOWN_TOOL for a name no part offers', async () => {
+    const combined = combineRegistries([fakeRegistry(['a_tool'])])
+    const r = await combined.execute('missing', {}, AbortSignal.timeout(1000))
+    expect(r).toMatchObject({ ok: false, errorCode: 'UNKNOWN_TOOL' })
+  })
+
+  it('close() closes every part', async () => {
+    let aClosed = false
+    let bClosed = false
+    const combined = combineRegistries([
+      fakeRegistry(['a_tool'], { onClose: () => { aClosed = true } }),
+      fakeRegistry(['b_tool'], { onClose: () => { bClosed = true } }),
+    ])
+    await combined.close()
+    expect(aClosed).toBe(true)
+    expect(bClosed).toBe(true)
+  })
 })
