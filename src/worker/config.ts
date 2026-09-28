@@ -18,6 +18,10 @@ export const CONTROL_TOOLS = [
 
 const DEFAULT_LIMITS = { maxTurns: 6, maxOutputTokens: 2048, maxWallSeconds: 240, maxToolErrors: 2 }
 
+// Run-log path segments (spec docs/specs/2026-09-28-harness-run-logging-design.md §5.1); matches the
+// worker-log pipeline's own NAME_SEGMENT_RE (scrum4me-docker/Ops-dashboard lib/worker-logs.ts).
+const SEGMENT = /^[A-Za-z0-9._-]{1,64}$/
+
 const TASK_LIMITS = z.object({
   maxTurns: z.number().int().positive(),
   maxOutputTokens: z.number().int().positive(),
@@ -85,6 +89,7 @@ export const WorkerConfigSchema = z
       .default(DEFAULT_LIMITS),
     waitSeconds: z.number().int().min(1).max(600).default(300),
     task: TaskConfigSchema.optional(),
+    workerLog: z.object({ dir: z.string().min(1), pool: z.string().regex(SEGMENT), instance: z.string().regex(SEGMENT) }).optional(),
   })
   .superRefine((cfg, ctx) => {
     // Stricter than banning the control tools: anything outside the doc tools could write.

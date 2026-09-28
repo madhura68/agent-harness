@@ -175,6 +175,37 @@ describe('TaskConfigSchema (worker config task block)', () => {
   })
 })
 
+describe('workerLog', () => {
+  it('accepts a valid workerLog block', () => {
+    const cfg = WorkerConfigSchema.parse({ ...base, workerLog: { dir: '/srv/scrum4me/worker-logs', pool: 'harness', instance: 'max2' } })
+    expect(cfg.workerLog).toEqual({ dir: '/srv/scrum4me/worker-logs', pool: 'harness', instance: 'max2' })
+  })
+
+  it('stays valid without a workerLog block', () => {
+    expect(WorkerConfigSchema.parse(base).workerLog).toBeUndefined()
+  })
+
+  it.each(['bad pool!', '', 'a'.repeat(65)])('rejects an invalid pool %j', (pool) => {
+    const r = WorkerConfigSchema.safeParse({ ...base, workerLog: { dir: '/x', pool, instance: 'max2' } })
+    expect(r.success).toBe(false)
+  })
+
+  it.each(['bad instance!', '', 'a'.repeat(65)])('rejects an invalid instance %j', (instance) => {
+    const r = WorkerConfigSchema.safeParse({ ...base, workerLog: { dir: '/x', pool: 'harness', instance } })
+    expect(r.success).toBe(false)
+  })
+
+  it('rejects an empty dir', () => {
+    const r = WorkerConfigSchema.safeParse({ ...base, workerLog: { dir: '', pool: 'harness', instance: 'max2' } })
+    expect(r.success).toBe(false)
+  })
+
+  it('the example worker config carries the workerLog block for max2', () => {
+    const cfg = loadWorkerConfig('examples/worker.json')
+    expect(cfg.workerLog).toEqual({ dir: '/srv/scrum4me/worker-logs', pool: 'harness', instance: 'max2' })
+  })
+})
+
 describe('normalizeRepoUrl', () => {
   it('lowercases the host and strips a trailing slash and .git suffix', () => {
     expect(normalizeRepoUrl('https://git.jp-visser.nl/janpeter/Scrum4Me.git')).toBe('https://git.jp-visser.nl/janpeter/Scrum4Me')
