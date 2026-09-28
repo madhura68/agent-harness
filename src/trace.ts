@@ -12,7 +12,7 @@ export type TraceEvent =
   | { type: 'tool_result'; callId: string; ok: boolean; errorCode?: ErrorCode; truncated: boolean; sha256: string; bytes: number }
   | { type: 'after_answer'; turn: number; outcome: 'accept' | 'retry' | 'fail' }
   // Written by the Task 11 task handler on the same trace as the run (prepare/verify containers around the gate).
-  | { type: 'container'; kind: 'prepare' | 'verify'; source: 'prepare' | 'run_tests' | 'gate'; exitCode: number | null; timedOut: boolean; durationMs: number }
+  | { type: 'container'; kind: 'prepare' | 'verify'; source: 'prepare' | 'run_tests' | 'gate'; n: number; exitCode: number | null; timedOut: boolean; durationMs: number; outputBytes: number }
   | { type: 'run_end'; status: RunStatus; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 // Exact spec §4.
@@ -39,6 +39,7 @@ export interface TraceWriter {
   readonly dir: string
   event(e: TraceEvent): void
   toolContent(callId: string, text: string): void
+  containerOutput(n: number, text: string): void
   result(r: RunResult): void
 }
 
@@ -63,6 +64,11 @@ export function openTrace(outDir: string, runId: string): TraceWriter {
       const toolsDir = join(dir, 'tools')
       mkdirSync(toolsDir, { recursive: true })
       writeFileSync(join(toolsDir, `${safeFileName(callId)}.txt`), text)
+    },
+    containerOutput(n, text) {
+      const containersDir = join(dir, 'containers')
+      mkdirSync(containersDir, { recursive: true })
+      writeFileSync(join(containersDir, `${n}.txt`), text)
     },
     result(r) {
       writeFileSync(join(dir, 'result.json'), JSON.stringify(r, null, 2) + '\n')

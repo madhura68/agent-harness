@@ -233,10 +233,12 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   const runContainer = async (kind: 'prepare' | 'verify', source: 'prepare' | 'run_tests' | 'gate', script: string, signal: AbortSignal): Promise<VerifyRun> => {
     // Never another container once one was not provably stopped.
     if (uncertain) return { exitCode: null, output: '', timedOut: false, runnerError: `container ${uncertain} niet aantoonbaar gestopt` }
-    const name = containerName(jobId, kind, ++containerNo)
+    const n = ++containerNo
+    const name = containerName(jobId, kind, n)
     const started = Date.now()
     const run = await runInContainer(kind, { name, worktree, task, script, signal }, deps.taskDeps)
-    trace.event({ type: 'container', kind, source, exitCode: run.exitCode, timedOut: run.timedOut, durationMs: Date.now() - started })
+    trace.containerOutput(n, run.output)
+    trace.event({ type: 'container', kind, source, n, exitCode: run.exitCode, timedOut: run.timedOut, durationMs: Date.now() - started, outputBytes: Buffer.byteLength(run.output) })
     if (run.cleanup === 'uncertain') {
       uncertain = name
       inner.abort() // so runManifest cannot turn this into an ordinary failure and nothing else starts

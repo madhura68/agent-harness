@@ -327,6 +327,23 @@ describe('runTaskJob — green path', () => {
     expect(containers.map((e) => [e.kind, e.source])).toEqual([['prepare', 'prepare'], ['verify', 'gate']])
   })
 
+  it('captures each container run under containers/<n>.txt with n and outputBytes on the event', async () => {
+    const t = await setup({
+      script: [write('src/greet.ts', 'export const greet = (n: string) => `hallo ${n}`\n'), answer('klaar')],
+      docker: { prepare: { out: 'npm ci: up to date' }, verify: [{ out: 'PASS greet.test.ts' }] },
+    })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('done')
+    const containers = traceOf(t.out).filter((e) => e.type === 'container')
+    expect(containers.map((e) => [e.n, e.outputBytes])).toEqual([
+      [1, Buffer.byteLength('npm ci: up to date')],
+      [2, Buffer.byteLength('PASS greet.test.ts')],
+    ])
+    const runDir = join(t.out, readdirSync(t.out)[0])
+    expect(readFileSync(join(runDir, 'containers', '1.txt'), 'utf8')).toBe('npm ci: up to date')
+    expect(readFileSync(join(runDir, 'containers', '2.txt'), 'utf8')).toBe('PASS greet.test.ts')
+  })
+
   it('red → repair → green: the retry message reaches the model', async () => {
     const t = await setup({
       script: [write('src/greet.ts', 'fout\n'), answer('klaar'), write('src/greet.ts', 'goed\n', 'w2'), answer('nu echt klaar')],
