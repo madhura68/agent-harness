@@ -83,6 +83,28 @@ describe('checkRunLogs', () => {
     expect(results).toContainEqual({ name: 'X_TOKEN', hits: 3, short: false })
   })
 
+  it('deduplicates the same secret name+value found via process.env and the MCP env into one row (Review F6)', () => {
+    const dir = tmp('crl')
+    writeFileSync(join(dir, 'a.log'), `leak once: ${TOKEN}\n`)
+    // examples/worker.json's real shape: mcp.env re-exposes SCRUM4ME_TOKEN via ${VAR} expansion, so the
+    // same name+value legitimately arrives from two distinct sources (process.env and workerMcpEnv).
+    const config = WorkerConfigSchema.parse({
+      model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'test-model' },
+      mcp: { command: 'node', args: [], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}' } },
+    })
+    const { results } = checkRunLogs(config, { SCRUM4ME_TOKEN: TOKEN }, dir)
+    const rows = results.filter((r) => r.name === 'SCRUM4ME_TOKEN')
+    expect(rows).toEqual([{ name: 'SCRUM4ME_TOKEN', hits: 1, short: false }])
+  })
+
+  it('a URL password without %-escapes gives one row for its name, not a raw+decoded duplicate (Review F6)', () => {
+    const dir = tmp('crl')
+    writeFileSync(join(dir, 'a.log'), 'connecting with password plain-password-987\n')
+    const { results } = checkRunLogs(baseConfig, { DATABASE_URL: 'postgresql://app:plain-password-987@db:5432/x' }, dir)
+    const rows = results.filter((r) => r.name === 'DATABASE_URL (url-wachtwoord)')
+    expect(rows).toEqual([{ name: 'DATABASE_URL (url-wachtwoord)', hits: 1, short: false }])
+  })
+
   it('also checks a secret sourced from config.model.apiKey (not only process env)', () => {
     const dir = tmp('crl')
     const apiKey = 'model-api-key-fake-777777'

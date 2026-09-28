@@ -647,4 +647,16 @@ describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
     expect(r.jobs[0].outcome).toBe('done')
     expect(runLogErrors).toHaveLength(1)
   })
+
+  it('a runLogFor that throws gives the same outcome as no run-log at all, plus exactly one log line (Review F2)', async () => {
+    const t = await setup({ claims: [job()], script: [answer('Zie de worker-runbook.')] })
+    t.deps.runLogFor = () => {
+      throw new Error('run-log kapot')
+    }
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'done' }], exitCode: 0 }) // same as without runLogFor at all
+    expect(t.logs.filter((l) => l.includes('run-log uitgeschakeld'))).toHaveLength(1)
+    expect(t.logs.filter((l) => l.includes('run-log uitgeschakeld'))[0]).toMatch(/^run-log uitgeschakeld voor job job1: run-log kapot$/)
+    expect(existsSync(runLogRunsDir(t.runLogDir))).toBe(false)
+  })
 })

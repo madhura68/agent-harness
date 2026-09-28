@@ -116,7 +116,14 @@ function ideaChatFailCode(result: RunResult): string {
 /** Routes a claim by kind: IDEA_CHAT and TASK_IMPLEMENTATION; anything else is a claim-filter breach. */
 export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJobContext): Promise<JobOutcome> {
   const started = Date.now()
-  const runLog = deps.runLogFor?.(claim) ?? null
+  const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
+  // Guarded on its own (spec §6.3): a throwing runLogFor must never take the job outcome down with it.
+  let runLog: RunLog | null = null
+  try {
+    runLog = deps.runLogFor?.(claim) ?? null
+  } catch (err) {
+    log(`run-log uitgeschakeld voor job ${claim.jobId}: ${err instanceof Error ? err.message : String(err)}`)
+  }
   let outcome: JobOutcome = 'failed'
   try {
     outcome = claim.kind === 'TASK_IMPLEMENTATION'

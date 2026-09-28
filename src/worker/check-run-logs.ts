@@ -39,13 +39,31 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 /**
+ * Collapses entries that share both name and value: the same variable found via two sources (e.g.
+ * SCRUM4ME_TOKEN in both process.env and the resolved MCP env), or a URL password whose decoded form
+ * equals its raw form (no %-escapes), would otherwise double-count as two rows for one real secret.
+ * A NUL byte cannot appear in either field from these sources, so it is a safe join separator.
+ */
+function dedupeEntries(entries: { name: string; value: string }[]): { name: string; value: string }[] {
+  const seen = new Set<string>()
+  const out: { name: string; value: string }[] = []
+  for (const entry of entries) {
+    const key = `${entry.name}\0${entry.value}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(entry)
+  }
+  return out
+}
+
+/**
  * Scans every file under `dir` for the secrets in `collectSecretEntries(...workerSecretSources(config,
  * processEnv))`: the redaction's own selection, but also shorter than 8 characters, so a short secret
  * is checked and reported instead of silently skipped (spec §10 criterion 4). Never returns a value,
  * only names and counts.
  */
 export function checkRunLogs(config: WorkerConfig, processEnv: NodeJS.ProcessEnv, dir: string): { checked: number; results: SecretCheckResult[] } {
-  const entries = collectSecretEntries(...workerSecretSources(config, processEnv))
+  const entries = dedupeEntries(collectSecretEntries(...workerSecretSources(config, processEnv)))
   const texts = listFiles(dir).map((f) => readFileSync(f, 'utf8'))
   const results = entries.map(({ name, value }) => ({
     name,

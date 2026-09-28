@@ -74,13 +74,14 @@ function applyFullLengthTruncation(fields: Record<string, unknown>, key: string,
   if (v.length > limit) fields[key] = cut(v, limit)
 }
 
-/** outputLength is the length of the RETAINED tail (i.e. of outputTail itself), never the original length. */
+/** lengthKey is always the full (redacted, pre-cut) length, same contract as applyFullLengthTruncation; key
+ * itself is tail-cut (the LAST `limit` chars) instead of head-cut. So lengthKey > the retained key.length
+ * exactly when the writer cut (spec §5.5; the Ops-dashboard parser reads lengthKey as the full length). */
 function applyTailLengthTruncation(fields: Record<string, unknown>, key: string, lengthKey: string, limit: number): void {
   const v = fields[key]
   if (typeof v !== 'string') return
-  const t = v.length > limit ? tail(v, limit) : v
-  fields[key] = t
-  fields[lengthKey] = t.length
+  fields[lengthKey] = v.length
+  if (v.length > limit) fields[key] = tail(v, limit)
 }
 
 function errorMessage(err: unknown): string {
@@ -150,7 +151,9 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
   // --- mutable state, closed over by every method below ---
   let disabled = false
   let ended = false
-  let cwd = init.cwd ?? process.cwd()
+  // Resolved lazily in flushRunStart, which already runs inside the tee's try/catch: process.cwd() throws
+  // when the working directory is gone, and openRunLog itself must never throw (spec §6.3).
+  let cwd = init.cwd
   let firstFail: { code: string; message: string } | undefined
   let awaitingRunStart = false
   let pendingRunId: string | undefined
@@ -167,8 +170,12 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
   }
 
   function appendMetaLine(text: string): void {
-    const folded = text.replace(/\r?\n/g, ' ') // a newline inside meta text becomes a space (spec §5.2)
-    appendFileSync(filePath, `${now().toISOString()} [harness] ${redactText(folded, secrets)}\n`)
+    // Redact BEFORE folding (same order as the closing block): a multi-line secret (e.g. a PEM-style
+    // *_PRIVATE_KEY) carries its own \n's, so folding first would desync the text from the literal secret
+    // and leave it unmasked (Review F4).
+    const redacted = redactText(text, secrets)
+    const folded = redacted.replace(/\r\n|\r|\n/g, ' ') // any newline form (CRLF, lone CR, LF) becomes a space (spec §5.2)
+    appendFileSync(filePath, `${now().toISOString()} [harness] ${folded}\n`)
   }
 
   function appendJsonLine(type: string, fields: Record<string, unknown>): void {
@@ -191,7 +198,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
       baseUrl: init.model.baseUrl,
       tools,
       mcpServers: ['scrum4me'],
-      cwd,
+      cwd: cwd ?? process.cwd(),
       version: init.version,
     }
     appendJsonLine('harness.run_start', redactDeep(fields, secrets))
@@ -339,7 +346,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
   }
 
   function meta(text: string): void {
-    if (disabled) return
+    if (disabled || ended) return // end() is write-once and the closing block is the last word (Review F3)
     try {
       appendMetaLine(text)
     } catch (err) {
@@ -364,7 +371,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
         dir: trace.dir,
         event(e: TraceEvent): void {
           trace.event(e) // the real trace first, always; its own errors propagate exactly as today
-          if (disabled) return
+          if (disabled || ended) return // no run-log write survives end() (Review F3)
           try {
             handleEvent(e)
           } catch (err) {
@@ -373,7 +380,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
         },
         toolContent(callId: string, text: string): void {
           trace.toolContent(callId, text)
-          if (disabled) return
+          if (disabled || ended) return
           try {
             pendingToolContent.set(callId, text)
           } catch (err) {
@@ -382,7 +389,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
         },
         containerOutput(n: number, text: string): void {
           trace.containerOutput(n, text)
-          if (disabled) return
+          if (disabled || ended) return
           try {
             pendingContainerOutput.set(n, text)
           } catch (err) {
@@ -391,7 +398,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
         },
         result(r: RunResult): void {
           trace.result(r) // the real trace first, always
-          if (disabled) return
+          if (disabled || ended) return
           try {
             handleResult(r)
           } catch (err) {

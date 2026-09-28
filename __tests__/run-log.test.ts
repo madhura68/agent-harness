@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { openRunLog, type RunLogInit, type WorkerLogConfig } from '../src/worker/run-log.js'
 import type { RunResult, TraceEvent, TraceWriter } from '../src/trace.js'
 
@@ -192,6 +192,43 @@ describe('openRunLog: file creation (spec §5.1)', () => {
   })
 })
 
+describe('openRunLog never throws, even when process.cwd() is unavailable (spec §6.3, Review F2)', () => {
+  it('does not throw and still returns a usable RunLog when process.cwd() throws and init.cwd is not given', () => {
+    const cwdSpy = vi.spyOn(process, 'cwd').mockImplementation(() => {
+      throw new Error('cwd gone')
+    })
+    try {
+      let rl: ReturnType<typeof openRunLog> = null
+      expect(() => {
+        rl = openRunLog(cfg(), baseInit())
+      }).not.toThrow()
+      expect(rl).not.toBeNull()
+    } finally {
+      cwdSpy.mockRestore()
+    }
+  })
+
+  it('a deferred harness.run_start that needs the default cwd disables further writes with exactly one log line instead of throwing', () => {
+    const logLines: string[] = []
+    const cwdSpy = vi.spyOn(process, 'cwd').mockImplementation(() => {
+      throw new Error('cwd gone')
+    })
+    try {
+      const rl = openRunLog(cfg(), baseInit({ log: (l) => logLines.push(l) }))!
+      const followed = rl.follow(fakeTrace())
+      expect(() => {
+        followed.event({ type: 'run_start', manifest: { id: 'r1' } })
+        followed.event({ type: 'tool_snapshot', names: [], hash: 'h' })
+      }).not.toThrow()
+      expect(logLines).toHaveLength(1)
+      expect(logLines[0]).toMatch(/^run-log uitgeschakeld voor job job-1: /)
+      expect(() => rl.end('done', 5)).not.toThrow() // end() still makes its own closing attempt
+    } finally {
+      cwdSpy.mockRestore()
+    }
+  })
+})
+
 describe('line formats (spec §5.2)', () => {
   it('every JSON line starts with {"type":"harness. and has timestamp as the second key; every meta line matches ^\\S+ \\[harness\\] ', () => {
     const rl = openRunLog(cfg(), baseInit())!
@@ -240,6 +277,24 @@ describe('meta / step / worktree', () => {
     rl.step('prepare exit=0 duration_ms=100')
     const lines = readLogLines()
     expect(lines[lines.length - 1]).toMatch(/\[harness\] step prepare exit=0 duration_ms=100$/)
+  })
+
+  it('redacts a multi-line secret in meta text before folding newlines to spaces (Review F4)', () => {
+    // Obviously fake, multi-line like a PEM-style *_PRIVATE_KEY value; the secret itself carries real \n's.
+    const multilineSecret = 'BEGIN-FAKE-KEY\nfake-key-material-0123\nEND-FAKE-KEY'
+    const rl = openRunLog(cfg(), baseInit({ secrets: [multilineSecret] }))!
+    rl.step(`using ${multilineSecret} for auth`)
+    const text = readLogText()
+    expect(text).not.toContain(multilineSecret)
+    expect(text).not.toContain('fake-key-material-0123') // no unmasked fragment of the secret either
+    expect(text).toContain('***')
+  })
+
+  it('folds a lone \\r (not just \\r\\n or \\n) to a space in meta text (Review F4)', () => {
+    const rl = openRunLog(cfg(), baseInit({ now: () => new Date('2026-09-28T10:00:00.000Z') }))!
+    rl.meta('before\rafter')
+    const lines = readLogLines()
+    expect(lines[lines.length - 1]).toBe('2026-09-28T10:00:00.000Z [harness] before after')
   })
 
   it('worktree() writes "worktree path=..." and overrides cwd used by a later harness.run_start', () => {
@@ -531,16 +586,27 @@ describe('truncation (spec §5.5, applied after redaction)', () => {
     expect(line?.content).toBe(long.slice(0, 8192))
   })
 
-  it('container outputTail over 8192 chars keeps the LAST 8192 chars; outputLength is the retained tail length', () => {
+  it('container outputTail over 8192 chars keeps the LAST 8192 chars; outputLength is the full length before the cut (Review F1)', () => {
     const rl = openRunLog(cfg(), baseInit())!
     const followed = rl.follow(fakeTrace())
     const long = Array.from({ length: 9000 }, (_, i) => String(i % 10)).join('')
     followed.containerOutput(1, long)
     followed.event({ type: 'container', kind: 'verify', source: 'run_tests', n: 1, exitCode: 1, timedOut: false, durationMs: 500, outputBytes: 9000 })
     const line = readJsonLines().find((l) => l.type === 'harness.container')
-    expect(line?.outputLength).toBe(8192)
+    expect(line?.outputLength).toBe(9000) // full redacted length, BEFORE the tail cut -- not outputTail.length
     expect((line?.outputTail as string).length).toBe(8192)
     expect(line?.outputTail).toBe(long.slice(-8192))
+    expect(line?.outputLength).toBeGreaterThan((line?.outputTail as string).length)
+  })
+
+  it('container outputTail under 8192 chars: outputLength equals outputTail.length (not cut) (Review F1)', () => {
+    const rl = openRunLog(cfg(), baseInit())!
+    const followed = rl.follow(fakeTrace())
+    followed.containerOutput(1, 'short output')
+    followed.event({ type: 'container', kind: 'prepare', source: 'prepare', n: 1, exitCode: 0, timedOut: false, durationMs: 10, outputBytes: 13 })
+    const line = readJsonLines().find((l) => l.type === 'harness.container')
+    expect(line?.outputLength).toBe('short output'.length)
+    expect(line?.outputLength).toBe((line?.outputTail as string).length)
   })
 })
 
@@ -670,6 +736,27 @@ describe('best-effort failure handling (spec §6.3)', () => {
     expect(text).toContain('"type":"harness.run_end"')
     expect(text).toContain('exit code=0')
     expect(logLines).toHaveLength(1) // no additional log line from end()
+  })
+})
+
+describe('no writes after end() (Review F3)', () => {
+  it('step(), worktree() and a traced event/toolContent/containerOutput/result after end() add nothing after the exit code= line', () => {
+    const rl = openRunLog(cfg(), baseInit())!
+    rl.end('done', 5)
+    const before = readLogText()
+    expect(before.trim().endsWith('exit code=0')).toBe(true)
+
+    const followed = rl.follow(fakeTrace())
+    expect(() => {
+      rl.step('too late')
+      rl.worktree('/too/late')
+      followed.event({ type: 'after_answer', turn: 9, outcome: 'accept' })
+      followed.toolContent('c1', 'too late')
+      followed.containerOutput(1, 'too late')
+      followed.result(RESULT)
+    }).not.toThrow()
+
+    expect(readLogText()).toBe(before)
   })
 })
 
