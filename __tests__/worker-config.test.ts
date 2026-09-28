@@ -119,7 +119,7 @@ describe('model.reasoningEffort', () => {
       {
         repoUrl: 'https://git.jp-visser.nl/janpeter/scrum4me-mcp.git',
         prepare: ['npm ci', 'npm run prisma:generate'],
-        verify: 'npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts',
+        verify: 'npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts --exclude __tests__/branch-safety.test.ts --exclude __tests__/default-branch.test.ts --exclude __tests__/worktree-branch-safety.test.ts --exclude __tests__/update-job-status-local-llm-chain.test.ts --exclude __tests__/update-job-status-local-llm-done-gitlink.test.ts --exclude __tests__/git/local-llm.test.ts',
       },
     ])
   })

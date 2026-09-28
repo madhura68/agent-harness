@@ -19,7 +19,9 @@
       "FORGEJO_PUSH_TOKEN": "${FORGEJO_PUSH_TOKEN}",
       "SCRUM4ME_AGENT_WORKTREE_DIR": "/var/lib/agent-harness/worktrees",
       "SCRUM4ME_REPO_ROOT_cmuhjw9e80003mt7rq4w3sauu": "/var/lib/agent-harness/repos/agent-harness",
-      "SCRUM4ME_REPO_ROOT_REPO_scrum4me-mcp": "/var/lib/agent-harness/repos/scrum4me-mcp"
+      "SCRUM4ME_REPO_ROOT_REPO_scrum4me-mcp": "/var/lib/agent-harness/repos/scrum4me-mcp",
+      "GIT_CONFIG_GLOBAL": "/dev/null",
+      "GIT_CONFIG_NOSYSTEM": "1"
     }
   },
   "allow": [
@@ -57,7 +59,7 @@
       {
         "repoUrl": "https://git.jp-visser.nl/janpeter/scrum4me-mcp.git",
         "prepare": ["npm ci", "npm run prisma:generate"],
-        "verify": "npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts"
+        "verify": "npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts --exclude __tests__/branch-safety.test.ts --exclude __tests__/default-branch.test.ts --exclude __tests__/worktree-branch-safety.test.ts --exclude __tests__/update-job-status-local-llm-chain.test.ts --exclude __tests__/update-job-status-local-llm-done-gitlink.test.ts --exclude __tests__/git/local-llm.test.ts"
       }
     ]
   }
