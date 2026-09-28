@@ -115,6 +115,19 @@ Vervolgoptie, niet gedaan: geef in deze scrum4me-mcp-tests `cwd: <tmpdir>` mee a
 
 `runInContainer('verify', …)` met `verifyTimeoutSeconds: 5`, vier keer: één keer `sleep 300` en drie keer een container die eerst 300 MB en 3000 mappen in zijn writable layer schrijft en dan slaapt. Elke keer gaf `docker ps -aq --filter name=^<naam>$` vóór de kill een id en daarna niets, met als resultaat `timedOut: true`, `cleanup: 'stopped'`. Na de timeout duurde de afronding 2,4 s tot 3,7 s. Er bleven geen `harness-*`-containers achter.
 
+## Live acceptatie (Taak 14, 2026-09-28)
+
+Proeftaken onder ST-009 ("M3 live-acceptatie") in sprint S-2026-09-27-1, product Agent-harness. Dispatch met `dispatch_job` en `required_capability: 'local_llm'` via een vers gestart MCP-proces: een sessie waarvan de MCP van vóór de merge is, kent de parameter nog niet (zie Voorwaarden, en herstart de MCP van de dispatchende sessie).
+
+| Criterium (spec §9) | Uitkomst | Bewijs |
+|---|---|---|
+| **1.** Kleine echte taak in agent-harness | **Gehaald.** T-30 (`normalizeRepoUrl`: host van scp-achtige remotes lowercase, plus 3 testgevallen) geeft job `DONE`. `model_id` is `qwen3.8-gsq-rco:27b-iq3_s-text` en de summary eindigt op de verify-uitslag. Branch `feat/story-253dbps0` @ `874337f`: author, committer en pusher zijn `agent-harness` (Forgejo-activiteit). Geen PR. T-30 staat op `review`; ST-009, PBI-3 en de sprint zijn ongewijzigd. Duur van start tot push: ±1,5 min. | job `cmukmueok00017x17apqdqj1f`; trace `/var/lib/agent-harness/runs/job-cmukmueok00017x17apqdqj1f-1790562774611`: 7 modelbeurten, 8 tool-calls, prepare 2,6 s, 3× verify groen (±12,5 s; 2× via `run_tests` van het model, 1× gate) |
+| **2.** Verify kan niet groen worden | **Gehaald.** Recept tijdelijk op `verify: "echo verify-proef-rood; exit 1"` (backup `worker.json.bak-pre-crit2`, daarna teruggezet en herstart). T-31 geeft job `FAILED` met `VERIFY_FAILED verify 3× rood: exitcode 1 verify-proef-rood; git-administratie ongewijzigd`. T-31 blijft `in_progress`. Geen nieuwe commit: branch en worktree blijven op `874337f`. Geen push (`pushed_at` leeg), geen PR, geen doorwerking. Het was een tweede claim op dezelfde story-branch, en de commit van T-30 bleef staan. | job `cmukn0uwc0001bx177r3ojar4`; trace `/var/lib/agent-harness/runs/job-cmukn0uwc0001bx177r3ojar4-1790563075843`: 9 modelbeurten, 3 `after_answer`, `verify-proef-rood` 6× in de trace; geen `harness-*`-container achtergebleven |
+| **3.** Isolatie (token, hooks, gitlink) | Open, door JP uit te voeren | — |
+| **4.** Tweede claim: prepare-script, `.gitmodules`, host-poorten | Open, door JP uit te voeren | — |
+| **5.** Eerste Notes-taak | Buiten dit plan (Notes-sprint) | — |
+| **6.** Idea-chat blijft werken | **Gehaald.** Live bericht na de uitrol geeft een `IDEA_CHAT`-job met `local_llm` die `DONE` eindigt in ±1 min met het lokale model; de regressietests zijn groen. | job `cmuklwg9d0009k47r72epkqby` |
+
 ## Mergen van een scrum4me-mcp-branch uit een lokale taak
 
 Een scrum4me-mcp-branch van een lokale taak wordt alleen gemerged via een PR met groene CI: het verify-recept sluit tests uit die een werkende gitdir in de worktree nodig hebben (zeven bestanden, zie "Inrichting max2" hieronder), en de CI draait alleen op PR's en main — niet op de losse commit die de worker op de host maakt.
