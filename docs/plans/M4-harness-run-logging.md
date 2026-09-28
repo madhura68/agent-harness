@@ -1,6 +1,6 @@
 # M4 — harness-runs volgen in Worker Logs: implementatieplan
 
-_Status: concept, revisie 2 (2026-09-28), na planronde 1. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
+_Status: concept, revisie 3 (2026-09-28), na planronde 2. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -27,7 +27,10 @@ _Status: concept, revisie 2 (2026-09-28), na planronde 1. Een technisch GO autor
 - Forgejo is de forge; nooit `gh`. Push via `GIT_ASKPASS` met `$FORGEJO_TOKEN`. Geen merge, serveractie of uitrol zonder JP. Geheimen nooit printen of loggen.
 - Gates vóór elke commit: agent-harness `npm run verify`; Ops-dashboard `npm run typecheck && npm test` (er is geen lint-script).
 - Een controle op geheimen zet nooit een waarde in argv, uitvoer of een log; alleen namen en tellingen.
-- De worker op max2 wordt alleen herstart als hij geen job uitvoert: de laatste journalregel is een afgeronde job of het wachten op een job, en `docker ps --filter name=^harness-` is leeg.
+- **Stopprocedure voor de worker op max2**, vóór elke herstart of stop (journal en containers alleen tonen geen claim; die zijn aanvullend bewijs, geen toets):
+  1. Toets: er is geen `local_llm`-job met status `CLAIMED` of `RUNNING`, met een read-only query op scrum4me-srv: `docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc "select count(*) from claude_jobs where required_capability = 'local_llm' and status in ('CLAIMED','RUNNING')"` geeft `0`. Na de M4-uitrol bovendien: het nieuwste bestand in `/srv/scrum4me/worker-logs/harness/max2/runs/` eindigt op `exit code=`.
+  2. `systemctl stop agent-harness-worker`, en dan dezelfde toets opnieuw. Is er in het gat toch een job geclaimd, dan is die door de stop als `STOPPED` afgesloten: melden aan JP, die hem opnieuw dispatcht. De wijziging gaat pas door na een schone tweede toets.
+  3. De wijziging, en daarna `systemctl start agent-harness-worker` en controle dat de service `active` is.
 
 ## Review Focus
 
@@ -125,22 +128,26 @@ export type ModelClientOptions = { /* bestaand */ now?: () => number } // testna
 
 ### Taak 3: redactie (`src/worker/redact.ts`)
 
-**Files:** Create `src/worker/redact.ts`, `__tests__/redact.test.ts`.
+**Files:** Create `src/worker/redact.ts`, `__tests__/redact.test.ts`. Consumes `workerMcpEnv` uit `src/worker/config.ts`.
 
 **Interfaces:**
 - Produces:
 
 ```ts
 export const REDACTED = '***'
-export function collectSecretValues(...envs: Array<Record<string, string | undefined>>): string[] // langste eerst
+/** Alle kandidaten met hun bron: de waarde van een variabele met een geheim-achtige naam, en het wachtwoord uit elke URL-waarde (ruw en gedecodeerd). Zonder lengtefilter; lege waarden vallen weg. */
+export function collectSecretEntries(...envs: Array<Record<string, string | undefined>>): { name: string; value: string }[]
+/** De redactieset: de waarden uit collectSecretEntries vanaf 8 tekens, uniek, langste eerst (= de runnerregel). */
+export function collectSecretValues(...envs: Array<Record<string, string | undefined>>): string[]
 export function redactText(text: string, secrets: readonly string[]): string
 /** Redigeert elke string in een JSON-waarde (objecten en arrays recursief); andere waarden blijven gelijk. */
 export function redactDeep<T>(value: T, secrets: readonly string[]): T
 ```
 
-- `collectSecretValues` en `redactText` zijn een kopie van scrum4me-docker `lib/log-redact.ts:9-58` (52ded13), met een verwijzing in het commentaar. De regelbuffer voor streams (`:60-88`) is niet nodig.
+- De selectieregels en `redactText` zijn een kopie van scrum4me-docker `lib/log-redact.ts:9-58` (52ded13), met een verwijzing in het commentaar; `collectSecretEntries` levert dezelfde selectie met de naam erbij (voor een URL-wachtwoord `<SLEUTEL> (url-wachtwoord)`), en `collectSecretValues` is daarvan afgeleid, zodat de redactie en de controle van Taak 7 dezelfde selectie delen. De regelbuffer voor streams (`:60-88`) is niet nodig.
+- `workerSecretSources(config, processEnv)` geeft de vier bronnen als lijst: `processEnv`, `workerMcpEnv(config, processEnv)` en `{ MODEL_API_KEY: config.model.apiKey, MODEL_BASE_URL: config.model.baseUrl }`. De worker (Taak 5) en de controle (Taak 7) gebruiken allebei deze functie.
 
-- [ ] Tests, dezelfde gevallen als scrum4me-docker `__tests__/log-redact.test.ts`: secret-achtige sleutels worden gepakt en gewone waarden blijven staan; het wachtwoord uit een URL-waarde onder een niet-secret sleutel, ook gedecodeerd; meerdere omgevingen, langste eerst; meerdere secrets op één regel; tekst zonder secrets blijft byte-identiek. Daarnaast: `redactDeep` over geneste objecten en arrays; een wachtwoord in een URL onder de sleutel `MODEL_BASE_URL` wordt gevonden.
+- [ ] Tests, dezelfde gevallen als scrum4me-docker `__tests__/log-redact.test.ts`: secret-achtige sleutels worden gepakt en gewone waarden blijven staan; het wachtwoord uit een URL-waarde onder een niet-secret sleutel, ook gedecodeerd; meerdere omgevingen, langste eerst; meerdere secrets op één regel; tekst zonder secrets blijft byte-identiek. Daarnaast: `redactDeep` over geneste objecten en arrays; een wachtwoord in een URL onder de sleutel `MODEL_BASE_URL` wordt gevonden; `collectSecretEntries` houdt korte waarden en namen, en laat lege waarden weg; elke waarde uit `collectSecretValues` zit ook in `collectSecretEntries` (pariteit); `workerSecretSources` levert een waarde uit elk van de vier bronnen.
 - [ ] FAIL → implementeer → PASS; `npm run verify` groen.
 - [ ] Commit: `feat(worker): redactieregels van de runner`
 
@@ -222,7 +229,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
   - redactie in meta-regels, `reasoning`, tool-content en `base_url`, en een geheim dat over de afkapgrens valt, wordt toch gemaskeerd;
   - `wx`-botsing: een tweede open in dezelfde seconde wacht en slaagt; een blijvende botsing geeft `null` en één logregel;
   - een schrijffout (map verwijderd of alleen-lezen na het openen) schakelt de tussenregels uit, geeft één logregel en `end` probeert het nog één keer; geen enkele methode gooit;
-  - een uitzondering in de omzetting (een event met een getter op `usage` die gooit) via `follow(trace)`: de echte trace heeft het event, de aanroep gooit niet, het run-log gaat uit met één logregel, en `end` schrijft het blok toch;
+  - een uitzondering in de omzetting, ná een geslaagde trace-write: een event met een getter op `usage` die de eerste keer een waarde geeft (de spread in `trace.event` leest hem één keer) en daarna gooit, via `follow(trace)`: de echte trace heeft het event, de aanroep gooit niet, het run-log gaat uit met één logregel, en `end` schrijft het blok toch;
   - `end` voor `done`, `failed` met en zonder `fail`, en `abandoned`: exact de regels uit het blok, één keer; een tweede `end` schrijft niets;
   - `fail`-voorrang: `VERIFY_FAILED` gevolgd door `JOB_FAILED` houdt `VERIFY_FAILED`; gevolgd door `ABANDONED` met `override` wordt `ABANDONED`;
   - config: een ongeldige `pool` of `instance` wordt geweigerd; zonder `workerLog` blijft de config geldig.
@@ -271,7 +278,7 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJo
 | stop na een niet-voltooide beurt (`worker gestopt`) | `STOPPED` |
 
 - Jobstappen in idee-chat: `step job_status running`, en na `close` `step job_status <done|failed>`.
-- `cmdWorker`: leest de versie uit `package.json` (via `new URL('../package.json', import.meta.url)`), berekent één keer `secrets = collectSecretValues(process.env, env, { MODEL_API_KEY: config.model.apiKey, MODEL_BASE_URL: config.model.baseUrl })` en geeft `runLogFor: (claim) => openRunLog(config.workerLog, { jobId: claim.jobId, kind: claim.kind, model: config.model, version, secrets })` mee.
+- `cmdWorker`: leest de versie uit `package.json` (via `new URL('../package.json', import.meta.url)`), berekent één keer `secrets = collectSecretValues(...workerSecretSources(config, process.env))` en geeft `runLogFor: (claim) => openRunLog(config.workerLog, { jobId: claim.jobId, kind: claim.kind, model: config.model, version, secrets })` mee.
 - Runbook `docs/runbooks/idea-chat-worker.md`, nieuwe sectie "Run-logs in Worker Logs": het `workerLog`-blok, waar de bestanden staan, hoe je ze controleert (eerste regels, afsluitblok), de controle op geheimen uit spec §10 criterium 4 (zonder waarden te tonen), en terugdraaien (blok weg, service herstarten).
 
 - [ ] Tests (`__tests__/worker.test.ts`). De testhulp van `worker.test.ts` en `task-impl.test.ts` zet `deps.runLogFor = (claim) => openRunLog({ dir: <tijdelijke map>, pool: 'harness', instance: 'test' }, { jobId: claim.jobId, kind: claim.kind, model: config.model, version: 'agent-harness@test', secrets: [] })`; alleen `cli-worker.test.ts` loopt via `config.workerLog`.
@@ -281,7 +288,7 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJo
   - een geïnjecteerde onverwachte fout in de handler → precies één blok met `HARNESS_ERROR`, en de fout gaat ongewijzigd verder;
   - zonder `runLogFor` gedraagt de worker zich als nu (de bestaande tests blijven groen);
   - een onschrijfbare map → dezelfde jobuitkomst en één logregel.
-- [ ] `__tests__/cli-worker.test.ts`, naar het voorbeeld van de bestaande test "runs one job with the expanded token only in the MCP env": met `workerLog` in de config staat na één job een run-log in `<dir>/harness/max2/runs/`, en `harness.run_start` draagt `version` `agent-harness@<versie uit package.json>`. Vier verschillende testgeheimen, één per bron (een geheim-achtige variabele in `process.env`, het uitgebreide token in de MCP-omgeving, `model.apiKey`, en een wachtwoord in `model.baseUrl` dat nergens anders staat), komen in geen enkele meta- of JSON-regel van het run-log voor.
+- [ ] `__tests__/cli-worker.test.ts`, naar het voorbeeld van de bestaande test "runs one job with the expanded token only in the MCP env": met `workerLog` in de config staat na één job een run-log in `<dir>/harness/max2/runs/`, en `harness.run_start` draagt `version` `agent-harness@<versie uit package.json>`. Een aparte test (naast de bestaande op `:115`, die over de run-map gaat; de trace is bewust ongeredigeerd) laat het gescripte modelantwoord drie testgeheimen dragen, in `content` en in `reasoning`: een geheim-achtige variabele in `process.env`, het uitgebreide token in de MCP-omgeving en `model.apiKey`. Geen van de drie staat in het run-log, `***` wel. Het vierde, een wachtwoord in `model.baseUrl`, dekken de `base_url`-test van Taak 4 en de bronnentest van Taak 3, want met zo'n URL faalt de modelaanroep al in `fetch` en komt er geen beurt.
 - [ ] FAIL → implementeer → PASS; `npm run verify` groen.
 - [ ] Commit: `feat(worker): run-log voor idee-chat, CLI-bedrading en runbook`
 
@@ -338,15 +345,15 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJo
 **Files:** Create `src/worker/check-run-logs.ts`, `__tests__/check-run-logs.test.ts`. Modify `src/cli.ts` (subcommando `check-run-logs`, gebruikstekst), `docs/runbooks/idea-chat-worker.md` (de sectie uit Taak 5).
 
 **Interfaces:**
-- Consumes: `loadWorkerConfig`, `workerMcpEnv` (`src/worker/config.ts`); `collectSecretValues` (Taak 3).
-- Produces: `harness check-run-logs --config <worker.json> --dir <map>`, en `checkRunLogs(config, env, dir): { name: string; hits: number; short: boolean }[]`.
+- Consumes: `loadWorkerConfig` (`src/worker/config.ts`); `collectSecretEntries`, `workerSecretSources` (Taak 3).
+- Produces: `harness check-run-logs --config <worker.json> --dir <map>` (optie `dir` erbij in de `parseArgs`-config van `src/cli.ts`, die `strict` is), en `checkRunLogs(config, processEnv, dir): { checked: number; results: { name: string; hits: number; short: boolean }[] }`.
 
-- De controle leest de geheimen zelf uit zijn omgeving en de config, precies zoals de worker: `process.env`, `workerMcpEnv(config)`, `model.apiKey` en `model.baseUrl`. Anders dan de redactie neemt hij elke waarde van een variabele met een geheim-achtige naam mee, ook korter dan 8 tekens, plus het wachtwoord uit elke URL-waarde (ruw en gedecodeerd).
-- Hij doorzoekt elk bestand onder `--dir` en drukt per geheim alleen de naam af, met het aantal treffers en of de waarde korter is dan 8 tekens. Nooit een waarde. Exitcode 1 bij minstens één treffer.
+- De controle leest de geheimen zelf, met `collectSecretEntries(...workerSecretSources(config, process.env))`: dezelfde selectie als de redactie, maar ook korter dan 8 tekens. Lege waarden doen niet mee.
+- Hij doorzoekt elk bestand onder `--dir` en drukt eerst het aantal gecontroleerde geheimen af, daarna per geheim alleen de naam, het aantal treffers en of de waarde korter is dan 8 tekens. Nooit een waarde. Exitcode 1 bij minstens één treffer, en ook als er nul geheimen gecontroleerd zijn (dan draait hij waarschijnlijk zonder de service-omgeving).
 - Een kort geheim dat in een run-log staat, betekent dat criterium 4 niet gehaald is: dan wordt de redactie versterkt of JP beslist over een spec-delta. Zo'n waarde wordt niet stil overgeslagen.
 - Runbook: de controle draait met de omgeving van de service, zonder dat een waarde in argv komt: `sudo systemd-run --wait --pipe --uid=janpeter -p EnvironmentFile=/etc/agent-harness/worker.env /usr/bin/node /home/janpeter/Development/agent-harness/dist/cli.js check-run-logs --config /etc/agent-harness/worker.json --dir /srv/scrum4me/worker-logs/harness`. De namencontrole van criterium 4 gebruikt alleen `sudo cut -d= -f1 /etc/agent-harness/worker.env`.
 
-- [ ] Tests: een tijdelijke map met een bestand dat één geheim bevat → die naam met 1 treffer en exitcode 1; zonder treffers exitcode 0; een geheim van 5 tekens wordt gecontroleerd en als kort gemarkeerd; een URL-wachtwoord wordt ook in gedecodeerde vorm gevonden; de uitvoer bevat geen enkele geheime waarde.
+- [ ] Tests: een tijdelijke map met een bestand dat één geheim bevat → die naam met 1 treffer en exitcode 1; zonder treffers exitcode 0; nul gecontroleerde geheimen → exitcode 1; een geheim van 5 tekens wordt gecontroleerd en als kort gemarkeerd; een lege geheim-achtige variabele doet niet mee (geen vals alarm); een URL-wachtwoord wordt ook in gedecodeerde vorm gevonden; de uitvoer bevat geen enkele geheime waarde.
 - [ ] FAIL → implementeer → PASS; `npm run verify` groen.
 - [ ] Commit: `feat(cli): check-run-logs — controle op geheimen zonder waarden te tonen`
 
@@ -358,13 +365,13 @@ Na Taak 7: push `feat/m4-run-logging` naar Forgejo en open een PR (JP merget).
 
 Alleen na merge van de harness-PR en op JP's go. Geheimen nooit printen of loggen.
 
-- [ ] Harness op max2 bijwerken volgens `docs/runbooks/task-worker.md`: pull (PAT via stdin-askpass), `npm ci`, `npm run build`. `/etc/agent-harness/worker.json`: backup met behoud van eigenaar en rechten (`cp -p` naar `*.bak-pre-m4`), dan het blok `"workerLog": { "dir": "/srv/scrum4me/worker-logs", "pool": "harness", "instance": "max2" }`. Herstart alleen als de worker stil is (Global Constraints); daarna toont `journalctl -u agent-harness-worker` geen fout.
+- [ ] Harness op max2 bijwerken volgens `docs/runbooks/task-worker.md`: pull (PAT via stdin-askpass), `npm ci`, `npm run build`. `/etc/agent-harness/worker.json`: backup met behoud van eigenaar en rechten (`cp -p` naar `*.bak-pre-m4`), dan het blok `"workerLog": { "dir": "/srv/scrum4me/worker-logs", "pool": "harness", "instance": "max2" }`. Stoppen en starten volgens de stopprocedure (Global Constraints; bij deze eerste keer bestaan er nog geen run-logs, dus alleen de query); daarna toont `journalctl -u agent-harness-worker` geen fout.
 - [ ] Eén idee-chat-job: JP stuurt een chatbericht op een idee van het product Agent-harness (zoals in M2). Controle op max2:
   - er staat één bestand in `/srv/scrum4me/worker-logs/harness/max2/runs/`;
   - de eerste twee regels zijn `claimed job_id=…` en `config …`;
   - elke JSON-regel begint met `{"type":"harness.`;
   - het bestand eindigt op het afsluitblok.
-- [ ] Criterium 5: de respons van de ingest-ronde daarna (journal van `worker-logs-ingest.service`) heeft een lege `errors`-lijst; het bestand telt mee in `skippedIdle`, want de huidige parser ziet geen `job_id`.
+- [ ] Criterium 5: de respons van de ingest-ronde daarna (journal van `worker-logs-ingest.service`) heeft een lege `errors`-lijst. `skippedIdle` is een totaal over alle bestanden en bewijst niets per bestand; dat de huidige parser dit bestand als `idle` overslaat, volgt uit zijn code (`parse-worker-log.ts:243-246`, `ingest-worker-log.ts:248-249`).
 - [ ] Criterium 4 op dit bestand met `harness check-run-logs` (Taak 7), volgens de runbook.
 - [ ] Fixture voor Taak 9: kopieer het bestand naar de Mac, naar `~/Development/m4-fixtures/harness-idea-chat.log` (buiten elke repo; Taak 9 neemt het over). Schonen: `check-run-logs` gaf 0 treffers; tekst van het idee en denk-tekst mogen alleen worden vervangen door neutrale tekst van precies dezelfde lengte, zodat `…Length`-velden en vlaggen blijven kloppen. Regelvolgorde, sleutels, tags en de vorm van elke regel blijven exact; er wordt niets ingekort.
 
@@ -434,17 +441,18 @@ const terminal = harnessLog
 ### Taak 10: uitrol parser op max2, criteria 1 en 6
 
 - [ ] Na merge: `redeploy_ops_dashboard` op max2 via de ops-agent-flow (JP's go). Leg in UTC vast: T0 = de flow is geslaagd afgerond.
-- [ ] Criterium 1: bij de eerste ingest-tick na T0 (timer `*:0/5`) verschijnt de run uit Taak 8 als `WorkerRun` met pool `harness`, host `max2`, status success, `job_id`, `model`, `num_turns` en `duration_ms`. Het detail in scrum4me-workers `/worker-logs` toont denk-tekst, antwoord, toolblokken en de meetregel per beurt; het Ops-dashboard op max2 toont hetzelfde van schijf. Leg de tijd van die tick en T1 (rij en weergave zichtbaar) vast. Gehaald als de run bij de eerste tick na T0 verschijnt, dus binnen 5 minuten plus de verwerkingstijd van die ronde; een handmatige ingest-start telt niet als bewijs.
+- [ ] Criterium 1: bij de eerste ingest-tick na T0 (timer `*:0/5`) verschijnt de run uit Taak 8 als `WorkerRun` met pool `harness`, host `max2`, status success, `job_id`, `model`, `num_turns` en `duration_ms`. Het detail in scrum4me-workers `/worker-logs` toont denk-tekst, antwoord, toolblokken en de meetregel per beurt; het Ops-dashboard op max2 toont hetzelfde van schijf. Leg de tijd van die tick en T1 (rij en weergave zichtbaar) vast. Gehaald als T1 − T0 ≤ 300 seconden; een handmatige ingest-start telt niet als bewijs. Is het meer, dan gaat de gemeten tijd naar JP, die over de grens beslist; het plan verandert de grens niet.
 - [ ] Criterium 6: nieuwe idea- en codex-runs verschijnen zoals voorheen.
 
 ### Taak 11: taakjob, foutproef en triage (criteria 2, 3 en 4)
 
 - [ ] Criterium 2: een kleine echte taak via `dispatch_job` met `required_capability: 'local_llm'`. De run toont `worktree path=`, containerblokken voor prepare en gate met uitvoer, de `run_tests`-regels en de jobstappen; de push blijkt uit `step job_status done pushed_at=ja` (de MCP pusht bij `done`, het harness niet). Het geschoonde run-log wordt de tweede fixture in het Ops-dashboard (kleine vervolg-PR, JP merget).
-- [ ] Criterium 3, met een vast herstelpad voor de rode config:
-  1. Worker stil (Global Constraints). `cp -p /etc/agent-harness/worker.json /etc/agent-harness/worker.json.bak-pre-rood`.
-  2. Zet het agent-harness-recept op `verify: "echo verify-proef-rood; exit 1"` en valideer de config met `node -e` die `loadWorkerConfig` aanroept; pas dan herstarten.
-  3. Dispatch een kleine proeftaak. Zodra de job FAILED is: `cp -p` de backup terug, valideer, worker stil, herstart, en controleer dat de service `active` is. Faalt of stopt een stap onderweg, dan eerst dit herstel en daarna pas verder.
-  4. Pas ná het herstel: de run staat op error met `error_summary` `VERIFY_FAILED: …`; JP start `worker-insights-triage.service` op scrum4me-srv, zo nodig herhaald (hooguit vijf keer) tot de run een `WorkerInsight` heeft of een ronde niets meer verwerkt. Aantal starts en tijden vastleggen.
+- [ ] Criterium 3, met een eenmalige worker en een tijdelijke rode config; `/etc/agent-harness/worker.json` blijft onaangeroerd:
+  1. Stop de service volgens de stopprocedure (Global Constraints). Toets met een read-only query dat er geen andere `QUEUED` `local_llm`-taakjob is; JP dispatcht tijdens de proef niets anders.
+  2. Kopieer `worker.json` naar `/run/agent-harness-red/worker.json` (map 0700, eigenaar janpeter), zet daarin het agent-harness-recept op `verify: "echo verify-proef-rood; exit 1"`, en valideer met `node -e` die `loadWorkerConfig` aanroept.
+  3. Dispatch een kleine proeftaak en draai één keer: `sudo systemd-run --wait --pipe --uid=janpeter -p EnvironmentFile=/etc/agent-harness/worker.env -p WorkingDirectory=/home/janpeter/Development/agent-harness /usr/bin/node dist/cli.js worker --config /run/agent-harness-red/worker.json --out /var/lib/agent-harness/runs --once`. Die claimt de proeftaak, eindigt FAILED en stopt.
+  4. Altijd daarna, ook als een stap faalt of wordt onderbroken: `/run/agent-harness-red` verwijderen, `systemctl start agent-harness-worker`, en controleren dat de service `active` is.
+  5. Pas daarna: de run staat op error met `error_summary` `VERIFY_FAILED: …`; JP start `worker-insights-triage.service` op scrum4me-srv, zo nodig herhaald (hooguit vijf keer) tot de run een `WorkerInsight` heeft of een ronde niets meer verwerkt. Aantal starts en tijden vastleggen.
 - [ ] Criterium 4 met `harness check-run-logs` over alle bestanden in `/srv/scrum4me/worker-logs/harness/`, plus de namencontrole, volgens de runbook.
 - [ ] Bewijs per criterium (job-id, run-id, relevante regels) in `docs/runbooks/idea-chat-worker.md`, in een docs-PR.
 
@@ -475,3 +483,19 @@ Bevindingen, allemaal gecontroleerd tegen de bomen en overgenomen:
 - **MINOR codex:** de vier redactiebronnen werden niet samen getest → één CLI-test met vier bronnen (Taak 5).
 
 Afgewezen: geen. Scope: toegevoegd zijn Taak 7 (controle op geheimen), een herstelpad voor de rode config, meetmomenten voor criterium 1 en een stilte-check vóór herstarts; niets geschrapt. Het eerste bruikbare resultaat en de praktijkproef blijven gelijk. Bewuste afwijking van de spec-mechaniek, door claude bevestigd: `follow()` wikkelt de trace in plaats van `openTrace` een volger te geven; dezelfde stroom en volgorde.
+
+### Planronde 2 — revisie 2 (`bc99673`), 2026-09-28
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 3 MINOR; GO) en `mac:codex` (0 BLOCKER, 3 MAJOR, 4 MINOR; NO-GO). Beide: geen taak om te schrappen; Taak 7 is terecht.
+
+Bevindingen, allemaal gecontroleerd tegen de bomen en overgenomen:
+- **MAJOR codex:** na de foutjob kon de doorlopende worker nog een job onder het rode recept claimen (`worker.ts:234-237`) → de proef draait als eenmalige `worker --once` met een tijdelijke config in `/run`, terwijl de service stilstaat; de productieconfig blijft onaangeroerd, en de service start altijd weer (Taak 11).
+- **MAJOR codex, MINOR claude:** de stilte-check via journal en containers ziet een lopende idee-chat niet → stopprocedure met een autoritatieve query op `CLAIMED`/`RUNNING`, na de uitrol ook het nieuwste run-log, en een tweede toets na het stoppen (Global Constraints, Taak 8, 11).
+- **MAJOR codex:** "binnen 5 minuten plus de verwerkingstijd" rekte de spec op → gehaald bij T1 − T0 ≤ 300 s; anders beslist JP (Taak 10).
+- **MINOR codex:** de omzettingsfouttest gooide al in de echte trace (de spread leest de getter) → getter die pas bij de tweede lezing gooit (Taak 4).
+- **MINOR codex:** een lege geheim-achtige variabele zou op elke regel matchen → lege waarden doen niet mee, met test (Taak 3, 7).
+- **MINOR codex:** `skippedIdle` is een totaal → alleen `errors` leeg als bewijs, plus de parsercode (Taak 8).
+- **MINOR beide:** de vierbronnentest kon groen zijn zonder dat drie bronnen ooit werden gelogd → het modelantwoord draagt drie geheimen, `model.baseUrl` via de unit-tests (met zo'n URL faalt `fetch` al vóór een beurt) (Taak 3, 4, 5).
+- **MINOR claude:** Taak 7 kon niet op `collectSecretValues` bouwen (geen namen, lengtefilter) en meldde 0 treffers zonder iets te controleren → `collectSecretEntries` en `workerSecretSources` in Taak 3, pariteitstest, `dir` in de CLI-opties, exitcode 1 bij nul gecontroleerde geheimen (Taak 3, 7).
+
+Afgewezen: geen. Scope: de rode proef raakt de productieconfig niet meer en de stop is aan een toets gebonden; de rest zijn verduidelijkingen. Niets toegevoegd aan het eerste resultaat, niets geschrapt.
