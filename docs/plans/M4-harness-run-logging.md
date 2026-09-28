@@ -1,6 +1,6 @@
 # M4 — harness-runs volgen in Worker Logs: implementatieplan
 
-_Status: concept, revisie 3 (2026-09-28), na planronde 2. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
+_Status: concept, revisie 4 (2026-09-28), na planronde 3. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -29,7 +29,7 @@ _Status: concept, revisie 3 (2026-09-28), na planronde 2. Een technisch GO autor
 - Een controle op geheimen zet nooit een waarde in argv, uitvoer of een log; alleen namen en tellingen.
 - **Stopprocedure voor de worker op max2**, vóór elke herstart of stop (journal en containers alleen tonen geen claim; die zijn aanvullend bewijs, geen toets):
   1. Toets: er is geen `local_llm`-job met status `CLAIMED` of `RUNNING`, met een read-only query op scrum4me-srv: `docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc "select count(*) from claude_jobs where required_capability = 'local_llm' and status in ('CLAIMED','RUNNING')"` geeft `0`. Na de M4-uitrol bovendien: het nieuwste bestand in `/srv/scrum4me/worker-logs/harness/max2/runs/` eindigt op `exit code=`.
-  2. `systemctl stop agent-harness-worker`, en dan dezelfde toets opnieuw. Is er in het gat toch een job geclaimd, dan is die door de stop als `STOPPED` afgesloten: melden aan JP, die hem opnieuw dispatcht. De wijziging gaat pas door na een schone tweede toets.
+  2. `systemctl stop agent-harness-worker`, en dan dezelfde toets opnieuw. Is die niet `0`, dan is er in het gat een job geclaimd; dat betekent niet dat hij als `STOPPED` is afgesloten: een afgebroken `wait_for_job` kan een claim achterlaten die pas via de lease-reset weer `QUEUED` wordt (`src/worker/control.ts:84-97`, `src/worker/worker.ts:201-219`). Leg dan de job-id's en statussen vast, dispatch niets opnieuw, en wacht tot elke claim terminaal is of weer `QUEUED`; begin daarna de procedure opnieuw. De wijziging gaat pas door na een schone tweede toets.
   3. De wijziging, en daarna `systemctl start agent-harness-worker` en controle dat de service `active` is.
 
 ## Review Focus
@@ -42,7 +42,7 @@ _Status: concept, revisie 3 (2026-09-28), na planronde 2. Een technisch GO autor
 
 ## Bouwvolgorde
 
-Spec §8: eerst het harness (PR, merge, max2), dan één echte idee-chat-job voor de fixture, dan de parser in het Ops-dashboard (PR, merge, uitrol op max2), dan de taakjob en de foutproef. Spec en plan gaan vooraf als docs-PR (branch `docs/m4-run-logging-spec`). Tussen de harness-uitrol en de parser-uitrol slaat de ingest de harness-bestanden over als `idle`; dat is onschadelijk.
+Spec §8: eerst het harness (PR, merge, max2), dan één echte idee-chat-job voor de fixture, dan de parser in het Ops-dashboard (PR, merge, uitrol op max2), dan de taakjob. Het bewijs voor een mislukte run volgt bij de eerste echte fout (spec §8 stap 4, tweede optie). Spec en plan gaan vooraf als docs-PR (branch `docs/m4-run-logging-spec`). Tussen de harness-uitrol en de parser-uitrol slaat de ingest de harness-bestanden over als `idle`; dat is onschadelijk.
 
 ## Bestandsstructuur
 
@@ -444,15 +444,13 @@ const terminal = harnessLog
 - [ ] Criterium 1: bij de eerste ingest-tick na T0 (timer `*:0/5`) verschijnt de run uit Taak 8 als `WorkerRun` met pool `harness`, host `max2`, status success, `job_id`, `model`, `num_turns` en `duration_ms`. Het detail in scrum4me-workers `/worker-logs` toont denk-tekst, antwoord, toolblokken en de meetregel per beurt; het Ops-dashboard op max2 toont hetzelfde van schijf. Leg de tijd van die tick en T1 (rij en weergave zichtbaar) vast. Gehaald als T1 − T0 ≤ 300 seconden; een handmatige ingest-start telt niet als bewijs. Is het meer, dan gaat de gemeten tijd naar JP, die over de grens beslist; het plan verandert de grens niet.
 - [ ] Criterium 6: nieuwe idea- en codex-runs verschijnen zoals voorheen.
 
-### Taak 11: taakjob, foutproef en triage (criteria 2, 3 en 4)
+### Taak 11: taakjob, eerste echte fout en triage (criteria 2, 3 en 4)
 
 - [ ] Criterium 2: een kleine echte taak via `dispatch_job` met `required_capability: 'local_llm'`. De run toont `worktree path=`, containerblokken voor prepare en gate met uitvoer, de `run_tests`-regels en de jobstappen; de push blijkt uit `step job_status done pushed_at=ja` (de MCP pusht bij `done`, het harness niet). Het geschoonde run-log wordt de tweede fixture in het Ops-dashboard (kleine vervolg-PR, JP merget).
-- [ ] Criterium 3, met een eenmalige worker en een tijdelijke rode config; `/etc/agent-harness/worker.json` blijft onaangeroerd:
-  1. Stop de service volgens de stopprocedure (Global Constraints). Toets met een read-only query dat er geen andere `QUEUED` `local_llm`-taakjob is; JP dispatcht tijdens de proef niets anders.
-  2. Kopieer `worker.json` naar `/run/agent-harness-red/worker.json` (map 0700, eigenaar janpeter), zet daarin het agent-harness-recept op `verify: "echo verify-proef-rood; exit 1"`, en valideer met `node -e` die `loadWorkerConfig` aanroept.
-  3. Dispatch een kleine proeftaak en draai één keer: `sudo systemd-run --wait --pipe --uid=janpeter -p EnvironmentFile=/etc/agent-harness/worker.env -p WorkingDirectory=/home/janpeter/Development/agent-harness /usr/bin/node dist/cli.js worker --config /run/agent-harness-red/worker.json --out /var/lib/agent-harness/runs --once`. Die claimt de proeftaak, eindigt FAILED en stopt.
-  4. Altijd daarna, ook als een stap faalt of wordt onderbroken: `/run/agent-harness-red` verwijderen, `systemctl start agent-harness-worker`, en controleren dat de service `active` is.
-  5. Pas daarna: de run staat op error met `error_summary` `VERIFY_FAILED: …`; JP start `worker-insights-triage.service` op scrum4me-srv, zo nodig herhaald (hooguit vijf keer) tot de run een `WorkerInsight` heeft of een ronde niets meer verwerkt. Aantal starts en tijden vastleggen.
+- [ ] Criterium 3 met de eerste echte mislukte harness-job na de uitrol, zoals spec §8 stap 4 als tweede optie toestaat. Er wordt geen config gemanipuleerd en de productieworker hoeft niet stil (planrondes 1–3 lieten zien dat de altijd-rode proef dat wel vraagt, met een eigen reeks risico's rond claims en herstarts).
+  1. De run staat op error met `error_summary` `<CODE>: …`, voor welke code ook.
+  2. Na de ingest start JP `worker-insights-triage.service` op scrum4me-srv, zo nodig herhaald (hooguit vijf keer), tot de run een `WorkerInsight` heeft of een ronde niets meer verwerkt. Aantal starts en tijden vastleggen.
+  3. Tot die fout er is, blijft criterium 3 open; de rest van M4 wacht daar niet op.
 - [ ] Criterium 4 met `harness check-run-logs` over alle bestanden in `/srv/scrum4me/worker-logs/harness/`, plus de namencontrole, volgens de runbook.
 - [ ] Bewijs per criterium (job-id, run-id, relevante regels) in `docs/runbooks/idea-chat-worker.md`, in een docs-PR.
 
@@ -499,3 +497,13 @@ Bevindingen, allemaal gecontroleerd tegen de bomen en overgenomen:
 - **MINOR claude:** Taak 7 kon niet op `collectSecretValues` bouwen (geen namen, lengtefilter) en meldde 0 treffers zonder iets te controleren → `collectSecretEntries` en `workerSecretSources` in Taak 3, pariteitstest, `dir` in de CLI-opties, exitcode 1 bij nul gecontroleerde geheimen (Taak 3, 7).
 
 Afgewezen: geen. Scope: de rode proef raakt de productieconfig niet meer en de stop is aan een toets gebonden; de rest zijn verduidelijkingen. Niets toegevoegd aan het eerste resultaat, niets geschrapt.
+
+### Planronde 3 — revisie 3 (`076a754`), 2026-09-28
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 2 MINOR; GO) en `mac:codex` (0 BLOCKER, 3 MAJOR, 1 MINOR; NO-GO).
+
+Bevindingen, gecontroleerd tegen de bomen:
+- **MAJOR codex:** een claim die tijdens het stoppen landt, is niet vanzelf `STOPPED`, want een afgebroken `wait_for_job` kan een claim achterlaten tot de lease-reset → een niet-nul tweede toets betekent: vastleggen, niets opnieuw dispatchen, wachten tot terminaal of weer `QUEUED`, opnieuw beginnen (Global Constraints). Overgenomen.
+- **MAJOR codex, MINOR claude:** de eenmalige worker kan een wachtende idee-chat claimen in plaats van de proeftaak. **MAJOR codex:** de hoofdservice mag niet herstarten zolang de rode proeftaak open is. **MINOR codex:** "altijd herstellen" had geen uitvoerbaar mechanisme. **MINOR claude:** `--pipe` bindt een run van 40 minuten aan de sessie. → Alle vier opgelost door de altijd-rode proef te schrappen. Spec §8 stap 4 staat als tweede optie de eerstvolgende echte fout toe; criterium 3 wordt daarmee bewezen, zonder configwijziging en zonder de productieworker stil te leggen (Taak 11).
+
+Afgewezen: geen. Scope, beoordeeld vóór ronde 4 omdat dezelfde procedure drie rondes terugkwam: geschrapt is de altijd-rode proef met stilgelegde service. Het bewijs voor criterium 3 hangt nu af van de eerste echte fout, en kan dus later komen dan de rest; de afgesproken acceptatie zelf verandert niet.
