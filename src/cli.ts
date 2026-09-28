@@ -10,6 +10,7 @@ import { runManifest } from './run.js'
 import { connectStdioClient, connectStdioRegistry, createRegistryView } from './tools/registry.js'
 import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
+import { checkRunLogs } from './worker/check-run-logs.js'
 import { loadWorkerConfig, workerMcpEnv } from './worker/config.js'
 import { createControlChannel } from './worker/control.js'
 import { collectSecretValues, workerSecretSources } from './worker/redact.js'
@@ -22,6 +23,7 @@ Usage:
   harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>]
   harness run <manifest.json> --out <dir> [--skip-probe]
   harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe]
+  harness check-run-logs --config <worker.json> --dir <run-logs-dir>
 `
 
 // allowPositionals is required: without it Node throws ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL on the subcommand.
@@ -38,6 +40,7 @@ export const cliArgsConfig = {
     'skip-probe': { type: 'boolean' },
     config: { type: 'string' },
     once: { type: 'boolean' },
+    dir: { type: 'string' },
   },
 } satisfies ParseArgsConfig
 
@@ -184,6 +187,23 @@ async function cmdWorker(values: Values): Promise<number> {
   }
 }
 
+/**
+ * Spec §10 criterion 4: scans --dir for the same secrets the redaction masks, without ever printing
+ * a value. checkRunLogs (src/worker/check-run-logs.ts) stays pure and does the scanning; this only
+ * prints and decides the exit code, matching the other cmd* handlers in this file.
+ */
+async function cmdCheckRunLogs(values: Values): Promise<number> {
+  if (!values.config) throw new UsageError('check-run-logs needs --config')
+  if (!values.dir) throw new UsageError('check-run-logs needs --dir')
+  const config = loadWorkerConfig(values.config)
+  const { checked, results } = checkRunLogs(config, process.env, values.dir)
+  process.stdout.write(`${checked} geheim(en) gecontroleerd in ${values.dir}\n`)
+  for (const r of results) process.stdout.write(`  ${r.name}: treffers=${r.hits} kort=${r.short}\n`)
+  // Exit 1 on any hit, and also when nothing was checked at all: that usually means this ran without
+  // the service's own environment, which would silently pass every check instead of failing loud.
+  return checked === 0 || results.some((r) => r.hits > 0) ? 1 : 0
+}
+
 export async function main(argv: string[]): Promise<number> {
   let parsed
   try {
@@ -205,6 +225,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdRun(values, positionals[1])
       case 'worker':
         return await cmdWorker(values)
+      case 'check-run-logs':
+        return await cmdCheckRunLogs(values)
       default:
         process.stderr.write(`${positionals[0]}: not implemented\n`)
         return 1

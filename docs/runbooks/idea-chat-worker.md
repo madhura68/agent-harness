@@ -70,15 +70,15 @@ Zonder dit blok werkt de worker precies zoals vóór M4: geen run-log, verder ge
 - Is een run klaar: `tail -4 <bestand>` toont het afsluitblok — een `harness.run_end`-JSON-regel, bij een fout een `ERROR <CODE>: <bericht>`-regel, `harness done job_id=… exit_code=… duration_ms=…`, en als laatste `exit code=<0|1>`. **Alleen die laatste regel telt als afgesloten**; een bestand zonder `exit code=` hoort bij een nog lopende job, of bij een harde crash die geen afsluitblok meer kon schrijven (spec §5.6) — niet bij een fout in het run-log zelf, want dat verandert nooit de jobuitkomst.
 - Alle jobstappen op een rij: `grep '\[harness\] step ' <bestand>`.
 
-**Controle op geheimen (spec §10 criterium 4).** Geen enkele waarde die de redactie hoort te raken — elke omgevingsvariabele in `/etc/agent-harness/worker.env` waarvan de naam matcht op `/(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|_KEY$|DSN|CREDENTIAL)/i`, en het wachtwoord uit elke URL-waarde (zoals in `DATABASE_URL` en `DIRECT_URL`) — hoort **onveranderd** in een run-log voor te komen; `***` op die plek wel. Zet de te controleren waarde alleen in een shell-variabele (nooit in dit document, nooit in argv of een log) en draai bijvoorbeeld:
+**Controle op geheimen (spec §10 criterium 4).** Geen enkele waarde die de redactie hoort te raken — elke omgevingsvariabele in `/etc/agent-harness/worker.env` waarvan de naam matcht op `/(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|_KEY$|DSN|CREDENTIAL)/i`, en het wachtwoord uit elke URL-waarde (zoals in `DATABASE_URL` en `DIRECT_URL`) — hoort **onveranderd** in een run-log voor te komen; `***` op die plek wel.
+
+`harness check-run-logs` doet deze controle geautomatiseerd, zonder ooit een waarde in argv, uitvoer of een log te zetten: hij leest de geheimen uit dezelfde bronnen als de redactie (`process.env`, de MCP-omgeving, `model.apiKey`), doorzoekt de run-logs recursief en drukt per geheim alleen de naam, het aantal treffers en of de waarde korter is dan 8 tekens af — nooit een waarde. Exitcode 1 bij minstens één treffer, en ook als er nul geheimen gecontroleerd zijn (dan draait hij waarschijnlijk zonder de service-omgeving). Draai het met de omgeving van de service, zodat er geen waarde in argv komt:
 
 ```bash
-grep -rF "$WAARDE" /srv/scrum4me/worker-logs/harness   # verwacht: 0 treffers
+sudo systemd-run --wait --pipe --uid=janpeter -p EnvironmentFile=/etc/agent-harness/worker.env /usr/bin/node /home/janpeter/Development/agent-harness/dist/cli.js check-run-logs --config /etc/agent-harness/worker.json --dir /srv/scrum4me/worker-logs/harness
 ```
 
-Herhaal dit voor elke geheime naam en voor elk URL-wachtwoord, zowel ruw als URL-gedecodeerd. Een losse controle op alleen de namen (zonder een waarde te tonen): `sudo cut -d= -f1 /etc/agent-harness/worker.env` naast de lijst met redactiepatronen hierboven — elke naam die matcht hoort onder één van beide regels te vallen. Deze controle zet nooit een waarde in argv, uitvoer of een log; alleen namen en tellingen.
-
-`harness check-run-logs` (Taak 7) doet precies deze controle geautomatiseerd — leest de geheimen uit dezelfde bronnen als de redactie (`process.env`, de MCP-omgeving, `model.apiKey`), doorzoekt de run-logs en drukt per geheim alleen de naam, het aantal treffers en of de waarde kort is af, nooit een waarde — met exitcode 1 bij minstens één treffer, uitgevoerd via `sudo systemd-run` met de service-omgeving zodat er geen waarde in argv komt. Tot dat commando er is, geldt de handmatige `grep -rF`-controle hierboven.
+Een losse controle op alleen de namen (zonder een waarde te tonen): `sudo cut -d= -f1 /etc/agent-harness/worker.env` naast de lijst met redactiepatronen hierboven — elke naam die matcht hoort onder één van beide regels te vallen. Deze controle zet nooit een waarde in argv, uitvoer of een log; alleen namen en tellingen.
 
 **Terugdraaien.** Verwijder het `workerLog`-blok uit `/etc/agent-harness/worker.json` (of zet de backup terug) en herstart de service:
 
