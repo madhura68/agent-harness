@@ -1,6 +1,6 @@
 # M4 — harness-runs volgen in Worker Logs: implementatieplan
 
-_Status: concept, revisie 5 (2026-09-28), na planronde 4. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
+_Status: concept, revisie 6 (2026-09-28), na planronde 5. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -28,8 +28,8 @@ _Status: concept, revisie 5 (2026-09-28), na planronde 4. Een technisch GO autor
 - Gates vóór elke commit: agent-harness `npm run verify`; Ops-dashboard `npm run typecheck && npm test` (er is geen lint-script).
 - Een controle op geheimen zet nooit een waarde in argv, uitvoer of een log; alleen namen en tellingen.
 - **Stopprocedure voor de worker op max2**, vóór elke herstart of stop (journal en containers alleen tonen geen claim; die zijn aanvullend bewijs, geen toets). Alle queries zijn read-only, op scrum4me-srv via `docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc "<query>"`:
-  1. Leg `T0` vast met `select now()`. Toets dat `select id, kind, status, claimed_at from claude_jobs where required_capability = 'local_llm' and status in ('CLAIMED','RUNNING')` geen rijen geeft. Na de M4-uitrol bovendien: het nieuwste bestand in `/srv/scrum4me/worker-logs/harness/max2/runs/` eindigt op `exit code=`.
-  2. `systemctl stop agent-harness-worker`, en dan de audit over het hele stopmoment: `select id, kind, status, error, claimed_at from claude_jobs where required_capability = 'local_llm' and (status in ('CLAIMED','RUNNING') or claimed_at >= '<T0>')` geeft geen rijen. Zo valt ook een job op die in het gat is geclaimd en door de stop al als FAILED (`worker gestopt`) is afgesloten; een afgebroken `wait_for_job` kan bovendien een claim achterlaten die pas via de lease-reset weer `QUEUED` wordt (`src/worker/control.ts:84-97`, `src/worker/worker.ts:201-219`). Geeft de audit rijen, dan is de stop niet schoon: de service blijft gestopt, de rijen gaan naar JP, er wordt niets opnieuw gedispatcht, en alleen de audit wordt herhaald tot elke rij terminaal is en JP over een eventuele herdispatch heeft beslist.
+  1. Leg `T0` vast met `select now() at time zone 'utc'`: `claimed_at` is `timestamp(3)` zonder tijdzone en wordt in UTC gevuld, en PostgreSQL negeert zonder melding een tijdzone in een letterlijke waarde voor zo'n kolom. Toets dat `select id, kind, status, claimed_at from claude_jobs where required_capability = 'local_llm' and status in ('CLAIMED','RUNNING')` geen rijen geeft. Na de M4-uitrol bovendien: het nieuwste bestand in `/srv/scrum4me/worker-logs/harness/max2/runs/` eindigt op `exit code=`.
+  2. `systemctl stop agent-harness-worker`, en dan de audit over het hele stopmoment: `select id, kind, status, claimed_at from claude_jobs where required_capability = 'local_llm' and (status in ('CLAIMED','RUNNING') or claimed_at >= '<T0>')` geeft geen rijen. Zo valt ook een job op die in het gat is geclaimd en door de stop al als FAILED (`worker gestopt`) is afgesloten; een afgebroken `wait_for_job` kan bovendien een claim achterlaten die pas via de lease-reset weer `QUEUED` wordt (`src/worker/control.ts:84-97`, `src/worker/worker.ts:201-219`). Geen enkele query in deze procedure selecteert `error`: die kolom kan ongeredigeerde model- of tooltekst bevatten (`src/model-client.ts:97`, via `closeFailed` in `src/worker/task-impl.ts:161`). Geeft de audit rijen, dan is de stop niet schoon: de service blijft gestopt, de ID's worden vastgelegd en gaan met hun rijen naar JP, en er wordt niets opnieuw gedispatcht. Daarna wordt alleen `select id, kind, status, claimed_at from claude_jobs where id in ('<id>', …)` met de vastgelegde ID's herhaald; stap 3 volgt pas als elk vastgelegd ID terminaal of weer `QUEUED` is en JP over een eventuele herdispatch heeft beslist. De brede audit wordt niet herhaald: een terminale rij blijft er door zijn `claimed_at` in staan, en een rij die via de lease-reset weer `QUEUED` wordt, verdwijnt eruit omdat de reset `claimed_at` wist (scrum4me-mcp `src/tools/wait-for-job.ts:620-627`).
   3. De wijziging, en daarna `systemctl start agent-harness-worker` en controle dat de service `active` is.
 
 ## Review Focus
@@ -519,3 +519,14 @@ Bevindingen, gecontroleerd tegen de bomen en overgenomen:
 - **MINOR claude:** het open criterium 3 had geen plek → de bewijs-PR noemt het open en één taak in de sprint blijft staan (Taak 11).
 
 Afgewezen: geen. Scope: onveranderd; alleen de stoptoets is aangescherpt.
+
+### Planronde 5 — revisie 5 (`35238ff`), 2026-09-28
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 1 MINOR; GO) en `mac:codex` (0 BLOCKER, 1 MAJOR, 1 MINOR; NO-GO). Beide: de audit met `claimed_at >= T0` vindt ook de snel afgesloten claim uit het stopgat; de rijen en de plek van het open criterium 3 houden stand.
+
+Bevindingen, gecontroleerd tegen de bomen:
+- **MAJOR codex:** de audit selecteerde `error`, en die kolom kan ongeredigeerde tekst bevatten: een modelfout neemt een uittreksel van de responsbody op (`src/model-client.ts:97`) en `closeFailed` stuurt die naar `update_job_status` (`src/worker/task-impl.ts:161`) → geen enkele query in de stopprocedure selecteert `error` (Global Constraints). Overgenomen.
+- **MINOR codex:** de brede audit wordt nooit leeg, want een terminale rij houdt zijn `claimed_at`; een rij die via de lease-reset weer `QUEUED` wordt, verdwijnt er juist uit, want de reset wist `claimed_at` (scrum4me-mcp `390c391`, `src/tools/wait-for-job.ts:620-627`) → de ID's uit de eerste audit worden vastgelegd en per ID gevolgd tot terminaal of `QUEUED`, plus JP's besluit (Global Constraints). Overgenomen, behalve de slotaudit met een nieuwe T1.
+- **MINOR claude:** `T0` uit `select now()` draagt de tijdzone van de sessie, terwijl `claimed_at` `timestamp(3)` zonder zone is en in UTC wordt gevuld; PostgreSQL negeert de zone in de letterlijke waarde → `select now() at time zone 'utc'` (Global Constraints). Overgenomen.
+
+Afgewezen: de slotaudit met een nieuwe T1 (uit de MINOR van codex). `systemctl stop` keert pas terug als de control group leeg is (`KillMode=mixed`, `TimeoutStopSec=180`, `docs/runbooks/task-worker.md:64-65,84`), en `Restart=always` herstart niet na een `stop`. Tot stap 3 kan dus geen proces van deze worker meer claimen. De vastgelegde ID's geven al een eindconditie die af te lezen is. Scope: onveranderd; alleen de stopprocedure is aangepast.
