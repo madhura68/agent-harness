@@ -2,7 +2,7 @@
 title: "Agent-harness M4 — harness-runs volgen in Worker Logs"
 status: reviewed
 last_updated: 2026-09-28
-revision: 3
+revision: 4
 ---
 
 # Agent-harness M4 — harness-runs volgen in Worker Logs
@@ -112,7 +112,7 @@ Het voorvoegsel `step` voorkomt dat vrije tekst per ongeluk begint met een ander
 | `harness.turn` | `turn`, `durationMs`, `finishReason`, `usageSource` (`provider_reported` of `missing`), `usage {input, output, cached?}`, `promptEstimate?`, `reasoning?` + `reasoningTruncated?`, `content?` + `contentTruncated?`, `systemFingerprint?` | `thinking` (reasoning), `assistant-text` (content, alleen als niet leeg) en een `raw`-regel `turn <n> · <s> s · in <x> · cached <y> · out <z> · <finish>`. `in` en `out` staan er alleen bij `usageSource` `provider_reported` (anders zou een ontbrekende meting als 0 lezen, `model-client.ts:36-42`); `cached` alleen als de server die waarde meldde |
 | `harness.tool_call` | `callId`, `name`, `arguments` (string) + `argumentsTruncated?` | `tool-call`, id = callId. Argumenten die als JSON-object parsen worden opgemaakt; al het andere (ongeldige JSON, `null`, een getal, een string of een array) wordt `{"arguments": "<ruwe string>"}`, want de ingest zet de invoer als JSON-waarde in `payload` (`ingest-worker-log.ts:84-91,141-151`) en `null` weigert die kolom |
 | `harness.tool_result` | `callId`, `ok`, `errorCode?`, `content` + `contentLength` | `tool-result`: isError = !ok; body met `[<errorCode>] ` ervoor als die er is; fullLength = contentLength, de lengte van de volledige tooluitvoer (`fullContent` als die er is, anders `content`) |
-| `harness.container` | `n`, `kind`, `source`, `exitCode`, `timedOut`, `durationMs`, `outputTail`, `outputLength` | Bij `prepare` en `gate`: `tool-call` (name `container:<kind>/<source>`, id `container-<n>`) plus `tool-result` (body = outputTail, isError = exitCode ≠ 0 of timedOut; `outputLength` is de lengte van de bewaarde staart). Bij `run_tests` alleen een `raw`-regel, want die uitvoer staat al in het tool-result van de modelaanroep |
+| `harness.container` | `n`, `kind`, `source`, `exitCode`, `timedOut`, `durationMs`, `outputTail`, `outputLength` | Bij `prepare` en `gate`: `tool-call` (name `container:<kind>/<source>`, id `container-<n>`) plus `tool-result` (body = outputTail, isError = exitCode ≠ 0 of timedOut; `outputLength` is de lengte van de geredigeerde uitvoer vóór de grens van 8 192 tekens (§5.5), dus groter dan de lengte van `outputTail` precies als er is afgekapt). Bij `run_tests` alleen een `raw`-regel, want die uitvoer staat al in het tool-result van de modelaanroep |
 | `harness.compacted` | `turn`, `messages`, `bytes`, `estimateBefore`, `estimateAfter` | `raw` |
 | `harness.gate` | `turn`, `outcome` (`accept`, `retry` of `fail`) | `raw` |
 | `harness.loop_end` | `status`, `error? {code, message}`, `turns`, `toolCalls`, `toolErrors`, `usageSource`, `inputTokens`, `outputTokens`, `cachedTokens?`, `durationMs` (van de modelloop) | `raw`: `model loop <status>[ <code>] · <turns> turns · <toolCalls> tool calls · in <x> · out <z> · <s> s` (`in`/`out` alleen bij `provider_reported`) |
@@ -334,3 +334,7 @@ MINOR-bevindingen, gecontroleerd en verwerkt in revisie 3 zonder nieuwe ronde, w
 - **beide:** testregels liepen achter op het nieuwe contract → `outcome` ≠ `done` met `exit code=1`; JSON-string en array bij de argumenten (§5.4, §9).
 
 Afgewezen: geen. Scope: onveranderd; alleen verduidelijkingen.
+
+### Delta na de uitvoering — revisie 4, 2026-09-28
+
+De rij `harness.container` in §5.4 noemde `outputLength` de lengte van de bewaarde staart. Dan is hij altijd gelijk aan de lengte van `outputTail` en draagt hij geen afkapsignaal, terwijl §5.5 bij afkappen een vlag of de volledige lengte eist. De eindreview van increment 1 legde dat bloot; de code volgt §5.5. De rij noemt nu de lengte vóór de grens. Akkoord JP, 2026-09-28.
