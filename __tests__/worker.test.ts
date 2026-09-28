@@ -328,11 +328,142 @@ describe('createControlChannel', () => {
     const r = await createControlChannel(mcp.client).waitForJob(1, new AbortController().signal)
     expect(r).toMatchObject({ type: 'job', jobId: 'job1', kind: 'IDEA_CHAT' })
   })
+
+  it('updateStatus returns the real outcome (status/branch/pushedAt/error), not just ok', async () => {
+    mcp = await startFakeScrum4meMcp({ updateOutcome: { done: { status: 'failed', error: 'push failed' } } })
+    const control = createControlChannel(mcp.client)
+    const r = await control.updateStatus('job1', { status: 'done', summary: 'klaar' })
+    expect(r).toEqual({ ok: true, status: 'failed', branch: null, pushedAt: null, error: 'push failed' })
+  })
+
+  it('updateStatus keeps working for callers that only read ok (idea-chat)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    const r = await control.updateStatus('job1', { status: 'running' })
+    expect(r.ok).toBe(true)
+  })
+
+  it('updateStatus classifies a thrown call (a timeout) as unknown, not a definite refusal (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockRejectedValueOnce(new McpError(ErrorCode.RequestTimeout, 'Request timed out'))
+    const r = await control.updateStatus('job1', { status: 'done', summary: 'klaar' })
+    expect(r.ok).toBe(false)
+    expect(r.unknown).toBe(true)
+    expect(r.message).toMatch(/timed out/i)
+  })
+
+  it('updateStatus keeps an isError refusal distinct from unknown (no unknown flag)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockResolvedValueOnce({ isError: true, content: [{ type: 'text', text: 'Job already terminal' }] })
+    const r = await control.updateStatus('job1', { status: 'done', summary: 'klaar' })
+    expect(r).toEqual({ ok: false, message: 'Job already terminal' })
+  })
+
+  it('gives a done update an explicit 300s request timeout, unlike running/failed (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    const spy = vi.spyOn(mcp.client, 'callTool')
+    await control.updateStatus('job1', { status: 'done', summary: 'klaar' })
+    expect(spy).toHaveBeenCalledWith({ name: 'update_job_status', arguments: expect.objectContaining({ status: 'done' }) }, undefined, expect.objectContaining({ timeout: 300_000 }))
+    spy.mockClear()
+    await control.updateStatus('job1', { status: 'running' })
+    const runningOpts = spy.mock.calls[0]?.[2] as { timeout?: number } | undefined
+    expect(runningOpts?.timeout).not.toBe(300_000)
+    spy.mockClear()
+    await control.updateStatus('job1', { status: 'failed', error: 'x' })
+    const failedOpts = spy.mock.calls[0]?.[2] as { timeout?: number } | undefined
+    expect(failedOpts?.timeout).not.toBe(300_000)
+  })
+
+  it('updateTaskStatus sends task_id and status to update_task_status', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    const r = await control.updateTaskStatus('task-1', 'in_progress')
+    expect(r).toEqual({ ok: true })
+    expect(mcp.calls.filter((c) => c.name === 'update_task_status')).toEqual([{ name: 'update_task_status', args: { task_id: 'task-1', status: 'in_progress' } }])
+  })
+
+  it('updateTaskStatus reports a tool error as ok:false', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockResolvedValueOnce({ isError: true, content: [{ type: 'text', text: 'task niet gevonden' }] })
+    const r = await control.updateTaskStatus('task-1', 'review')
+    expect(r).toEqual({ ok: false, message: 'task niet gevonden' })
+  })
+
+  it('verifyTaskAgainstPlan sends task_id and worktree_path and parses the result', async () => {
+    mcp = await startFakeScrum4meMcp({ verifyResult: 'partial' })
+    const control = createControlChannel(mcp.client)
+    const r = await control.verifyTaskAgainstPlan('task-1', '/var/lib/agent-harness/worktrees/task-1')
+    expect(r).toEqual({ ok: true, result: 'partial' })
+    expect(mcp.calls.filter((c) => c.name === 'verify_task_against_plan')).toEqual([
+      { name: 'verify_task_against_plan', args: { task_id: 'task-1', worktree_path: '/var/lib/agent-harness/worktrees/task-1' } },
+    ])
+  })
+
+  it('verifyTaskAgainstPlan reports a tool error as ok:false', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockResolvedValueOnce({ isError: true, content: [{ type: 'text', text: 'geen plan' }] })
+    const r = await control.verifyTaskAgainstPlan('task-1', '/wt')
+    expect(r).toEqual({ ok: false, message: 'geen plan' })
+  })
+
+  it('verifyTaskAgainstPlan classifies a thrown call as unknown too (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockRejectedValueOnce(new McpError(ErrorCode.RequestTimeout, 'Request timed out'))
+    const r = await control.verifyTaskAgainstPlan('task-1', '/wt')
+    expect(r.ok).toBe(false)
+    expect(r.unknown).toBe(true)
+  })
+
+  it('gives verify_task_against_plan an explicit 300s request timeout (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    const spy = vi.spyOn(mcp.client, 'callTool')
+    await control.verifyTaskAgainstPlan('task-1', '/wt')
+    expect(spy).toHaveBeenCalledWith(
+      { name: 'verify_task_against_plan', arguments: { task_id: 'task-1', worktree_path: '/wt' } },
+      undefined,
+      expect.objectContaining({ timeout: 300_000 }),
+    )
+  })
+
+  it('log sends the right argument names for implementation, commit and test', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    await control.log('implementation', { storyId: 'story-1', taskId: 'task-1', content: 'gestart' })
+    await control.log('commit', { storyId: 'story-1', taskId: 'task-1', content: 'commit', commitHash: 'abc123', commitMessage: 'feat: iets' })
+    await control.log('test', { storyId: 'story-1', taskId: 'task-1', content: 'groen', status: 'PASSED' })
+    expect(mcp.calls.filter((c) => c.name === 'log_implementation')).toEqual([{ name: 'log_implementation', args: { story_id: 'story-1', task_id: 'task-1', content: 'gestart' } }])
+    expect(mcp.calls.filter((c) => c.name === 'log_commit')).toEqual([
+      { name: 'log_commit', args: { story_id: 'story-1', task_id: 'task-1', content: 'commit', commit_hash: 'abc123', commit_message: 'feat: iets' } },
+    ])
+    expect(mcp.calls.filter((c) => c.name === 'log_test_result')).toEqual([
+      { name: 'log_test_result', args: { story_id: 'story-1', task_id: 'task-1', content: 'groen', status: 'PASSED' } },
+    ])
+  })
+
+  it('log is best-effort: a tool error or a rejected call never throws and never writes to the console', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    vi.spyOn(mcp.client, 'callTool').mockResolvedValueOnce({ isError: true, content: [{ type: 'text', text: 'kapot' }] })
+    await expect(control.log('implementation', { storyId: 'story-1', taskId: 'task-1', content: 'x' })).resolves.toEqual({ ok: false, message: 'log_implementation mislukt: kapot' })
+    vi.spyOn(mcp.client, 'callTool').mockRejectedValueOnce(new Error('verbinding weg'))
+    await expect(control.log('commit', { storyId: 'story-1', taskId: 'task-1', content: 'x', commitHash: 'a', commitMessage: 'm' })).resolves.toEqual({ ok: false, message: 'log_commit mislukt: verbinding weg' })
+    expect(await control.log('test', { storyId: 'story-1', taskId: 'task-1', content: 'x', status: 'PASSED' })).toEqual({ ok: true })
+    expect(consoleError).not.toHaveBeenCalled()
+    consoleError.mockRestore()
+  })
 })
 
 describe('runWorker — review fixes', () => {
   it('stops after an unsupported kind: a wrong claim filter must not drain the queue', async () => {
-    const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'TASK_IMPLEMENTATION' }), job()], script: [answer('nee')], once: false })
+    const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'PR_REVIEW' }), job()], script: [answer('nee')], once: false })
     const r = await t.run()
     expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
     expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)

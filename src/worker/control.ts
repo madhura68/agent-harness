@@ -17,12 +17,45 @@ export type StatusUpdate = {
   output_tokens?: number
 }
 
+/**
+ * The real outcome of `update_job_status`: what the MCP actually resolved the job to, not just whether
+ * the call itself errored. `unknown: true` marks the call itself as having thrown or timed out — the MCP
+ * may still be processing it (and could still write a terminal status later) — which callers must treat
+ * as distinct from `isError` (a definite refusal, `unknown` absent): sending a second terminal update in
+ * response to an unknown outcome risks racing the MCP's own, possibly-still-pending, write (spec P12).
+ */
+export type StatusOutcome = {
+  ok: boolean
+  unknown?: boolean
+  message?: string
+  status?: 'running' | 'done' | 'failed' | 'skipped'
+  branch?: string | null
+  pushedAt?: string | null
+  error?: string | null
+}
+
+export type LogArgs = {
+  storyId: string
+  taskId: string
+  content: string
+  commitHash?: string
+  commitMessage?: string
+  status?: 'PASSED' | 'FAILED'
+}
+
 /** The harness's own channel to the scrum4me MCP. The model never sees these tools. */
 export interface ControlChannel {
   waitForJob(waitSeconds: number, signal: AbortSignal): Promise<ClaimResult>
   /** false when the server refuses (claim lost, cancelled, terminal); rejects when the call itself failed. */
   heartbeat(jobId: string): Promise<boolean>
-  updateStatus(jobId: string, input: StatusUpdate): Promise<{ ok: boolean; message?: string }>
+  updateStatus(jobId: string, input: StatusUpdate): Promise<StatusOutcome>
+  updateTaskStatus(taskId: string, status: 'in_progress' | 'review' | 'todo'): Promise<{ ok: boolean; message?: string }>
+  verifyTaskAgainstPlan(taskId: string, worktreePath: string): Promise<{ ok: boolean; unknown?: boolean; result?: 'aligned' | 'partial' | 'empty' | 'divergent'; message?: string }>
+  /**
+   * Best-effort: a tool error or a rejected call is never thrown; it comes back as `ok: false` so the caller
+   * can report it through its own logger (the worker's `deps.log`).
+   */
+  log(kind: 'implementation' | 'commit' | 'test', args: LogArgs): Promise<{ ok: boolean; message?: string }>
 }
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
@@ -32,10 +65,21 @@ const text = (res: unknown) => {
 }
 
 /**
+ * `update_job_status` for a `done` request, and `verify_task_against_plan`, get this explicit request
+ * timeout instead of the SDK's 60 s default (spec P12): the MCP's `done` handling can itself run long
+ * (push, cascades), and a 60 s client timeout turning into a false refusal risks a second terminal
+ * update racing the MCP's own possibly-still-pending write. `doneTimeoutMs`/`verifyTimeoutMs` override it
+ * (tests only).
+ */
+const DONE_AND_VERIFY_TIMEOUT_MS = 300_000
+
+/**
  * `requestTimeoutMs` overrides the wait_for_job request timeout (tests only). By default it is
  * waitSeconds + 30 s: the SDK would otherwise abort the long-poll after its 60 s default.
  */
-export function createControlChannel(client: Client, opts: { requestTimeoutMs?: number } = {}): ControlChannel {
+export function createControlChannel(client: Client, opts: { requestTimeoutMs?: number; doneTimeoutMs?: number; verifyTimeoutMs?: number } = {}): ControlChannel {
+  const doneTimeoutMs = opts.doneTimeoutMs ?? DONE_AND_VERIFY_TIMEOUT_MS
+  const verifyTimeoutMs = opts.verifyTimeoutMs ?? DONE_AND_VERIFY_TIMEOUT_MS
   return {
     async waitForJob(waitSeconds, signal) {
       if (signal.aborted) return { type: 'stopped' }
@@ -72,10 +116,83 @@ export function createControlChannel(client: Client, opts: { requestTimeoutMs?: 
 
     async updateStatus(jobId, input) {
       try {
-        const res = await client.callTool({ name: 'update_job_status', arguments: { job_id: jobId, ...input } })
+        // Only a 'done' request gets the long bound: 'running'/'failed' keep the SDK default so a
+        // genuinely stuck connection is still detected promptly on those (non-terminal-conflict) paths.
+        const callOpts = input.status === 'done' ? { timeout: doneTimeoutMs } : undefined
+        const res = await client.callTool({ name: 'update_job_status', arguments: { job_id: jobId, ...input } }, undefined, callOpts)
+        if (res.isError) return { ok: false, message: text(res) }
+        const body = text(res)
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(body)
+        } catch {
+          return { ok: true }
+        }
+        const p = parsed as { status?: unknown; branch?: unknown; pushed_at?: unknown; error?: unknown }
+        return {
+          ok: true,
+          status: typeof p?.status === 'string' ? (p.status as StatusOutcome['status']) : undefined,
+          branch: typeof p?.branch === 'string' || p?.branch === null ? (p.branch as string | null) : undefined,
+          pushedAt: typeof p?.pushed_at === 'string' || p?.pushed_at === null ? (p.pushed_at as string | null) : undefined,
+          error: typeof p?.error === 'string' || p?.error === null ? (p.error as string | null) : undefined,
+        }
+      } catch (err) {
+        // A thrown call (including a client-side request timeout) is UNKNOWN, not a refusal: the MCP may
+        // still be processing it. Only `res.isError` above is a definite REFUSED.
+        return { ok: false, unknown: true, message: message(err) }
+      }
+    },
+
+    async updateTaskStatus(taskId, status) {
+      try {
+        const res = await client.callTool({ name: 'update_task_status', arguments: { task_id: taskId, status } })
         return res.isError ? { ok: false, message: text(res) } : { ok: true }
       } catch (err) {
         return { ok: false, message: message(err) }
+      }
+    },
+
+    async verifyTaskAgainstPlan(taskId, worktreePath) {
+      try {
+        const res = await client.callTool(
+          { name: 'verify_task_against_plan', arguments: { task_id: taskId, worktree_path: worktreePath } },
+          undefined,
+          { timeout: verifyTimeoutMs },
+        )
+        if (res.isError) return { ok: false, message: text(res) }
+        const body = text(res)
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(body)
+        } catch {
+          return { ok: true }
+        }
+        const p = parsed as { result?: unknown }
+        const result = p?.result
+        const valid = result === 'aligned' || result === 'partial' || result === 'empty' || result === 'divergent'
+        return { ok: true, result: valid ? result : undefined }
+      } catch (err) {
+        // Same UNKNOWN/REFUSED distinction as updateStatus, for consistency; task-impl.ts's failPath
+        // currently treats both as an ordinary (single, non-terminal-conflicting) failed update either way.
+        return { ok: false, unknown: true, message: message(err) }
+      }
+    },
+
+    async log(kind, args) {
+      const toolName = kind === 'implementation' ? 'log_implementation' : kind === 'commit' ? 'log_commit' : 'log_test_result'
+      const toolArgs: Record<string, unknown> = { story_id: args.storyId, task_id: args.taskId, content: args.content }
+      if (kind === 'commit') {
+        toolArgs.commit_hash = args.commitHash
+        toolArgs.commit_message = args.commitMessage
+      }
+      if (kind === 'test') {
+        toolArgs.status = args.status
+      }
+      try {
+        const res = await client.callTool({ name: toolName, arguments: toolArgs })
+        return res.isError ? { ok: false, message: `${toolName} mislukt: ${text(res)}` } : { ok: true }
+      } catch (err) {
+        return { ok: false, message: `${toolName} mislukt: ${message(err)}` }
       }
     },
   }

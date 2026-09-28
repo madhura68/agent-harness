@@ -4,8 +4,11 @@ import { runManifest } from '../run.js'
 import { openTrace, type RunResult } from '../trace.js'
 import type { ToolRegistry } from '../types.js'
 import type { WorkerConfig } from './config.js'
+import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
+import { startHeartbeat } from './heartbeat.js'
 import { IDEA_CHAT_SYSTEM_PROMPT, IdeaChatPayloadSchema, pendingUserMessages, renderIdeaChatUserMessage } from './idea-chat.js'
+import { ContainerUncertainError, runTaskJob, type TaskJobContext } from './task-impl.js'
 
 export type WorkerDeps = {
   control: ControlChannel
@@ -21,6 +24,8 @@ export type WorkerDeps = {
   /** Pause after a wait_for_job tool error before the next attempt; default 5 s. */
   errorBackoffMs?: number
   log?: (line: string) => void
+  /** Test seam for the task containers (fake docker); production passes nothing. */
+  taskDeps?: ContainerDeps
 }
 
 export type JobOutcome = 'done' | 'failed' | 'abandoned' // abandoned = no longer ours, nothing closed
@@ -92,7 +97,13 @@ function closingUpdate(result: RunResult, config: WorkerConfig): StatusUpdate {
   return { status: 'failed', error: cut(failureText(result, config), ERROR_LIMIT) }
 }
 
-export async function runOneJob(deps: WorkerDeps, claim: Claim): Promise<JobOutcome> {
+/** Routes a claim by kind: IDEA_CHAT and TASK_IMPLEMENTATION; anything else is a claim-filter breach. */
+export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJobContext): Promise<JobOutcome> {
+  if (claim.kind === 'TASK_IMPLEMENTATION') return runTaskJob(deps, claim, taskCtx)
+  return runIdeaChatJob(deps, claim)
+}
+
+async function runIdeaChatJob(deps: WorkerDeps, claim: Claim): Promise<JobOutcome> {
   const { control, config } = deps
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const { jobId } = claim
@@ -103,7 +114,7 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim): Promise<JobOutc
     return update.status === 'done' ? 'done' : 'failed'
   }
 
-  // Second lock behind the claim filter: this worker runs IDEA_CHAT only.
+  // Second lock behind the claim filter: this worker runs IDEA_CHAT and TASK_IMPLEMENTATION only.
   if (claim.kind !== 'IDEA_CHAT') {
     await close({ status: 'failed', error: `kind ${claim.kind} niet ondersteund door agent-harness` })
     throw new ClaimFilterError(`kind ${claim.kind}`)
@@ -128,25 +139,10 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim): Promise<JobOutc
   deps.signal.addEventListener('abort', onStop, { once: true })
   if (deps.signal.aborted) inner.abort() // Ctrl-C during the running update: no model call
   let lost = false
-  let beatFailures = 0
-  const beat = setInterval(() => {
-    // A refusal (false) means the job is no longer ours. A thrown call proves nothing by itself;
-    // two in a row are treated as lost, so one transient hiccup does not abandon a healthy turn.
-    void control.heartbeat(jobId).then(
-      (ok) => {
-        beatFailures = 0
-        if (!ok) markLost()
-      },
-      () => {
-        if (++beatFailures >= 2) markLost()
-      },
-    )
-  }, deps.heartbeatMs ?? 60_000)
-  const markLost = () => {
-    if (lost) return
+  const stopBeat = startHeartbeat(control, jobId, deps.heartbeatMs ?? 60_000, () => {
     lost = true
     inner.abort()
-  }
+  })
 
   let update: StatusUpdate
   try {
@@ -171,7 +167,7 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim): Promise<JobOutc
   } catch (err) {
     update = { status: 'failed', error: cut(`harness: ${err instanceof Error ? err.message : String(err)}`, ERROR_LIMIT) }
   } finally {
-    clearInterval(beat)
+    stopBeat()
     deps.signal.removeEventListener('abort', onStop)
   }
 
@@ -189,6 +185,19 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim): Promise<JobOutc
 export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId: string; outcome: JobOutcome }>; exitCode: 0 | 1 }> {
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const jobs: Array<{ jobId: string; outcome: JobOutcome }> = []
+  // Leftover harness containers from a crash: clean them up before the first task. Idea-chat never waits on
+  // this; a task job re-checks first and is refused (without touching the task) while it stays uncertain.
+  let taskReady = true
+  if (deps.config.task) {
+    taskReady = (await killLeftoverContainers(deps.taskDeps)) === 'clean'
+    if (!taskReady) log('achtergebleven harness-containers niet aantoonbaar opgeruimd; taakjobs worden geweigerd tot een hercontrole slaagt')
+  }
+  const taskCtx: TaskJobContext = {
+    containersClean: async () => {
+      if (!taskReady) taskReady = (await killLeftoverContainers(deps.taskDeps)) === 'clean'
+      return taskReady
+    },
+  }
   for (;;) {
     if (deps.signal.aborted) return { jobs, exitCode: 0 }
     const claim = await deps.control.waitForJob(deps.config.waitSeconds, deps.signal)
@@ -210,8 +219,13 @@ export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId
       case 'job': {
         let outcome: JobOutcome
         try {
-          outcome = await runOneJob(deps, claim)
+          outcome = await runOneJob(deps, claim, taskCtx)
         } catch (err) {
+          if (err instanceof ContainerUncertainError) {
+            jobs.push({ jobId: claim.jobId, outcome: err.outcome })
+            log(`job ${claim.jobId}: ${err.message}. Worker stopt.`)
+            return { jobs, exitCode: 1 }
+          }
           if (!(err instanceof ClaimFilterError)) throw err
           jobs.push({ jobId: claim.jobId, outcome: 'failed' })
           log(`job ${claim.jobId}: ${err.message} — dit hoort het claimfilter (local_llm-isolatie in scrum4me-mcp) te voorkomen. Worker stopt.`)

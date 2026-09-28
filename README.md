@@ -50,3 +50,11 @@ De worker start één scrum4me-MCP-kindproces met de vaste identiteit `SCRUM4ME_
 Elke claim krijgt een eigen run-dir `runs/job-<jobId>-<epoch-ms>/`. `--once` stopt na één claim of één lege wachtronde. Ctrl-C rondt een lopende job af als `failed` ("worker gestopt"); een tweede Ctrl-C breekt direct af. Dezelfde probe-gate als `harness run` geldt.
 
 Ontwerp en plan: [docs/specs/2026-09-26-idea-chat-local-llm-design.md](docs/specs/2026-09-26-idea-chat-local-llm-design.md), [docs/plans/M2-idea-chat-local-llm.md](docs/plans/M2-idea-chat-local-llm.md). Recept en praktijkbewijs: [docs/runbooks/idea-chat-worker.md](docs/runbooks/idea-chat-worker.md).
+
+## Worker-modus (TASK_IMPLEMENTATION via een lokaal model)
+
+Dezelfde worker claimt met een `task`-blok in de config ook `TASK_IMPLEMENTATION`-jobs met `required_capability: 'local_llm'` (`kind = 'TASK_IMPLEMENTATION' AND source = 'COPILOT' AND sprint_run_id IS NULL`). Per taak draait de harness `prepare`- en `verify`-commando's (uit een per-repo recept) in wegwerp-Dockercontainers, laat het model werken met zes worktools (`list_files`, `read_file`, `write_file`, `edit_file`, `search`, `run_tests`) begrensd tot de worktree, en commit zelf — deterministisch, nooit het model — pas na een groene verify en een schone scan van de git-administratie. Push gebeurt door de scrum4me-MCP zelf, met een `GIT_ASKPASS`-script ([`deploy/max2/forgejo-askpass.sh`](deploy/max2/forgejo-askpass.sh)) dat het Forgejo-token alleen aan `git.jp-visser.nl` geeft.
+
+Tot deze harness met een `task`-blok op max2 draait, wordt geen taak met `local_llm` gedispatcht (zie het runbook).
+
+Ontwerp en plan: [docs/specs/2026-09-27-task-implementation-local-llm-design.md](docs/specs/2026-09-27-task-implementation-local-llm-design.md), [docs/plans/M3-task-implementation-local-llm.md](docs/plans/M3-task-implementation-local-llm.md). Recept, faalredenen en opruimen: [docs/runbooks/task-worker.md](docs/runbooks/task-worker.md).

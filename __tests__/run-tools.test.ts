@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Manifest } from '../src/manifest.js'
 import { createModelClient } from '../src/model-client.js'
-import { runManifest } from '../src/run.js'
+import { runManifest, type AfterAnswerResult } from '../src/run.js'
 import { connectRegistry } from '../src/tools/registry.js'
 import { openTrace } from '../src/trace.js'
 import type { ToolRegistry } from '../src/types.js'
@@ -27,7 +27,12 @@ const answer = (text: string): FakeTurn => ({ body: completion({ content: text }
 
 async function run(
   script: FakeTurn[],
-  opts: { allow?: string[]; limits?: Partial<typeof limits>; connect?: (signal: AbortSignal) => Promise<ToolRegistry> } = {},
+  opts: {
+    allow?: string[]
+    limits?: Partial<typeof limits>
+    connect?: (signal: AbortSignal) => Promise<ToolRegistry>
+    afterAnswer?: (answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>
+  } = {},
 ) {
   fake = await startFakeModelServer(script)
   const mcp = await startFakeMcp()
@@ -41,7 +46,12 @@ async function run(
   }
   const trace = openTrace(tmp('tools'), m.id)
   const connect = vi.fn(opts.connect ?? (async () => connectRegistry(mcp.client, allow)))
-  const result = await runManifest(m, { client: createModelClient({ baseUrl: fake.baseUrl, name: 'm' }), trace, connectRegistry: connect })
+  const result = await runManifest(m, {
+    client: createModelClient({ baseUrl: fake.baseUrl, name: 'm' }),
+    trace,
+    connectRegistry: connect,
+    ...(opts.afterAnswer ? { afterAnswer: opts.afterAnswer } : {}),
+  })
   return { result, trace, requests: fake.requests, mcpCalls: mcp.calls, connect, events: readTrace(trace.dir) }
 }
 
@@ -239,5 +249,92 @@ describe('context budget (limits.contextTokens)', () => {
     expect(r.result.status).toBe('budget_exceeded')
     expect(r.result.error?.code).toBe('CONTEXT_EXHAUSTED')
     expect(r.requests).toHaveLength(1)
+  })
+})
+
+describe('afterAnswer hook', () => {
+  it('without the hook, behaviour is unchanged', async () => {
+    const r = await run([answer('Klaar.')])
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'Klaar.' })
+    expect(r.events.some((e) => e.type === 'after_answer')).toBe(false)
+  })
+
+  it('accept ends the run as completed with the model answer', async () => {
+    const afterAnswer = vi.fn(async (): Promise<AfterAnswerResult> => ({ kind: 'accept' }))
+    const r = await run([answer('Klaar.')], { afterAnswer })
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'Klaar.' })
+    expect(afterAnswer).toHaveBeenCalledTimes(1)
+    expect(afterAnswer.mock.calls[0][0]).toBe('Klaar.')
+    expect(r.requests).toHaveLength(1)
+    expect(r.events.find((e) => e.type === 'after_answer')).toMatchObject({ turn: 1, outcome: 'accept' })
+  })
+
+  it('retry keeps the rejected answer in history, then a user message, and lets a second answer accept', async () => {
+    const afterAnswer = vi.fn<(answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>>()
+      .mockResolvedValueOnce({ kind: 'retry', message: 'Nog niet klaar, probeer opnieuw.' })
+      .mockResolvedValueOnce({ kind: 'accept' })
+    const r = await run([answer('Eerste antwoord.'), answer('Tweede antwoord.')], { afterAnswer })
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'Tweede antwoord.' })
+    expect(afterAnswer).toHaveBeenCalledTimes(2)
+    expect(afterAnswer.mock.calls[1][0]).toBe('Tweede antwoord.')
+    expect(r.requests).toHaveLength(2)
+    const secondRequestMessages = r.requests[1].body.messages as Array<{ role: string; content: string; tool_calls?: unknown }>
+    // The model must see its own rejected answer before the retry instruction — never two user turns in a row.
+    expect(secondRequestMessages.slice(-2)).toEqual([
+      { role: 'assistant', content: 'Eerste antwoord.' },
+      { role: 'user', content: 'Nog niet klaar, probeer opnieuw.' },
+    ])
+    expect(r.events.filter((e) => e.type === 'after_answer').map((e) => e.outcome)).toEqual(['retry', 'accept'])
+  })
+
+  it('counts the retry-added assistant and user messages in the next prompt estimate', async () => {
+    const charsOf = (v: unknown) => JSON.stringify(v).length
+    const afterAnswer = vi.fn<(answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>>()
+      .mockResolvedValueOnce({ kind: 'retry', message: 'Nog niet klaar, probeer opnieuw.' })
+      .mockResolvedValueOnce({ kind: 'accept' })
+    const r = await run([answer('Eerste antwoord.'), answer('Tweede antwoord.')], { afterAnswer, limits: { contextTokens: 50_000 } })
+    expect(r.result.status).toBe('completed')
+    const firstRequestMessages = r.requests[0].body.messages
+    const secondRequestMessages = r.requests[1].body.messages
+    // Exactly the rejected-answer + retry-instruction pair was added on top of the first request's history.
+    expect(secondRequestMessages).toHaveLength(firstRequestMessages.length + 2)
+    const addedChars = charsOf(secondRequestMessages) - charsOf(firstRequestMessages)
+    const modelRequests = r.events.filter((e) => e.type === 'model_request')
+    // calibration.tokens comes from the fake server's default prompt_tokens (10); ADDED_CHARS_PER_TOKEN = 1.7 is the
+    // documented constant in src/run.ts. This pins that fitContext's estimate() actually walks the added history
+    // (both pushed messages), not just the retry user message.
+    expect(modelRequests[1]).toMatchObject({ turn: 2, promptEstimate: 10 + Math.ceil(addedChars / 1.7) })
+  })
+
+  it('fail ends the run as failed with VERIFY_FAILED', async () => {
+    const afterAnswer = vi.fn(async (): Promise<AfterAnswerResult> => ({ kind: 'fail', code: 'VERIFY_FAILED', message: 'model produceerde geen wijzigingen' }))
+    const r = await run([answer('Klaar.')], { afterAnswer })
+    expect(r.result).toMatchObject({ status: 'failed', error: { code: 'VERIFY_FAILED', message: 'model produceerde geen wijzigingen' } })
+    expect(r.requests).toHaveLength(1)
+    expect(r.events.find((e) => e.type === 'after_answer')).toMatchObject({ outcome: 'fail' })
+  })
+
+  it('an abort during the hook ends the run without a further model call', async () => {
+    const started = Date.now()
+    const r = await run([answer('Klaar.')], {
+      limits: { maxWallSeconds: 1 },
+      afterAnswer: () => new Promise<AfterAnswerResult>(() => undefined), // hangs forever
+    })
+    expect(r.result.status).toBe('timed_out')
+    expect(r.requests).toHaveLength(1)
+    expect(Date.now() - started).toBeLessThan(2500)
+  })
+
+  it('a throwing hook ends the run as failed/HARNESS_ERROR, closes the registry, and writes run_end', async () => {
+    const close = vi.fn(async () => undefined)
+    const registryStub = {
+      snapshot: { entries: [], hash: 'h' }, toOpenAiTools: () => [], execute: vi.fn(), close,
+    } as unknown as ToolRegistry
+    const afterAnswer = vi.fn(async (): Promise<AfterAnswerResult> => { throw new Error('gate crashed') })
+    const r = await run([answer('Klaar.')], { afterAnswer, connect: async () => registryStub })
+    expect(r.result).toMatchObject({ status: 'failed', error: { code: 'HARNESS_ERROR', message: 'gate crashed' } })
+    expect(r.requests).toHaveLength(1)
+    expect(close).toHaveBeenCalledTimes(1)
+    expect(r.events.at(-1)).toMatchObject({ type: 'run_end', status: 'failed', error: { code: 'HARNESS_ERROR', message: 'gate crashed' } })
   })
 })

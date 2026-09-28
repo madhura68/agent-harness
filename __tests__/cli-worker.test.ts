@@ -10,6 +10,9 @@ import { dirContains, tmp } from './helpers.js'
 const stdioCalls: ServerSpec[] = []
 let claims: ClaimStep[] = []
 let fakeMcp: Awaited<ReturnType<typeof startFakeScrum4meMcp>> | undefined
+// Set fresh on every connectStdioClient call: lets a test assert the harness itself closed the MCP
+// child (Fix 2 / cmdWorker's `finally`), independent of this test file's own afterEach cleanup below.
+let lastCloseSpy: ReturnType<typeof vi.fn> | undefined
 
 vi.mock('../src/tools/registry.js', async (importActual) => {
   const actual = await importActual<typeof import('../src/tools/registry.js')>()
@@ -18,7 +21,9 @@ vi.mock('../src/tools/registry.js', async (importActual) => {
     connectStdioClient: vi.fn(async (server: ServerSpec) => {
       stdioCalls.push(server)
       fakeMcp = await startFakeScrum4meMcp({ claims })
-      return { client: fakeMcp.client, close: fakeMcp.close }
+      const closeSpy = vi.fn(fakeMcp.close)
+      lastCloseSpy = closeSpy
+      return { client: fakeMcp.client, close: closeSpy }
     }),
   }
 })
@@ -121,6 +126,19 @@ describe('harness worker', () => {
     expect(readdirSync(out).some((n) => n.startsWith('job-job1-'))).toBe(true)
     expect(dirContains(out, 'sk-test-secret')).toBe(false)
     expect(stderr.join('')).not.toContain('sk-test-secret')
+  })
+
+  it('closes the MCP connection itself before returning, so systemd stop does not have to (Fix 2)', async () => {
+    const dir = tmp('cli-worker')
+    const out = join(dir, 'runs')
+    writeProbe(out, 'http://127.0.0.1:1/v1')
+    process.env.SCRUM4ME_TOKEN = 'x'
+    claims = [{ timeout: true }]
+    const code = await main(['worker', '--config', workerConfig(dir, 'http://127.0.0.1:1/v1'), '--out', out, '--once'])
+    expect(code).toBe(0)
+    // Asserted immediately after main() returns, before this file's afterEach ever touches fakeMcp —
+    // proves cmdWorker's own `finally` (src/cli.ts) called conn.close(), not test cleanup.
+    expect(lastCloseSpy).toHaveBeenCalledTimes(1)
   })
 
   it('passes model.reasoningEffort to the model request', async () => {
