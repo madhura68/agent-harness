@@ -182,6 +182,12 @@ describe('normalizeRepoUrl', () => {
     expect(normalizeRepoUrl('https://git.jp-visser.nl/janpeter/Scrum4Me/')).toBe('https://git.jp-visser.nl/janpeter/Scrum4Me')
     expect(normalizeRepoUrl('  https://git.jp-visser.nl/janpeter/Scrum4Me.git  ')).toBe('https://git.jp-visser.nl/janpeter/Scrum4Me')
   })
+
+  it('lowercases the host of an scp-like remote, leaving user and path untouched', () => {
+    expect(normalizeRepoUrl('git@Git.JP-Visser.NL:janpeter/Scrum4Me.git')).toBe('git@git.jp-visser.nl:janpeter/Scrum4Me')
+    expect(normalizeRepoUrl('Git.JP-Visser.NL:janpeter/Scrum4Me/')).toBe('git.jp-visser.nl:janpeter/Scrum4Me')
+    expect(normalizeRepoUrl('git@git.jp-visser.nl:JanPeter/Repo')).toBe('git@git.jp-visser.nl:JanPeter/Repo')
+  })
 })
 
 describe('findRecipe', () => {
