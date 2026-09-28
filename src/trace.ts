@@ -7,7 +7,7 @@ export type TraceEvent =
   | { type: 'tool_snapshot'; names: string[]; hash: string }
   | { type: 'model_request'; turn: number; messages: number; tools: number; maxTokens: number; promptEstimate?: number }
   | { type: 'context_compacted'; turn: number; messages: number; bytes: number; estimateBefore: number; estimateAfter: number }
-  | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage }
+  | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage; reasoning?: string; durationMs: number; systemFingerprint?: string }
   | { type: 'tool_call'; callId: string; name: string; arguments: string; argumentsWasObject: boolean }
   | { type: 'tool_result'; callId: string; ok: boolean; errorCode?: ErrorCode; truncated: boolean; sha256: string; bytes: number }
   | { type: 'after_answer'; turn: number; outcome: 'accept' | 'retry' | 'fail' }
@@ -29,6 +29,7 @@ export type RunResult = {
     turns: number
     toolCalls: number
     toolErrors: number
+    cachedTokens?: number
   }
   durationMs: number
   toolSnapshotHash?: string

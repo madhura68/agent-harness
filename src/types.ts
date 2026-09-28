@@ -21,6 +21,7 @@ export type Usage = {
   source: 'provider_reported' | 'missing'
   inputTokens: number
   outputTokens: number
+  cachedTokens?: number
 }
 
 export type CompleteResult = {
@@ -28,6 +29,9 @@ export type CompleteResult = {
   finishReason: 'stop' | 'length' | 'tool_calls' | 'other'
   usage: Usage
   model: string | undefined // what the server reports
+  reasoning?: string // message.reasoning, otherwise message.reasoning_content; only ever a non-empty string
+  durationMs: number // measured from just before fetch to just after the response body is read
+  systemFingerprint?: string // system_fingerprint
 }
 
 export type RunStatus = 'completed' | 'failed' | 'budget_exceeded' | 'timed_out'

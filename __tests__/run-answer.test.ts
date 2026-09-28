@@ -5,7 +5,7 @@ import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Manifest } from '../src/manifest.js'
 import { createModelClient } from '../src/model-client.js'
-import { runManifest } from '../src/run.js'
+import { runManifest, type AfterAnswerResult } from '../src/run.js'
 import { openTrace } from '../src/trace.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { dirContains, readTrace, tmp } from './helpers.js'
@@ -108,6 +108,38 @@ describe('runManifest — answer profile', () => {
     const { trace, requests } = await run([{ body: completion({ content: 'x' }) }], (b) => ({ model: { baseUrl: b, name: 'm', apiKey: 'sk-test-secret' } }))
     expect(requests[0].headers.authorization).toBe('Bearer sk-test-secret')
     expect(dirContains(trace.dir, 'sk-test-secret')).toBe(false)
+  })
+
+  it('leaves usage.cachedTokens absent when no response reported it', async () => {
+    const { result } = await run([{ body: completion({ content: 'x', usage: { prompt_tokens: 5, completion_tokens: 2 } }) }])
+    expect(result.usage.cachedTokens).toBeUndefined()
+  })
+
+  it('carries reasoning, durationMs and systemFingerprint on model_response, and sums cachedTokens across turns', async () => {
+    fake = await startFakeModelServer([
+      { body: readFileSync(join('__tests__', 'fixtures', 'ollama-v1-reasoning.json'), 'utf8') },
+      { body: readFileSync(join('__tests__', 'fixtures', 'ollama-v1-cached.json'), 'utf8') },
+    ])
+    const m = manifest(fake.baseUrl)
+    const trace = openTrace(tmp('run'), m.id)
+    const afterAnswer = vi.fn<(answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>>()
+      .mockResolvedValueOnce({ kind: 'retry', message: 'Nog een keer.' })
+      .mockResolvedValueOnce({ kind: 'accept' })
+    const result = await runManifest(m, {
+      client: createModelClient({ baseUrl: m.model.baseUrl, name: m.model.name }),
+      trace,
+      connectRegistry: async () => { throw new Error('unused') },
+      afterAnswer,
+    })
+    expect(result.status).toBe('completed')
+    expect(result.usage.cachedTokens).toBe(22) // 0 (first turn) + 22 (second turn)
+    const responses = readTrace(trace.dir).filter((e) => e.type === 'model_response')
+    expect(responses).toHaveLength(2)
+    for (const r of responses) {
+      expect(r.systemFingerprint).toBe('fp_ollama')
+      expect(typeof r.reasoning).toBe('string')
+      expect(typeof r.durationMs).toBe('number')
+    }
   })
 })
 

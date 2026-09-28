@@ -128,6 +128,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   let toolErrors = 0
   let inputTokens = 0
   let outputTokens = 0
+  let cachedTokens: number | undefined
   let usageComplete = true
   let responses = 0
   let reportedModel: string | undefined
@@ -255,9 +256,12 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       } else {
         usageComplete = false
       }
+      if (typeof res.usage.cachedTokens === 'number') cachedTokens = (cachedTokens ?? 0) + res.usage.cachedTokens
       trace.event({
         type: 'model_response', turn: turns, content: res.message.content, toolCalls: res.message.toolCalls,
-        finishReason: res.finishReason, usage: res.usage,
+        finishReason: res.finishReason, usage: res.usage, durationMs: res.durationMs,
+        ...(res.reasoning !== undefined ? { reasoning: res.reasoning } : {}),
+        ...(res.systemFingerprint !== undefined ? { systemFingerprint: res.systemFingerprint } : {}),
       })
 
       if (outputTokens > limits.maxOutputTokens) return { status: 'budget_exceeded' }
@@ -358,6 +362,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
     usage: {
       source: responses > 0 && usageComplete ? 'provider_reported' : 'missing',
       inputTokens, outputTokens, turns, toolCalls, toolErrors,
+      ...(cachedTokens !== undefined ? { cachedTokens } : {}),
     },
     durationMs: now() - started,
     ...(snapshotHash ? { toolSnapshotHash: snapshotHash } : {}),

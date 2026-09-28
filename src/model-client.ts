@@ -9,7 +9,14 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number]
  * after the whole generation, and undici's 300 s default cut off long thinking turns. The run deadline (the signal)
  * bounds every request anyway.
  */
-export type ModelClientOptions = { baseUrl: string; name: string; apiKey?: string; reasoningEffort?: ReasoningEffort; headersTimeoutMs?: number }
+export type ModelClientOptions = {
+  baseUrl: string
+  name: string
+  apiKey?: string
+  reasoningEffort?: ReasoningEffort
+  headersTimeoutMs?: number
+  now?: () => number // test seam for durationMs; defaults to Date.now
+}
 export type CompleteOptions = { signal: AbortSignal; maxTokens: number; tools?: ToolDef[] }
 export type ModelClient = { complete(messages: ChatMessage[], options: CompleteOptions): Promise<CompleteResult> }
 
@@ -34,11 +41,26 @@ function excerpt(text: string): string {
 }
 
 function parseUsage(raw: unknown): Usage {
-  const u = raw as { prompt_tokens?: unknown; completion_tokens?: unknown } | undefined
+  const u = raw as { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } } | undefined
   if (u && typeof u.prompt_tokens === 'number' && typeof u.completion_tokens === 'number') {
-    return { source: 'provider_reported', inputTokens: u.prompt_tokens, outputTokens: u.completion_tokens }
+    const cached = u.prompt_tokens_details?.cached_tokens
+    return {
+      source: 'provider_reported',
+      inputTokens: u.prompt_tokens,
+      outputTokens: u.completion_tokens,
+      cachedTokens: typeof cached === 'number' ? cached : undefined,
+    }
   }
   return { source: 'missing', inputTokens: 0, outputTokens: 0 }
+}
+
+function nonEmptyString(v: unknown): string | undefined {
+  return typeof v === 'string' && v.length > 0 ? v : undefined
+}
+
+// message.reasoning, falling back to message.reasoning_content (some OpenAI-compatible servers use the latter name).
+function parseReasoning(message: { reasoning?: unknown; reasoning_content?: unknown }): string | undefined {
+  return nonEmptyString(message.reasoning) ?? nonEmptyString(message.reasoning_content)
 }
 
 function parseToolCalls(raw: unknown): ToolCall[] {
@@ -70,6 +92,7 @@ function toWire(messages: ChatMessage[]): unknown[] {
 export function createModelClient(opts: ModelClientOptions): ModelClient {
   const url = `${opts.baseUrl.replace(/\/+$/, '')}/chat/completions`
   const dispatcher = new Agent(transportTimeouts(opts))
+  const now = opts.now ?? Date.now
   return {
     async complete(messages, options) {
       const headers: Record<string, string> = { 'content-type': 'application/json' }
@@ -83,6 +106,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       if (options.tools && options.tools.length > 0) body.tools = options.tools
       if (opts.reasoningEffort) body.reasoning_effort = opts.reasoningEffort
 
+      const requestStart = now()
       let text: string
       let status: number
       try {
@@ -93,10 +117,11 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         const reason = options.signal.aborted ? 'aborted (deadline)' : err instanceof Error ? err.message : String(err)
         throw new ModelError(`model request failed: ${reason}`, { cause: err })
       }
+      const durationMs = now() - requestStart
       if (status < 200 || status >= 300) {
         throw new ModelError(`model HTTP ${status}: ${excerpt(text)}`)
       }
-      let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown }
+      let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown }
       try {
         json = JSON.parse(text)
       } catch (err) {
@@ -112,7 +137,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       if (!choice || typeof choice !== 'object') {
         throw new ModelError(`model HTTP ${status}: no choices: ${excerpt(text)}`)
       }
-      const message = (choice as { message?: { content?: unknown; tool_calls?: unknown } }).message ?? {}
+      const message = (choice as { message?: { content?: unknown; tool_calls?: unknown; reasoning?: unknown; reasoning_content?: unknown } }).message ?? {}
       const finish = (choice as { finish_reason?: unknown }).finish_reason
       return {
         message: {
@@ -122,6 +147,9 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         finishReason: typeof finish === 'string' && FINISH_REASONS.has(finish) ? (finish as CompleteResult['finishReason']) : 'other',
         usage: parseUsage(json.usage),
         model: typeof json.model === 'string' ? json.model : undefined,
+        reasoning: parseReasoning(message),
+        durationMs,
+        systemFingerprint: nonEmptyString(json.system_fingerprint),
       }
     },
   }
