@@ -272,6 +272,23 @@ const lastJobUpdate = (m: McpFake) => jobUpdates(m).at(-1)
 const taskUpdates = (m: McpFake) => m.calls.filter((c) => c.name === 'update_task_status').map((c) => c.args.status)
 const traceOf = (out: string) => readTrace(join(out, readdirSync(out)[0]))
 
+// ---- run-log helpers (M4 Taak 6), mirroring worker.test.ts's ----
+
+const runLogRunsDir = (dir: string): string => join(dir, 'harness', 'test', 'runs')
+
+function runLogLines(dir: string): string[] {
+  const runsDir = runLogRunsDir(dir)
+  const files = readdirSync(runsDir).filter((f) => f.endsWith('.log'))
+  expect(files).toHaveLength(1)
+  return readFileSync(join(runsDir, files[0]), 'utf8').trim().split('\n')
+}
+
+function runLogJsonLines(dir: string): Array<Record<string, unknown> & { type: string }> {
+  return runLogLines(dir)
+    .filter((l) => l.startsWith('{'))
+    .map((l) => JSON.parse(l))
+}
+
 // ---------------------------------------------------------------------------------------------------
 
 describe('pure helpers', () => {
@@ -738,5 +755,228 @@ describe('runWorker — leftover containers', () => {
     const r = await t.run()
     expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'done' }], exitCode: 0 })
     expect(t.docker.calls.filter((a) => a[0] === 'ps' && a[3] === 'name=^harness-')).toHaveLength(3) // startup 1 + re-check 2
+  })
+})
+
+describe('runTaskJob — run-log (M4 Taak 6, spec §5.6)', () => {
+  it('green path: worktree path=, harness.run_start cwd=worktree, container blocks for prepare and gate, all steps, and a closing block with done', async () => {
+    const t = await setup({ script: [write('src/greet.ts', 'export const greet = (n: string) => `hallo ${n}`\n'), answer('klaar')] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('done')
+    const sha = await t.branchSha()
+    const lines = runLogLines(t.runLogDir)
+    expect(lines.some((l) => l.endsWith(`[harness] worktree path=${t.worktree}`))).toBe(true)
+    expect(lines.some((l) => l.endsWith('[harness] step task_status in_progress'))).toBe(true)
+    expect(lines.some((l) => l.endsWith(`[harness] step commit sha=${sha}`))).toBe(true)
+    expect(lines.some((l) => l.endsWith('[harness] step plan_check aligned'))).toBe(true)
+    expect(lines.some((l) => l.endsWith('[harness] step job_status done pushed_at=ja'))).toBe(true)
+    expect(lines.some((l) => l.endsWith('[harness] step task_status review ok'))).toBe(true)
+    const jsonLines = runLogJsonLines(t.runLogDir)
+    expect(jsonLines.find((j) => j.type === 'harness.run_start')).toMatchObject({ cwd: t.worktree })
+    const containers = jsonLines.filter((j) => j.type === 'harness.container')
+    expect(containers.map((c) => [c.kind, c.source])).toEqual([['prepare', 'prepare'], ['verify', 'gate']])
+    const runEnd = jsonLines.find((j) => j.type === 'harness.run_end')
+    expect(runEnd).toMatchObject({ outcome: 'done' })
+    expect(lines.at(-1)).toBe(`${String(runEnd?.timestamp)} [harness] exit code=0`)
+  })
+
+  it('no recipe ⇒ ERROR NO_RECIPE', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, repoUrl: 'https://git.example/ander.git' }) }] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR NO_RECIPE: geen recept voor https:\/\/git\.example\/ander\.git$/))
+  })
+
+  it('prepare fails ⇒ ERROR PREPARE_FAILED', async () => {
+    const t = await setup({ script: [answer('nee')], docker: { prepare: { code: 1, out: 'npm ERR! kapot' } } })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PREPARE_FAILED: prepare faalde/))
+  })
+
+  it('3× red ⇒ ERROR VERIFY_FAILED survives closeFailed, exactly one closing block', async () => {
+    const t = await setup({
+      script: [write('a.txt', 'a\n'), answer('klaar 1'), answer('klaar 2'), answer('klaar 3')],
+      docker: { verify: [RED('rood-1'), RED('rood-2'), RED('rood-3')] },
+    })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    const lines = runLogLines(t.runLogDir)
+    expect(lines.filter((l) => l.includes('"type":"harness.run_end"'))).toHaveLength(1)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR VERIFY_FAILED: /))
+  })
+
+  it('commitAll throwing ⇒ ERROR COMMIT_FAILED, outcome failed', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')] })
+    vi.mocked(commitAll).mockRejectedValueOnce(new Error('commit kapot'))
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(String(lastJobUpdate(t.mcp)?.error)).toMatch(/^commit mislukt: commit kapot/)
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR COMMIT_FAILED: commit mislukt: commit kapot/))
+  })
+
+  it('plan check divergent ⇒ ERROR PLAN_CHECK_FAILED, outcome failed', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], verifyResult: 'divergent' })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PLAN_CHECK_FAILED: verify_task_against_plan: divergent/))
+  })
+
+  it('done refused ⇒ ERROR DONE_REFUSED, outcome failed', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], failUpdate: ['done'] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR DONE_REFUSED: done geweigerd: /))
+  })
+
+  it('done outcome unknown (a thrown call) ⇒ ERROR DONE_UNKNOWN, outcome abandoned', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')] })
+    const orig = t.mcp.client.callTool.bind(t.mcp.client)
+    vi.spyOn(t.mcp.client, 'callTool').mockImplementation(async (params: { name: string; arguments?: Record<string, unknown> }, schema?: unknown, opts?: unknown) => {
+      if (params.name === 'update_job_status' && params.arguments?.status === 'done') {
+        throw new McpError(ErrorCode.RequestTimeout, 'Request timed out')
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (orig as any)(params, schema, opts)
+    })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR DONE_UNKNOWN: uitkomst van done onbekend: /))
+  })
+
+  it('a lost heartbeat after an earlier fail() still closes with ABANDONED (override wins)', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], heartbeatMs: 20 })
+    let refuse = false
+    const control = t.deps.control
+    t.deps.control = {
+      ...control,
+      heartbeat: async (id) => (refuse ? false : control.heartbeat(id)),
+      log: async (kind, args) => {
+        const r = await control.log(kind, args)
+        if (kind === 'commit') {
+          refuse = true
+          await new Promise((res) => setTimeout(res, 80)) // at least one refused beat lands
+        }
+        return r
+      },
+    }
+    // A synthetic "earlier fail" (not otherwise reachable in one run: every fail-recording branch returns
+    // or throws at once) proves abandon() really passes override: true, not just that it fires first.
+    const origRunLogFor = t.deps.runLogFor
+    t.deps.runLogFor = (claim) => {
+      const rl = origRunLogFor?.(claim) ?? null
+      rl?.fail('EERDERE_TEST_CODE', 'eerdere fail, moet worden overschreven')
+      return rl
+    }
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    const lines = runLogLines(t.runLogDir)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR ABANDONED: eigendom kwijt \(heartbeat geweigerd\)$/))
+    expect(lines.join('\n')).not.toContain('EERDERE_TEST_CODE')
+  })
+
+  it('a container not provably stopped ⇒ ERROR CONTAINER_UNCERTAIN, exactly one closing block, and ContainerUncertainError still reaches the worker loop', async () => {
+    const t = await setup({ script: [answer('nee')], docker: { prepare: { hang: true }, killCode: 1 } })
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
+    const lines = runLogLines(t.runLogDir)
+    expect(lines.filter((l) => l.includes('"type":"harness.run_end"'))).toHaveLength(1)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CONTAINER_UNCERTAIN: /))
+  })
+
+  it('a stop during the gate verify ⇒ ERROR STOPPED (Review Focus 3)', async () => {
+    const stop = new AbortController()
+    const t = await setup({
+      script: [write('a.txt', 'a\n'), answer('klaar')],
+      docker: { verify: [{ hang: true }], onRun: (kind) => { if (kind === 'verify') setTimeout(() => stop.abort(), 20) } },
+      timeouts: { verify: 10 },
+      signal: stop.signal,
+    })
+    const r = await t.run()
+    expect(r.exitCode).toBe(0)
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR STOPPED: worker gestopt/))
+  })
+
+  // ---- Bonus coverage: the rest of the brief's code table, each reusing an existing production scenario ----
+
+  it('no task-config ⇒ ERROR NO_TASK_CONFIG', async () => {
+    const t = await setup({ noTask: true, script: [answer('nee')] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR NO_TASK_CONFIG: worker heeft geen task-config$/))
+  })
+
+  it('an unreadable worktree ⇒ ERROR GIT_SCAN_FAILED (the pre-loop snapshot)', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: join(wt, 'bestaat-niet') }) }] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR GIT_SCAN_FAILED: git-administratie niet te scannen: /))
+  })
+
+  it('leftover containers not provably clean ⇒ ERROR CONTAINERS_LEFTOVER', async () => {
+    const t = await setup({ script: [answer('nee')], docker: { leftovers: [{ out: 'abc123\n' }, { out: 'abc123\n' }], rmCode: 1 } })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CONTAINERS_LEFTOVER: achtergebleven harness-container niet aantoonbaar opgeruimd/))
+  })
+
+  it('running refused ⇒ ERROR ABANDONED', async () => {
+    const t = await setup({ script: [answer('nee')], failUpdate: ['running'] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR ABANDONED: niet \(meer\) van deze worker/))
+  })
+
+  it('update_task_status(in_progress) refused ⇒ ERROR JOB_FAILED', async () => {
+    const t = await setup({ script: [answer('nee')] })
+    const control = t.deps.control
+    t.deps.control = { ...control, updateTaskStatus: async (id, status) => (status === 'in_progress' ? { ok: false, message: 'geweigerd' } : control.updateTaskStatus(id, status)) }
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR JOB_FAILED: update_task_status in_progress mislukt: geweigerd/))
+  })
+
+  it('the model changes nothing ⇒ ERROR NO_CHANGES', async () => {
+    const t = await setup({ script: [answer('alles was al goed')] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR NO_CHANGES: model produceerde geen wijzigingen/))
+  })
+
+  it('a gitlink bent by the container ⇒ ERROR GIT_ADMIN_CHANGED', async () => {
+    let wt = ''
+    const t = await setup({
+      script: [write('a.txt', 'a\n'), answer('klaar')],
+      docker: { verify: [{ code: 0, effect: () => writeFileSync(join(wt, '.git'), 'gitdir: /tmp/evil\n') }] },
+    })
+    wt = t.worktree
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR GIT_ADMIN_CHANGED: git-administratie gewijzigd: changed: \.git$/))
+  })
+
+  it('done comes back as failed after a push error ⇒ ERROR DONE_ENDED_FAILED', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], doneOutcome: { status: 'failed', error: 'push failed', pushed_at: null } })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR DONE_ENDED_FAILED: update_job_status\(done\) eindigde als failed \(push failed\)$/))
+  })
+
+  it('an invalid payload ⇒ ERROR PAYLOAD_INVALID', async () => {
+    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION' } }] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PAYLOAD_INVALID: payload ongeldig: /))
+  })
+
+  it('openTrace throwing ⇒ ERROR HARNESS_ERROR', async () => {
+    const t = await setup({ script: [answer('nee')] })
+    const blockerDir = tmp('out-blocker')
+    const blockerFile = join(blockerDir, 'blocker') // a plain file where openTrace expects a directory: mkdirSync fails
+    writeFileSync(blockerFile, 'x')
+    t.deps.out = blockerFile
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR HARNESS_ERROR: harness: /))
   })
 })

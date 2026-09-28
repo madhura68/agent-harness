@@ -142,6 +142,15 @@ function failureText(result: RunResult, limits: TaskConfig['limits']): string {
   return `${result.status}: onbekende fout`
 }
 
+/** RunLog.fail() code for a run that did not complete (spec §5.6): the model loop's own error code when
+ * it has one, else the budget/timeout status; the call site uses STOPPED instead when the service stopped. */
+function failureCode(result: RunResult): string {
+  if (result.error) return result.error.code
+  if (result.status === 'timed_out') return 'TIMED_OUT'
+  if (result.status === 'budget_exceeded') return 'BUDGET_EXCEEDED'
+  return 'JOB_FAILED'
+}
+
 /** Run ids live inside the manifest grammar ^[a-z0-9][a-z0-9-]{0,79}$; the epoch keeps re-claims apart. */
 function runIdFor(jobId: string): string {
   return `job-${jobId.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 60)}-${Date.now()}`
@@ -158,7 +167,8 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const { jobId } = claim
 
-  const closeFailed = async (error: string): Promise<JobOutcome> => {
+  const closeFailed = async (error: string, code: string): Promise<JobOutcome> => {
+    runLog?.fail(code, error)
     const res = await control.updateStatus(jobId, { status: 'failed', error: cut(error, ERROR_LIMIT) })
     if (!res.ok) log(`job ${jobId}: update_job_status(failed) mislukt: ${res.message ?? 'onbekend'}`)
     log(`job ${jobId}: failed`)
@@ -171,35 +181,36 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   try {
     trace = runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId)
   } catch (err) {
-    return closeFailed(`harness: ${message(err)}`)
+    return closeFailed(`harness: ${message(err)}`, 'HARNESS_ERROR')
   }
 
   // Step 1: nothing here touches the task, so it stays todo and can be dispatched again at once.
   const parsed = TaskPayloadSchema.safeParse(claim.payload)
   if (!parsed.success) {
-    return closeFailed(`payload ongeldig: ${parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')}`)
+    return closeFailed(`payload ongeldig: ${parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')}`, 'PAYLOAD_INVALID')
   }
   const p = parsed.data
   runLog?.worktree(p.worktree_path)
   const task = config.task
-  if (!task) return closeFailed('worker heeft geen task-config')
+  if (!task) return closeFailed('worker heeft geen task-config', 'NO_TASK_CONFIG')
   const containersClean = ctx.containersClean ?? (async () => (await killLeftoverContainers(deps.taskDeps)) === 'clean')
-  if (!(await containersClean())) return closeFailed(LEFTOVER_ERROR)
+  if (!(await containersClean())) return closeFailed(LEFTOVER_ERROR, 'CONTAINERS_LEFTOVER')
   const worktree = p.worktree_path
   let snapshot: GitAdminSnapshot
   try {
     snapshot = await snapshotGitAdmin(worktree)
   } catch (err) {
-    return closeFailed(`git-administratie niet te scannen: ${message(err)}`)
+    return closeFailed(`git-administratie niet te scannen: ${message(err)}`, 'GIT_SCAN_FAILED')
   }
   const repoUrl = repoUrlOf(p)
   const recipe = repoUrl ? findRecipe(task, repoUrl) : undefined
-  if (!recipe) return closeFailed(`geen recept voor ${repoUrl || '<geen repo_url>'}`)
+  if (!recipe) return closeFailed(`geen recept voor ${repoUrl || '<geen repo_url>'}`, 'NO_RECIPE')
 
   // Step 2.
   const running = await control.updateStatus(jobId, { status: 'running' })
   if (!running.ok) {
     log(`job ${jobId}: niet (meer) van deze worker (${running.message ?? 'onbekend'}); overgeslagen`)
+    runLog?.fail('ABANDONED', `niet (meer) van deze worker (${running.message ?? 'onbekend'})`)
     return 'abandoned'
   }
 
@@ -258,6 +269,8 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     if (!res.ok) log(`job ${jobId}: ${res.message ?? `log ${kind} mislukt`}`)
   }
   const abandon = (): JobOutcome => {
+    // override: true (spec §5.6) — losing ownership always wins over any reason recorded so far.
+    runLog?.fail('ABANDONED', 'eigendom kwijt (heartbeat geweigerd)', { override: true })
     log(`job ${jobId}: eigendom kwijt (heartbeat geweigerd); niets afgesloten`)
     return 'abandoned'
   }
@@ -270,10 +283,11 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
       outcome = 'failed'
     }
     log(`job ${jobId}: ${msg}`)
+    runLog?.fail('CONTAINER_UNCERTAIN', msg, { override: true })
     throw new ContainerUncertainError(msg, outcome)
   }
   /** The failure path (from step 2): no git; a fresh fs-only scan goes into the error unless `scanned`. */
-  const failPath = async (reason: string, scanned = false): Promise<JobOutcome> => {
+  const failPath = async (reason: string, code: string, scanned = false): Promise<JobOutcome> => {
     inner.abort() // a container still running is killed by runInContainer…
     await settleContainers() // …and the scan only starts once that kill has settled
     if (uncertain) return uncertainPath()
@@ -290,19 +304,20 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     if (lost) return abandon()
     if (lastVerify && !lastVerify.green) await logStep('test', { content: `verify rood (${recipe.verify}):\n${lastVerify.text}`, status: 'FAILED' })
     if (lost) return abandon()
-    return closeFailed(scan ? `${squeeze(reason, ERROR_LIMIT - scan.length - 2)}; ${scan}` : squeeze(reason, ERROR_LIMIT))
+    return closeFailed(scan ? `${squeeze(reason, ERROR_LIMIT - scan.length - 2)}; ${scan}` : squeeze(reason, ERROR_LIMIT), code)
   }
   const interrupted = (): Promise<JobOutcome> | undefined => {
     if (uncertain) return uncertainPath()
     if (lost) return Promise.resolve(abandon())
-    if (deps.signal.aborted) return failPath(STOPPED)
+    if (deps.signal.aborted) return failPath(STOPPED, 'STOPPED')
     return undefined
   }
 
   try {
     const inProgress = await control.updateTaskStatus(p.task.id, 'in_progress')
     if (lost) return abandon()
-    if (!inProgress.ok) return await failPath(`update_task_status in_progress mislukt: ${inProgress.message ?? 'onbekend'}`)
+    if (!inProgress.ok) return await failPath(`update_task_status in_progress mislukt: ${inProgress.message ?? 'onbekend'}`, 'JOB_FAILED')
+    runLog?.step('task_status in_progress')
     await logStep('implementation', { content: `lokaal model start: ${config.model.name}, recept ${repoUrl}` })
     const beforePrepare = interrupted()
     if (beforePrepare) return await beforePrepare
@@ -312,7 +327,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
       const prep = await container('prepare', 'prepare', buildScript(recipe.prepare), inner.signal)
       const afterPrepare = interrupted()
       if (afterPrepare) return await afterPrepare
-      if (!isGreen(prep)) return await failPath(prepareFailure(prep))
+      if (!isGreen(prep)) return await failPath(prepareFailure(prep), 'PREPARE_FAILED')
     }
 
     // Step 4: the model loop; the gate runs verify on every final answer.
@@ -358,14 +373,17 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
       await settleContainers()
       const afterThrow = interrupted()
       if (afterThrow) return await afterThrow
-      return await failPath(`harness: ${message(err)}`)
+      return await failPath(`harness: ${message(err)}`, 'HARNESS_ERROR')
     }
     // A gate or run_tests container may still be killing; its cleanup outcome decides what comes next.
     await settleContainers()
     // The uncertain flag first: runManifest reports that abort as an ordinary HARNESS_ERROR.
     if (uncertain) return await uncertainPath()
     if (lost) return abandon()
-    if (result.status !== 'completed') return await failPath(deps.signal.aborted ? STOPPED : failureText(result, task.limits))
+    if (result.status !== 'completed') {
+      const stopped = deps.signal.aborted
+      return await failPath(stopped ? STOPPED : failureText(result, task.limits), stopped ? 'STOPPED' : failureCode(result))
+    }
 
     // Step 5 onwards is short and makes no model call: a stop from here on lets it finish.
     deps.signal.removeEventListener('abort', onStop)
@@ -373,26 +391,28 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     try {
       after = await snapshotGitAdmin(worktree)
     } catch (err) {
-      return await failPath(`git-administratie niet te scannen: ${message(err)}`, true)
+      return await failPath(`git-administratie niet te scannen: ${message(err)}`, 'GIT_SCAN_FAILED', true)
     }
     const diffs = diffGitAdmin(snapshot, after)
-    if (diffs.length > 0) return await failPath(`git-administratie gewijzigd: ${diffs.join(', ')}`, true)
+    if (diffs.length > 0) return await failPath(`git-administratie gewijzigd: ${diffs.join(', ')}`, 'GIT_ADMIN_CHANGED', true)
     if (lost) return abandon()
     let commit: { committed: boolean; sha?: string }
     try {
       commit = await commitAll(worktree, p.task.title)
     } catch (err) {
-      return await failPath(`commit mislukt: ${message(err)}`)
+      return await failPath(`commit mislukt: ${message(err)}`, 'COMMIT_FAILED')
     }
-    if (!commit.committed) return await failPath('model produceerde geen wijzigingen')
+    if (!commit.committed) return await failPath('model produceerde geen wijzigingen', 'NO_CHANGES')
     const sha = commit.sha ?? ''
+    runLog?.step(`commit sha=${sha}`)
 
     // Step 6.
     if (lost) return abandon()
     const plan = await control.verifyTaskAgainstPlan(p.task.id, worktree)
     if (lost) return abandon()
-    if (!plan.ok) return await failPath(`verify_task_against_plan mislukt: ${plan.message ?? 'onbekend'}`)
-    if (plan.result !== 'aligned' && plan.result !== 'partial') return await failPath(`verify_task_against_plan: ${plan.result ?? 'geen uitslag'}`)
+    if (!plan.ok) return await failPath(`verify_task_against_plan mislukt: ${plan.message ?? 'onbekend'}`, 'PLAN_CHECK_FAILED')
+    if (plan.result !== 'aligned' && plan.result !== 'partial') return await failPath(`verify_task_against_plan: ${plan.result ?? 'geen uitslag'}`, 'PLAN_CHECK_FAILED')
+    runLog?.step(`plan_check ${plan.result}`)
 
     // Step 7.
     await logStep('commit', { content: `commit ${sha}: ${p.task.title}`, commitHash: sha, commitMessage: p.task.title })
@@ -416,18 +436,24 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
         // DONE later). Sending a second terminal update here would race that possibly-still-pending
         // write, so the harness sends none — no update_job_status, no update_task_status — and abandons.
         log(`job ${jobId}: uitkomst van done onbekend: ${outcome.message ?? 'onbekend'}; geen tweede terminale update`)
+        runLog?.fail('DONE_UNKNOWN', `uitkomst van done onbekend: ${outcome.message ?? 'onbekend'}`)
         return 'abandoned'
       }
-      return await closeFailed(`done geweigerd: ${outcome.message ?? 'onbekend'}`)
+      return await closeFailed(`done geweigerd: ${outcome.message ?? 'onbekend'}`, 'DONE_REFUSED')
     }
+    runLog?.step(`job_status done pushed_at=${outcome.pushedAt ? 'ja' : 'nee'}`)
     if (outcome.status === 'done' && outcome.pushedAt) {
       const review = await control.updateTaskStatus(p.task.id, 'review')
       if (!review.ok) log(`job ${jobId}: update_task_status(review) mislukt: ${review.message ?? 'onbekend'}`)
+      runLog?.step(`task_status review ${review.ok ? 'ok' : 'mislukt'}`)
       log(`job ${jobId}: done (${sha})`)
       return 'done'
     }
     // Already terminal (FAILED after a push error, or done without pushed_at): no second terminal update.
     log(`job ${jobId}: update_job_status(done) eindigde als ${outcome.status ?? 'onbekend'}${outcome.error ? ` (${outcome.error})` : ''}; taak blijft in_progress`)
+    if (outcome.status !== 'done') {
+      runLog?.fail('DONE_ENDED_FAILED', `update_job_status(done) eindigde als ${outcome.status ?? 'onbekend'}${outcome.error ? ` (${outcome.error})` : ''}`)
+    }
     return outcome.status === 'done' ? 'done' : 'failed'
   } finally {
     stopBeat()
