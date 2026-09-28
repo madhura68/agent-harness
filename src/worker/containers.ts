@@ -117,6 +117,11 @@ class TailBuffer {
   }
 }
 
+// Promises that resolve to nothing after `ms` milliseconds.
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+}
+
 /**
  * Resolves with `promise`'s value, or `undefined` once `ms` elapses first — whichever comes first.
  * Used to give the original `docker run` CLI child a bounded grace period to exit (and flush its last
@@ -124,10 +129,6 @@ class TailBuffer {
  * away. Same shape as `runDockerBounded`'s own timeout race, kept separate because it waits on a
  * `SpawnFn`'s `done` directly rather than driving a fresh docker call.
  */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
-}
-
 function withGrace<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
   return new Promise((resolvePromise) => {
     let settled = false
