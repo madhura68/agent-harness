@@ -72,9 +72,50 @@ De unit voor deze worker (zie [idea-chat-worker.md](idea-chat-worker.md#producti
 
 **Ctrl-C in een terminal stuurt SIGINT naar de hele procesgroep** (voorgrondjob), niet alleen naar het hoofdproces — dat wijkt af van hoe systemd een enkel proces signaleert. Test dit stopgedrag daarom met `kill -INT <hoofdproces-pid>` (bijvoorbeeld `kill -INT $(systemctl show -p MainPID --value agent-harness-worker)` op max2), nooit met Ctrl-C in een interactieve shell.
 
+## Inrichting max2 (Taak 13, 2026-09-28)
+
+Stand na de inrichting; geheimen staan alleen in `/etc/agent-harness/worker.env` (root, 0600).
+
+- **Paden:** clones in `/var/lib/agent-harness/repos/{agent-harness,scrum4me-mcp}`, gemaakt met een URL zonder userinfo (`https://git.jp-visser.nl/janpeter/<repo>.git`) en zonder `node_modules` in de clone-root. scrum4me-mcp is gemaakt met `--recurse-submodules`. Worktrees staan in `/var/lib/agent-harness/worktrees/` en de npm-cache in `/var/lib/agent-harness/npm-cache/`, allemaal van `janpeter`. De askpass-helper staat in `/usr/local/lib/agent-harness/forgejo-askpass.sh` (root, 0755). Image: `node:24-bookworm` (node v24.21.0, git 2.39.5).
+- **Config:** de backup van de oude config staat in `/etc/agent-harness/worker.json.bak-pre-m3`.
+- **Eigen git-config voor het MCP-kind:** `mcp.env` zet `GIT_CONFIG_GLOBAL=/dev/null` en `GIT_CONFIG_NOSYSTEM=1`. `~/.gitconfig` van `janpeter` op max2 heeft een `credential.helper store` met janpeters eigen Forgejo-token. Zonder deze isolatie zou de MCP bij `done` pushen als `janpeter`, niet als de beperkte gebruiker `agent-harness`. Met isolatie is `GIT_ASKPASS` de enige bron van credentials, ook voor de `fetch` bij de claim.
+- **Nog open (JP):** de Forgejo-gebruiker `agent-harness` bestaat nog niet (API: 404). Tot die er is, met schrijfrecht op agent-harness en scrum4me-mcp en leesrecht op scrum4me-shared, en `FORGEJO_PUSH_TOKEN` in `worker.env` staat, ontbreekt `FORGEJO_PUSH_TOKEN` bewust in `mcp.env`. Een `${VAR}` zonder waarde laat de worker namelijk niet starten (`expandEnv`), en dan ligt idea-chat stil. Voeg na het token de regel `"FORGEJO_PUSH_TOKEN": "${FORGEJO_PUSH_TOKEN}"` toe en herstart. Zonder token faalt bij een taakjob de `fetch` of `push`, en dus ook de claim of de `done`.
+- **Worker-token:** `scoped_products` = `{cmuhjw9e80003mt7rq4w3sauu, cmohrysyj0000rd17clnjy4tc}` (Agent-harness + Scrum4Me), gezet in één transactie op de server-DB.
+- **systemd:** drop-in `/etc/systemd/system/agent-harness-worker.service.d/m3.conf` met `KillMode=mixed` en `TimeoutStopSec=180` (`systemctl show`: `KillMode=mixed`, `TimeoutStopUSec=3min`, `KillSignal=2`). Een eerste herstart liet de stop schoon verlopen: `worker klaar — 0 job(s)`, `Deactivated successfully`. Bij een hangende `done`/`verify_task_against_plan` (grens 300 s) SIGKILLt systemd na 180 s. De job loopt dan via de lease-sweep opnieuw; dat is veilig, maar geen groene afronding.
+- **scrum4me-mcp-stable bijwerken:** na `git pull --ff-only && npm ci` ook **`git submodule update --init` en daarna `npm run prisma:generate`**. `npm ci` draait de `postinstall` met de oude submodule, schrijft daarmee een verouderd `prisma/schema.prisma` en genereert de client daarop. Het MCP-kind start dan niet (`ERR_MODULE_NOT_FOUND @shared/…`), of de werkkopie blijft vuil. Na de regeneratie is `git status --porcelain` weer leeg. Dit geldt ook op de Mac.
+
+### Recept-proef (zonder model)
+
+Uitgevoerd met `runInContainer` uit `dist/` op een tijdelijke worktree op main. Na afloop zijn de worktrees verwijderd.
+
+| Repo | prepare | verify | `git status --porcelain` na afloop | overig |
+|---|---|---|---|---|
+| agent-harness | groen (3 s, warme cache) | groen (12 s) | leeg | geen `node_modules`-symlink |
+| scrum4me-mcp | groen (9–11 s) | groen (82 s) met de uitsluitingen hieronder | leeg | Prisma-client in `node_modules/.prisma/client`; geen `node_modules`-symlink |
+
+`git --version` in een verify-container (`--network none`, worktree gemount): `git version 2.39.5`.
+
+**Uitsluitingen in het scrum4me-mcp-recept.** Elk van deze bestanden faalt uitsluitend omdat de gitdir van de worktree buiten de containermount staat. Git leest de gitlink in de werkmap en stopt met `fatal: not a git repository: /var/lib/agent-harness/repos/scrum4me-mcp/.git/worktrees/<naam>`, ook bij commando's als `git ls-remote <pad>` die geen repo nodig hebben, omdat de tests geen eigen `cwd` meegeven. De gitdir mounten zou de containergrens verbreden en is geen optie. De volledige suite draait in de CI bij de PR.
+
+| Bestand | Falende tests (eerste proef, zonder uitsluiting: 9 rood, 1907 groen) |
+|---|---|
+| `__tests__/ppe-bundle1-parity.test.ts` | (vooraf uitgesloten) git op de eigen repo-geschiedenis |
+| `__tests__/branch-safety.test.ts` | 2× `git ls-remote <tmp>/origin.git` |
+| `__tests__/default-branch.test.ts` | 1× `git ls-remote` |
+| `__tests__/worktree-branch-safety.test.ts` | 2× `git ls-remote` |
+| `__tests__/update-job-status-local-llm-chain.test.ts` | 2× `git config --file <tmp>/…/config` |
+| `__tests__/update-job-status-local-llm-done-gitlink.test.ts` | 1× `git config --file …` |
+| `__tests__/git/local-llm.test.ts` | 1× `git config --file …` |
+
+Vervolgoptie, niet gedaan: geef in deze scrum4me-mcp-tests `cwd: <tmpdir>` mee aan de git-aanroepen. Dan kunnen de uitsluitingen weer weg.
+
+### Naamfilter en opruimen, live
+
+`runInContainer('verify', …)` met `verifyTimeoutSeconds: 5`, vier keer: één keer `sleep 300` en drie keer een container die eerst 300 MB en 3000 mappen in zijn writable layer schrijft en dan slaapt. Elke keer gaf `docker ps -aq --filter name=^<naam>$` vóór de kill een id en daarna niets, met als resultaat `timedOut: true`, `cleanup: 'stopped'`. Na de timeout duurde de afronding 2,4 s tot 3,7 s. Er bleven geen `harness-*`-containers achter.
+
 ## Mergen van een scrum4me-mcp-branch uit een lokale taak
 
-Een scrum4me-mcp-branch van een lokale taak wordt alleen gemerged via een PR met groene CI: het verify-recept sluit tests uit die de git-geschiedenis van de repo nodig hebben (`__tests__/ppe-bundle1-parity.test.ts`, zie Taak 13), en de CI draait alleen op PR's en main — niet op de losse commit die de worker op de host maakt.
+Een scrum4me-mcp-branch van een lokale taak wordt alleen gemerged via een PR met groene CI: het verify-recept sluit tests uit die een werkende gitdir in de worktree nodig hebben (zeven bestanden, zie "Inrichting max2" hieronder), en de CI draait alleen op PR's en main — niet op de losse commit die de worker op de host maakt.
 
 ## Config (`examples/worker.json`, `task`-blok)
 
@@ -88,12 +129,12 @@ Een scrum4me-mcp-branch van een lokale taak wordt alleen gemerged via een PR met
     "npmCacheDir": "/var/lib/agent-harness/npm-cache",
     "recipes": [
       { "repoUrl": "https://git.jp-visser.nl/janpeter/agent-harness.git", "prepare": ["npm ci"], "verify": "npm run verify" },
-      { "repoUrl": "https://git.jp-visser.nl/janpeter/scrum4me-mcp.git", "prepare": ["npm ci", "npm run prisma:generate"], "verify": "npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts" }
+      { "repoUrl": "https://git.jp-visser.nl/janpeter/scrum4me-mcp.git", "prepare": ["npm ci", "npm run prisma:generate"], "verify": "npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts --exclude __tests__/branch-safety.test.ts --exclude __tests__/default-branch.test.ts --exclude __tests__/worktree-branch-safety.test.ts --exclude __tests__/update-job-status-local-llm-chain.test.ts --exclude __tests__/update-job-status-local-llm-done-gitlink.test.ts --exclude __tests__/git/local-llm.test.ts" }
     ]
   }
 }
 ```
 
-`uid`/`gid` zijn hier `1000`; Taak 13 vervangt ze door de echte waarden van `janpeter` op max2 (eigenaar van de worktree). `mcp.env` krijgt daarnaast `GIT_ASKPASS` (naar [`deploy/max2/forgejo-askpass.sh`](../../deploy/max2/forgejo-askpass.sh)), `GIT_TERMINAL_PROMPT=0`, `FORGEJO_PUSH_TOKEN` (uit de omgeving, nooit een echte waarde in de config), `SCRUM4ME_AGENT_WORKTREE_DIR` en de `SCRUM4ME_REPO_ROOT_*`-variabelen voor de twee recepten (spec §6).
+`uid`/`gid` zijn `1000`: dat zijn de echte waarden van `janpeter` op max2 (eigenaar van de worktree; gecontroleerd in Taak 13). `mcp.env` krijgt daarnaast `GIT_ASKPASS` (naar [`deploy/max2/forgejo-askpass.sh`](../../deploy/max2/forgejo-askpass.sh)), `GIT_TERMINAL_PROMPT=0`, `FORGEJO_PUSH_TOKEN` (uit de omgeving, nooit een echte waarde in de config), `SCRUM4ME_AGENT_WORKTREE_DIR`, de `SCRUM4ME_REPO_ROOT_*`-variabelen voor de twee recepten (spec §6), en `GIT_CONFIG_GLOBAL=/dev/null` + `GIT_CONFIG_NOSYSTEM=1` (zie "Inrichting max2").
 
 Het askpass-script geeft het token alleen als de prompt `https://git.jp-visser.nl` noemt (username) of `https://agent-harness@git.jp-visser.nl` (wachtwoord); elke andere prompt krijgt niets (exit 1, geen output) — zie [`__tests__/askpass.test.ts`](../../__tests__/askpass.test.ts).
