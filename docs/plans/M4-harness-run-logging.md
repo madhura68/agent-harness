@@ -1,6 +1,6 @@
 # M4 — harness-runs volgen in Worker Logs: implementatieplan
 
-_Status: concept, revisie 4 (2026-09-28), na planronde 3. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
+_Status: concept, revisie 5 (2026-09-28), na planronde 4. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -27,9 +27,9 @@ _Status: concept, revisie 4 (2026-09-28), na planronde 3. Een technisch GO autor
 - Forgejo is de forge; nooit `gh`. Push via `GIT_ASKPASS` met `$FORGEJO_TOKEN`. Geen merge, serveractie of uitrol zonder JP. Geheimen nooit printen of loggen.
 - Gates vóór elke commit: agent-harness `npm run verify`; Ops-dashboard `npm run typecheck && npm test` (er is geen lint-script).
 - Een controle op geheimen zet nooit een waarde in argv, uitvoer of een log; alleen namen en tellingen.
-- **Stopprocedure voor de worker op max2**, vóór elke herstart of stop (journal en containers alleen tonen geen claim; die zijn aanvullend bewijs, geen toets):
-  1. Toets: er is geen `local_llm`-job met status `CLAIMED` of `RUNNING`, met een read-only query op scrum4me-srv: `docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc "select count(*) from claude_jobs where required_capability = 'local_llm' and status in ('CLAIMED','RUNNING')"` geeft `0`. Na de M4-uitrol bovendien: het nieuwste bestand in `/srv/scrum4me/worker-logs/harness/max2/runs/` eindigt op `exit code=`.
-  2. `systemctl stop agent-harness-worker`, en dan dezelfde toets opnieuw. Is die niet `0`, dan is er in het gat een job geclaimd; dat betekent niet dat hij als `STOPPED` is afgesloten: een afgebroken `wait_for_job` kan een claim achterlaten die pas via de lease-reset weer `QUEUED` wordt (`src/worker/control.ts:84-97`, `src/worker/worker.ts:201-219`). Leg dan de job-id's en statussen vast, dispatch niets opnieuw, en wacht tot elke claim terminaal is of weer `QUEUED`; begin daarna de procedure opnieuw. De wijziging gaat pas door na een schone tweede toets.
+- **Stopprocedure voor de worker op max2**, vóór elke herstart of stop (journal en containers alleen tonen geen claim; die zijn aanvullend bewijs, geen toets). Alle queries zijn read-only, op scrum4me-srv via `docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc "<query>"`:
+  1. Leg `T0` vast met `select now()`. Toets dat `select id, kind, status, claimed_at from claude_jobs where required_capability = 'local_llm' and status in ('CLAIMED','RUNNING')` geen rijen geeft. Na de M4-uitrol bovendien: het nieuwste bestand in `/srv/scrum4me/worker-logs/harness/max2/runs/` eindigt op `exit code=`.
+  2. `systemctl stop agent-harness-worker`, en dan de audit over het hele stopmoment: `select id, kind, status, error, claimed_at from claude_jobs where required_capability = 'local_llm' and (status in ('CLAIMED','RUNNING') or claimed_at >= '<T0>')` geeft geen rijen. Zo valt ook een job op die in het gat is geclaimd en door de stop al als FAILED (`worker gestopt`) is afgesloten; een afgebroken `wait_for_job` kan bovendien een claim achterlaten die pas via de lease-reset weer `QUEUED` wordt (`src/worker/control.ts:84-97`, `src/worker/worker.ts:201-219`). Geeft de audit rijen, dan is de stop niet schoon: de service blijft gestopt, de rijen gaan naar JP, er wordt niets opnieuw gedispatcht, en alleen de audit wordt herhaald tot elke rij terminaal is en JP over een eventuele herdispatch heeft beslist.
   3. De wijziging, en daarna `systemctl start agent-harness-worker` en controle dat de service `active` is.
 
 ## Review Focus
@@ -450,7 +450,7 @@ const terminal = harnessLog
 - [ ] Criterium 3 met de eerste echte mislukte harness-job na de uitrol, zoals spec §8 stap 4 als tweede optie toestaat. Er wordt geen config gemanipuleerd en de productieworker hoeft niet stil (planrondes 1–3 lieten zien dat de altijd-rode proef dat wel vraagt, met een eigen reeks risico's rond claims en herstarts).
   1. De run staat op error met `error_summary` `<CODE>: …`, voor welke code ook.
   2. Na de ingest start JP `worker-insights-triage.service` op scrum4me-srv, zo nodig herhaald (hooguit vijf keer), tot de run een `WorkerInsight` heeft of een ronde niets meer verwerkt. Aantal starts en tijden vastleggen.
-  3. Tot die fout er is, blijft criterium 3 open; de rest van M4 wacht daar niet op.
+  3. Tot die fout er is, blijft criterium 3 open; de rest van M4 wacht daar niet op. De bewijs-PR noemt criterium 3 als open, en er blijft één open taak in de M4-sprint staan tot de eerste mislukte run een `WorkerInsight` heeft.
 - [ ] Criterium 4 met `harness check-run-logs` over alle bestanden in `/srv/scrum4me/worker-logs/harness/`, plus de namencontrole, volgens de runbook.
 - [ ] Bewijs per criterium (job-id, run-id, relevante regels) in `docs/runbooks/idea-chat-worker.md`, in een docs-PR.
 
@@ -507,3 +507,15 @@ Bevindingen, gecontroleerd tegen de bomen:
 - **MAJOR codex, MINOR claude:** de eenmalige worker kan een wachtende idee-chat claimen in plaats van de proeftaak. **MAJOR codex:** de hoofdservice mag niet herstarten zolang de rode proeftaak open is. **MINOR codex:** "altijd herstellen" had geen uitvoerbaar mechanisme. **MINOR claude:** `--pipe` bindt een run van 40 minuten aan de sessie. → Alle vier opgelost door de altijd-rode proef te schrappen. Spec §8 stap 4 staat als tweede optie de eerstvolgende echte fout toe; criterium 3 wordt daarmee bewezen, zonder configwijziging en zonder de productieworker stil te leggen (Taak 11).
 
 Afgewezen: geen. Scope, beoordeeld vóór ronde 4 omdat dezelfde procedure drie rondes terugkwam: geschrapt is de altijd-rode proef met stilgelegde service. Het bewijs voor criterium 3 hangt nu af van de eerste echte fout, en kan dus later komen dan de rest; de afgesproken acceptatie zelf verandert niet.
+
+### Planronde 4 — revisie 4 (`bfac184`), 2026-09-28
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 2 MINOR; GO) en `mac:codex` (0 BLOCKER, 1 MAJOR, 1 MINOR; NO-GO). Beide: het schrappen van de rode proef houdt stand; spec §8 stap 4 staat de eerstvolgende echte fout letterlijk toe.
+
+Bevindingen, gecontroleerd tegen de bomen en overgenomen:
+- **MAJOR codex:** een job die in het stopgat wordt geclaimd en snel als FAILED eindigt, staat bij de tweede telling niet meer op `CLAIMED`/`RUNNING` → de tweede toets wordt een audit over het stopmoment met `claimed_at >= T0` (kolommen `claimed_at`, `status`, `error` bestaan in `ClaudeJob`, scrum4me-mcp `prisma/schema.prisma`) (Global Constraints).
+- **MINOR codex:** een telling levert geen job-id's → beide queries geven rijen (Global Constraints).
+- **MINOR claude:** "begin de procedure opnieuw" terwijl de service al stilstaat → de service blijft gestopt en alleen de audit wordt herhaald (Global Constraints).
+- **MINOR claude:** het open criterium 3 had geen plek → de bewijs-PR noemt het open en één taak in de sprint blijft staan (Taak 11).
+
+Afgewezen: geen. Scope: onveranderd; alleen de stoptoets is aangescherpt.
