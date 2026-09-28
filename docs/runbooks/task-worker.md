@@ -57,7 +57,20 @@ Elk faalpad na stap 2 killt eerst elke lopende container, scant de git-administr
 
 **SIGINT tijdens een taak:** een stop die vóór de host-commit binnenkomt (stap 5) breekt de lopende stap af, killt een draaiende container en sluit de job af als `failed` ("worker gestopt"); geen git-operatie. Een stop die pas ná de commit binnenkomt laat het groene pad (`verify_task_against_plan`, `done`) nog afmaken — vanaf dat punt maakt de harness geen modelbeurt meer en is de rest kort.
 
-**Open punt voor Taak 13 (setup):** dit gedrag ("stappen 5–8 afmaken na SIGINT") veronderstelt dat het proces zelf het stopsignaal krijgt en de kans krijgt om af te maken. De systemd-unit van de idea-chat-worker gebruikt de standaard `KillMode=control-group`: bij een `stop` krijgt niet alleen dit proces maar ook zijn stdio-MCP-kind het signaal. Of dat "afmaken" in de praktijk lukt (het MCP-kind kan zelf al wegvallen terwijl de harness nog `verify_task_against_plan` of de push-aanroep doet) hangt dus af van de exacte unit-instelling. Dit runbook wijzigt geen unit-bestand; Taak 13 moet dit expliciet meenemen bij het schrijven van de systemd-unit voor deze worker.
+**Systemd-stopgedrag voor Taak 13 (setup):** het gedrag hierboven ("stappen 5–8 afmaken na SIGINT") veronderstelt dat het hoofdproces zelf het stopsignaal krijgt en de kans krijgt om af te maken — niet dat zijn stdio-MCP-kind halverwege wegvalt. Met de systemd-default `KillMode=control-group` krijgt bij een `stop` niet alleen dit proces maar tegelijk ook het MCP-kind SIGINT; dat kind heeft geen SIGINT-handler, dus dat kan het middenin `verify_task_against_plan` of de `done`-aanroep raken en breekt dan precies het pad dat dit runbook als "afmaken" beschrijft.
+
+De unit voor deze worker (zie [idea-chat-worker.md](idea-chat-worker.md#productie-service-op-max2-sinds-2026-09-27)) zet daarom:
+
+- **`KillMode=mixed`** — SIGINT gaat alleen naar het hoofdproces; pas ná diens exit stuurt systemd SIGKILL naar de rest van de control group (het MCP-kind). Het MCP-kind blijft dus in leven zolang de harness zelf nog loopt.
+- **`TimeoutStopSec=180`** — geeft het hoofdproces ruim baan om na SIGINT de lopende stap af te maken vóórdat systemd alsnog SIGKILLt.
+
+**De harness sluit het MCP-kind zelf ook af, ongeacht de unit.** `cmdWorker` (`src/cli.ts`) doet dit in zijn `finally`: `await conn?.close()` (via `connectStdioClient`, `src/tools/registry.ts`) sluit de MCP-`Client` en de stdio-transport netjes af zodra `runWorker` terugkeert — of dat nu is na een schone afronding of na een SIGINT-afbreekpad. `__tests__/cli-worker.test.ts` ("closes the MCP connection itself before returning") bevestigt dit met een spy op `close()` die los staat van de eigen test-cleanup. Met `KillMode=mixed` is dit een tweede, onafhankelijke garantie bovenop het systemd-gedrag; met de oude `control-group`-default was het de enige garantie, en races tegen systemd's eigen SIGINT naar het MCP-kind waren mogelijk.
+
+**Live stoptest voor Taak 13:** met de echte unit op max2, twee scenario's, telkens met `kill -INT <hoofdproces-pid>` (zie hieronder — niet Ctrl-C in een terminal):
+1. **Stop tijdens verify** (vóór stap 5, de host-commit): verwacht de job `failed` met "worker gestopt", de container aantoonbaar weg (`docker ps` leeg voor `harness-*`), en geen git-operatie op de worktree (geen nieuwe commit, geen gewijzigde `.git`-administratie).
+2. **Stop ná de commit** (stap 5 al voltooid, tijdens stap 6–8): verwacht dat de job alsnog groen afrondt — `verify_task_against_plan`, `done` en (bij een bevestigde push) `update_task_status review` lopen nog af vóór de worker stopt.
+
+**Ctrl-C in een terminal stuurt SIGINT naar de hele procesgroep** (voorgrondjob), niet alleen naar het hoofdproces — dat wijkt af van hoe systemd een enkel proces signaleert. Test dit stopgedrag daarom met `kill -INT <hoofdproces-pid>` (bijvoorbeeld `kill -INT $(systemctl show -p MainPID --value agent-harness-worker)` op max2), nooit met Ctrl-C in een interactieve shell.
 
 ## Mergen van een scrum4me-mcp-branch uit een lokale taak
 

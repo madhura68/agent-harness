@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { promisify } from 'node:util'
+import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createModelClient } from '../src/model-client.js'
 import { createRegistryView } from '../src/tools/registry.js'
@@ -463,6 +464,25 @@ describe('runTaskJob — failures', () => {
     expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running', 'done', 'failed'])
     expect(String(lastJobUpdate(t.mcp)?.error)).toContain('already terminal')
     expect(taskUpdates(t.mcp)).toEqual(['in_progress'])
+  })
+
+  it('done times out (a thrown call, not a refusal) ⇒ abandoned, no second terminal update, no review (Fix 3 / P12)', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')] })
+    const orig = t.mcp.client.callTool.bind(t.mcp.client)
+    vi.spyOn(t.mcp.client, 'callTool').mockImplementation(async (params: { name: string; arguments?: Record<string, unknown> }, schema?: unknown, opts?: unknown) => {
+      if (params.name === 'update_job_status' && params.arguments?.status === 'done') {
+        throw new McpError(ErrorCode.RequestTimeout, 'Request timed out')
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (orig as any)(params, schema, opts)
+    })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    // The 'done' call never reached the MCP (it was rejected client-side): only 'running' was recorded,
+    // and — critically — no second terminal update ('failed') was sent after the unknown outcome.
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running'])
+    expect(taskUpdates(t.mcp)).toEqual(['in_progress'])
+    expect(t.logs.join('\n')).toMatch(/uitkomst van done onbekend.*geen tweede terminale update/)
   })
 
   it('done comes back as failed (push) ⇒ no review and no second terminal update', async () => {

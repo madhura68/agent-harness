@@ -406,7 +406,16 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     stopBeat()
 
     // Step 8.
-    if (!outcome.ok) return await closeFailed(`done geweigerd: ${outcome.message ?? 'onbekend'}`)
+    if (!outcome.ok) {
+      if (outcome.unknown) {
+        // The call itself threw or timed out: the MCP may still be processing it (and could still write
+        // DONE later). Sending a second terminal update here would race that possibly-still-pending
+        // write, so the harness sends none — no update_job_status, no update_task_status — and abandons.
+        log(`job ${jobId}: uitkomst van done onbekend: ${outcome.message ?? 'onbekend'}; geen tweede terminale update`)
+        return 'abandoned'
+      }
+      return await closeFailed(`done geweigerd: ${outcome.message ?? 'onbekend'}`)
+    }
     if (outcome.status === 'done' && outcome.pushedAt) {
       const review = await control.updateTaskStatus(p.task.id, 'review')
       if (!review.ok) log(`job ${jobId}: update_task_status(review) mislukt: ${review.message ?? 'onbekend'}`)

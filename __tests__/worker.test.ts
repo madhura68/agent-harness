@@ -343,6 +343,40 @@ describe('createControlChannel', () => {
     expect(r.ok).toBe(true)
   })
 
+  it('updateStatus classifies a thrown call (a timeout) as unknown, not a definite refusal (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockRejectedValueOnce(new McpError(ErrorCode.RequestTimeout, 'Request timed out'))
+    const r = await control.updateStatus('job1', { status: 'done', summary: 'klaar' })
+    expect(r.ok).toBe(false)
+    expect(r.unknown).toBe(true)
+    expect(r.message).toMatch(/timed out/i)
+  })
+
+  it('updateStatus keeps an isError refusal distinct from unknown (no unknown flag)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockResolvedValueOnce({ isError: true, content: [{ type: 'text', text: 'Job already terminal' }] })
+    const r = await control.updateStatus('job1', { status: 'done', summary: 'klaar' })
+    expect(r).toEqual({ ok: false, message: 'Job already terminal' })
+  })
+
+  it('gives a done update an explicit 300s request timeout, unlike running/failed (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    const spy = vi.spyOn(mcp.client, 'callTool')
+    await control.updateStatus('job1', { status: 'done', summary: 'klaar' })
+    expect(spy).toHaveBeenCalledWith({ name: 'update_job_status', arguments: expect.objectContaining({ status: 'done' }) }, undefined, expect.objectContaining({ timeout: 300_000 }))
+    spy.mockClear()
+    await control.updateStatus('job1', { status: 'running' })
+    const runningOpts = spy.mock.calls[0]?.[2] as { timeout?: number } | undefined
+    expect(runningOpts?.timeout).not.toBe(300_000)
+    spy.mockClear()
+    await control.updateStatus('job1', { status: 'failed', error: 'x' })
+    const failedOpts = spy.mock.calls[0]?.[2] as { timeout?: number } | undefined
+    expect(failedOpts?.timeout).not.toBe(300_000)
+  })
+
   it('updateTaskStatus sends task_id and status to update_task_status', async () => {
     mcp = await startFakeScrum4meMcp()
     const control = createControlChannel(mcp.client)
@@ -375,6 +409,27 @@ describe('createControlChannel', () => {
     vi.spyOn(mcp.client, 'callTool').mockResolvedValueOnce({ isError: true, content: [{ type: 'text', text: 'geen plan' }] })
     const r = await control.verifyTaskAgainstPlan('task-1', '/wt')
     expect(r).toEqual({ ok: false, message: 'geen plan' })
+  })
+
+  it('verifyTaskAgainstPlan classifies a thrown call as unknown too (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    vi.spyOn(mcp.client, 'callTool').mockRejectedValueOnce(new McpError(ErrorCode.RequestTimeout, 'Request timed out'))
+    const r = await control.verifyTaskAgainstPlan('task-1', '/wt')
+    expect(r.ok).toBe(false)
+    expect(r.unknown).toBe(true)
+  })
+
+  it('gives verify_task_against_plan an explicit 300s request timeout (Fix 3 / P12)', async () => {
+    mcp = await startFakeScrum4meMcp()
+    const control = createControlChannel(mcp.client)
+    const spy = vi.spyOn(mcp.client, 'callTool')
+    await control.verifyTaskAgainstPlan('task-1', '/wt')
+    expect(spy).toHaveBeenCalledWith(
+      { name: 'verify_task_against_plan', arguments: { task_id: 'task-1', worktree_path: '/wt' } },
+      undefined,
+      expect.objectContaining({ timeout: 300_000 }),
+    )
   })
 
   it('log sends the right argument names for implementation, commit and test', async () => {

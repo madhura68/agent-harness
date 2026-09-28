@@ -23,7 +23,7 @@ De worker draait als systemd-service op max2, naast Ollama: geen tunnel, altijd 
 
 | Onderdeel | Waar |
 |---|---|
-| Unit | `/etc/systemd/system/agent-harness-worker.service` (`User=janpeter`, `Restart=always`, `RestartSec=30`, `KillSignal=SIGINT`, na `ollama.service`) |
+| Unit | `/etc/systemd/system/agent-harness-worker.service` (`User=janpeter`, `Restart=always`, `RestartSec=30`, `KillSignal=SIGINT`, `KillMode=mixed` — stuurt SIGINT alleen naar het hoofdproces (niet naar de nog-lopende stdio-MCP-kind, die geen SIGINT-handler heeft) en pas ná diens exit stuurt systemd SIGKILL naar de rest van de control group, `TimeoutStopSec=180` — geeft het hoofdproces ruim baan om na SIGINT nog af te ronden (git/verify-stappen) vóórdat systemd alsnog SIGKILLt, na `ollama.service`) |
 | Code | `~/Development/agent-harness` (gebouwd: `dist/cli.js`) en `~/Development/scrum4me-mcp-stable` (MCP-kindproces via `tsx`) |
 | Config | `/etc/agent-harness/worker.json`: model `qwen3.8-gsq-rco:27b-iq3_s-text`, baseUrl `http://127.0.0.1:11434/v1`, thinking aan, `maxTurns 8`, `maxOutputTokens 4096`, `contextTokens 65536`, gelijk aan `OLLAMA_CONTEXT_LENGTH` in `/etc/systemd/system/ollama.service.d/override.conf` (zie [contextvenster](probe-and-run-max2.md#contextvenster-en-lange-beurten) en [meetproef](probe-and-run-max2.md#meetproef-contextvenster-2026-09-27)). Pas de twee altijd samen aan |
 | Secrets | `/etc/agent-harness/worker.env` (root, 0600): `SCRUM4ME_TOKEN` = eigen token `agent-harness-local-llm-max2`; `DATABASE_URL`/`DIRECT_URL` = beperkte worker-rol uit `worker-idea.env` |

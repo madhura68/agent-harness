@@ -16,7 +16,7 @@ export type SpawnFn = (
 ) => { stdout: Readable; stderr: Readable; done: Promise<number | null>; kill(): void; errorMessage?(): string | undefined }
 
 /** Test seam shared by `runInContainer` and `killLeftoverContainers`. Production callers pass neither field. */
-export type ContainerDeps = { spawn?: SpawnFn; cleanupTimeoutMs?: number; killGraceMs?: number }
+export type ContainerDeps = { spawn?: SpawnFn; cleanupTimeoutMs?: number; killGraceMs?: number; pollIntervalMs?: number }
 
 const HOME_PREFIX = 'export HOME=/tmp/harness-home && mkdir -p "$HOME" && '
 /** Combined stdout+stderr kept per container run; `run_tests` (task-tools.ts) truncates further for the model. */
@@ -25,6 +25,8 @@ const OUTPUT_TAIL_BYTES = 64 * 1024
 const DEFAULT_CLEANUP_TIMEOUT_MS = 20_000
 /** After the container is confirmed killed, how long to still let the original `docker run` CLI child settle (and flush any last output) before giving up on it — never unbounded. */
 const DEFAULT_KILL_GRACE_MS = 2000
+/** How often `cleanupContainer` re-polls `docker ps` after a successful kill: a `--rm` container can stay listed as `dead` for ~100 ms while the daemon removes it, which is not evidence it is still running. */
+const DEFAULT_POLL_INTERVAL_MS = 250
 const LEFTOVER_FILTER = 'name=^harness-'
 const NO_EXIT_CODE_ERROR = 'docker-proces eindigde zonder exitcode'
 
@@ -122,6 +124,10 @@ class TailBuffer {
  * away. Same shape as `runDockerBounded`'s own timeout race, kept separate because it waits on a
  * `SpawnFn`'s `done` directly rather than driving a fresh docker call.
  */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
+}
+
 function withGrace<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
   return new Promise((resolvePromise) => {
     let settled = false
@@ -202,19 +208,28 @@ function runDockerBounded(spawn: SpawnFn, args: string[], timeoutMs: number): Pr
 }
 
 /**
- * `docker kill <name>` then `docker ps -aq --filter name=^<name>$` to confirm it is actually gone, each
- * bounded to its own `cleanupTimeoutMs` (never the already-aborted run signal). `'stopped'` only when
- * both calls succeed and the confirmation is empty; anything else — kill fails, either call hangs past
- * the bound, or the container is still listed — is `'uncertain'`: a failed inspection is not proof the
+ * `docker kill <name>` then repeatedly `docker ps -aq --filter name=^<name>$` to confirm it is actually
+ * gone, each call bounded to its own `cleanupTimeoutMs` (never the already-aborted run signal). A
+ * `--rm` container can still show up in that listing for ~100 ms while the daemon removes it, so a
+ * single listing is not proof it is still running: this polls every `pollIntervalMs` until one
+ * `ps` call comes back empty (`'stopped'`), or until `cleanupTimeoutMs` has elapsed since the kill
+ * without ever seeing an empty listing (`'uncertain'`). `kill` failing or hanging past the bound, or
+ * `ps` failing/hanging on every poll, is also `'uncertain'`: a failed inspection is not proof the
  * container is gone.
  */
-async function cleanupContainer(name: string, spawn: SpawnFn, cleanupTimeoutMs: number): Promise<'stopped' | 'uncertain'> {
+async function cleanupContainer(name: string, spawn: SpawnFn, cleanupTimeoutMs: number, pollIntervalMs: number): Promise<'stopped' | 'uncertain'> {
   try {
     const kill = await runDockerBounded(spawn, ['kill', name], cleanupTimeoutMs)
     if (kill.timedOut || kill.code !== 0) return 'uncertain'
-    const ps = await runDockerBounded(spawn, ['ps', '-aq', '--filter', `name=^${name}$`], cleanupTimeoutMs)
-    if (ps.timedOut || ps.code !== 0) return 'uncertain'
-    return ps.output.trim() === '' ? 'stopped' : 'uncertain'
+
+    const deadline = Date.now() + cleanupTimeoutMs
+    for (;;) {
+      const ps = await runDockerBounded(spawn, ['ps', '-aq', '--filter', `name=^${name}$`], cleanupTimeoutMs)
+      if (!ps.timedOut && ps.code === 0 && ps.output.trim() === '') return 'stopped'
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) return 'uncertain'
+      await sleep(Math.min(pollIntervalMs, remaining))
+    }
   } catch {
     return 'uncertain'
   }
@@ -240,6 +255,7 @@ export async function runInContainer(
   const spawn = deps?.spawn ?? defaultSpawn
   const cleanupTimeoutMs = deps?.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS
   const killGraceMs = deps?.killGraceMs ?? DEFAULT_KILL_GRACE_MS
+  const pollIntervalMs = deps?.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
   const timeoutSeconds = kind === 'prepare' ? o.task.prepareTimeoutSeconds : o.task.verifyTimeoutSeconds
   const args = buildDockerArgs(kind, {
     name: o.name,
@@ -294,7 +310,7 @@ export async function runInContainer(
     return { exitCode: outcome.code, output: tail.toString(), timedOut: false }
   }
 
-  const cleanup = await cleanupContainer(o.name, spawn, cleanupTimeoutMs)
+  const cleanup = await cleanupContainer(o.name, spawn, cleanupTimeoutMs, pollIntervalMs)
   try {
     child.kill()
   } catch {

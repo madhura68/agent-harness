@@ -294,7 +294,7 @@ describe('runInContainer: timeout', () => {
     expect(result.cleanup).toBe('uncertain')
   }, 2000)
 
-  it('reports uncertain when the container is still listed after the kill', async () => {
+  it('reports uncertain when the container is still listed after the kill for the whole poll bound', async () => {
     const { spawn } = fakeSpawn({
       run: () => fakeChild({ never: true }),
       kill: () => fakeChild({ exitCode: 0 }),
@@ -303,11 +303,50 @@ describe('runInContainer: timeout', () => {
     const result = await runInContainer(
       'verify',
       { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
-      { spawn, killGraceMs: 20 },
+      { spawn, killGraceMs: 20, cleanupTimeoutMs: 60, pollIntervalMs: 10 },
     )
     expect(result.timedOut).toBe(true)
     expect(result.cleanup).toBe('uncertain')
-  })
+  }, 2000)
+
+  it('polls past a --rm container still briefly listed and reports stopped once the listing goes empty', async () => {
+    let psCalls = 0
+    const { spawn, calls } = fakeSpawn({
+      run: () => fakeChild({ never: true }),
+      kill: () => fakeChild({ exitCode: 0 }),
+      ps: () => {
+        psCalls++
+        // The first 2 polls still see the --rm container mid-removal; the 3rd poll finds it gone.
+        return psCalls <= 2 ? fakeChild({ exitCode: 0, stdout: 'deadbeef1234\n' }) : fakeChild({ exitCode: 0, stdout: '' })
+      },
+    })
+    const result = await runInContainer(
+      'verify',
+      { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
+      { spawn, killGraceMs: 20, cleanupTimeoutMs: 2000, pollIntervalMs: 10 },
+    )
+    expect(result.timedOut).toBe(true)
+    expect(result.cleanup).toBe('stopped')
+    expect(calls.filter((c) => c.args[0] === 'ps').length).toBe(3)
+  }, 2000)
+
+  it('reports uncertain within the bound when docker ps fails every time (a failing inspection is not proof of absence)', async () => {
+    const { spawn } = fakeSpawn({
+      run: () => fakeChild({ never: true }),
+      kill: () => fakeChild({ exitCode: 0 }),
+      ps: () => fakeChild({ exitCode: 1, stdout: '' }),
+    })
+    const start = Date.now()
+    const result = await runInContainer(
+      'verify',
+      { name: 'harness-abc12345-verify-0', worktree: '/wt', task: TASK, script: 'noop', signal: AbortSignal.timeout(60_000) },
+      { spawn, killGraceMs: 20, cleanupTimeoutMs: 60, pollIntervalMs: 10 },
+    )
+    expect(result.timedOut).toBe(true)
+    expect(result.cleanup).toBe('uncertain')
+    // Bounded by cleanupTimeoutMs (60 ms), not left to hang: generous margin for CI/test-runner jitter.
+    expect(Date.now() - start).toBeLessThan(1800)
+  }, 2000)
 })
 
 describe('runInContainer: kill grace period', () => {
@@ -378,12 +417,12 @@ describe('runInContainer: abort', () => {
     const result = await runInContainer(
       'prepare',
       { name: 'harness-abc12345-prepare-0', worktree: '/wt', task: TASK, script: 'noop', signal: controller.signal },
-      { spawn, killGraceMs: 20 },
+      { spawn, killGraceMs: 20, cleanupTimeoutMs: 60, pollIntervalMs: 10 },
     )
     expect(result.timedOut).toBe(true)
     expect(result.runnerError).toBe('afgebroken')
     expect(result.cleanup).toBe('uncertain')
-  })
+  }, 2000)
 })
 
 describe('killLeftoverContainers', () => {

@@ -14,7 +14,7 @@
       "SCRUM4ME_TOKEN": "${SCRUM4ME_TOKEN}",
       "DATABASE_URL": "${DATABASE_URL}",
       "DIRECT_URL": "${DIRECT_URL}",
-      "GIT_ASKPASS": "/etc/agent-harness/forgejo-askpass.sh",
+      "GIT_ASKPASS": "/usr/local/lib/agent-harness/forgejo-askpass.sh",
       "GIT_TERMINAL_PROMPT": "0",
       "FORGEJO_PUSH_TOKEN": "${FORGEJO_PUSH_TOKEN}",
       "SCRUM4ME_AGENT_WORKTREE_DIR": "/var/lib/agent-harness/worktrees",

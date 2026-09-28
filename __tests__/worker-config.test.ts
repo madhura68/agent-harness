@@ -127,7 +127,9 @@ describe('model.reasoningEffort', () => {
   it('the example worker config adds the Forgejo askpass and repo-root env for the M3 task worker, still as ${VAR}', () => {
     const cfg = loadWorkerConfig('examples/worker.json')
     expect(cfg.mcp.env).toMatchObject({
-      GIT_ASKPASS: '/etc/agent-harness/forgejo-askpass.sh',
+      // Must match plan Task 13's install path (setup: "askpass-script naar /usr/local/lib/agent-harness/forgejo-askpass.sh") — a
+      // mismatch here would leave GIT_ASKPASS pointing at a script that was never installed there (Fix 4).
+      GIT_ASKPASS: '/usr/local/lib/agent-harness/forgejo-askpass.sh',
       GIT_TERMINAL_PROMPT: '0',
       FORGEJO_PUSH_TOKEN: '${FORGEJO_PUSH_TOKEN}',
       SCRUM4ME_AGENT_WORKTREE_DIR: '/var/lib/agent-harness/worktrees',
