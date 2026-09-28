@@ -1,8 +1,8 @@
 ---
 title: "Agent-harness M4 — harness-runs volgen in Worker Logs"
-status: draft
+status: reviewed
 last_updated: 2026-09-28
-revision: 2
+revision: 3
 ---
 
 # Agent-harness M4 — harness-runs volgen in Worker Logs
@@ -110,7 +110,7 @@ Het voorvoegsel `step` voorkomt dat vrije tekst per ongeluk begint met een ander
 |---|---|---|
 | `harness.run_start` | `runId`, `model`, `baseUrl`, `tools` (namen), `mcpServers`, `cwd`, `version` | `system-init`: model, tools, mcpServers, sessionId = runId, cwd, version; permissionMode `—` |
 | `harness.turn` | `turn`, `durationMs`, `finishReason`, `usageSource` (`provider_reported` of `missing`), `usage {input, output, cached?}`, `promptEstimate?`, `reasoning?` + `reasoningTruncated?`, `content?` + `contentTruncated?`, `systemFingerprint?` | `thinking` (reasoning), `assistant-text` (content, alleen als niet leeg) en een `raw`-regel `turn <n> · <s> s · in <x> · cached <y> · out <z> · <finish>`. `in` en `out` staan er alleen bij `usageSource` `provider_reported` (anders zou een ontbrekende meting als 0 lezen, `model-client.ts:36-42`); `cached` alleen als de server die waarde meldde |
-| `harness.tool_call` | `callId`, `name`, `arguments` (string) + `argumentsTruncated?` | `tool-call`, id = callId. Argumenten die als JSON-object parsen worden opgemaakt; al het andere (ongeldige JSON, `null`, een getal of string) wordt `{"arguments": "<ruwe string>"}`, want de ingest zet de invoer als JSON-waarde in `payload` (`ingest-worker-log.ts:84-91,141-151`) en `null` weigert die kolom |
+| `harness.tool_call` | `callId`, `name`, `arguments` (string) + `argumentsTruncated?` | `tool-call`, id = callId. Argumenten die als JSON-object parsen worden opgemaakt; al het andere (ongeldige JSON, `null`, een getal, een string of een array) wordt `{"arguments": "<ruwe string>"}`, want de ingest zet de invoer als JSON-waarde in `payload` (`ingest-worker-log.ts:84-91,141-151`) en `null` weigert die kolom |
 | `harness.tool_result` | `callId`, `ok`, `errorCode?`, `content` + `contentLength` | `tool-result`: isError = !ok; body met `[<errorCode>] ` ervoor als die er is; fullLength = contentLength, de lengte van de volledige tooluitvoer (`fullContent` als die er is, anders `content`) |
 | `harness.container` | `n`, `kind`, `source`, `exitCode`, `timedOut`, `durationMs`, `outputTail`, `outputLength` | Bij `prepare` en `gate`: `tool-call` (name `container:<kind>/<source>`, id `container-<n>`) plus `tool-result` (body = outputTail, isError = exitCode ≠ 0 of timedOut; `outputLength` is de lengte van de bewaarde staart). Bij `run_tests` alleen een `raw`-regel, want die uitvoer staat al in het tool-result van de modelaanroep |
 | `harness.compacted` | `turn`, `messages`, `bytes`, `estimateBefore`, `estimateAfter` | `raw` |
@@ -147,11 +147,16 @@ De parser zet `truncated` als hij zelf afkapt of als de regel de vlag draagt. Me
 | Onverwachte fout in de job | `failed` | `ERROR HARNESS_ERROR: <bericht>` | 1 |
 | Harde crash (SIGKILL, OOM) of een tweede SIGINT/SIGTERM (`src/cli.ts:143`: `process.exit(130)` slaat elke `finally` over) | — | — | geen blok: de run blijft `running` in de tabel. Er is geen apart overzicht voor; het bestaande "vastgelopen runs" telt herhaalde toolfouten binnen één run |
 
-**Foutcodes.** De handler geeft code en bericht door met `RunLog.fail(code, bericht)`, op de plek waar hij de reden al kent: `failPath`, `closeFailed`, `abandon`, `uncertainPath` en de claim-filtercontrole. De laatste `fail` vóór het einde telt. Codes:
+**Foutcodes.** De handler geeft code en bericht door met `RunLog.fail(code, bericht)`, op de plek waar hij de reden al kent: `failPath`, `closeFailed`, `abandon`, `uncertainPath` en de claim-filtercontrole.
+- `failPath` en `closeFailed` krijgen de code als parameter, en `failPath` geeft hem door aan `closeFailed` (`task-impl.ts:289`). Een latere `fail()` vervangt een eerdere alleen als hij uit `abandon` of `uncertainPath` komt; zo blijft bijvoorbeeld `VERIFY_FAILED` staan.
+- De plekken die nu een uitkomst teruggeven zonder een van die functies, roepen `fail()` zelf aan: `running` geweigerd (`task-impl.ts:199-201`, `worker.ts:132-135`, code `ABANDONED`), eigendom kwijt in idee-chat (`worker.ts:174-177`, `ABANDONED`), uitkomst van `done` onbekend (`task-impl.ts:410-415`, `DONE_UNKNOWN`) en `done` die na een pushfout als FAILED eindigde (`task-impl.ts:426-427`, `DONE_ENDED_FAILED`).
+- Is de uitkomst niet `done` en is er geen `fail()` geweest, dan schrijft `end()` `JOB_FAILED` of `ABANDONED` met een vaste tekst.
+
+Codes:
 - de `ErrorCode` van de modelloop als die faalde (bijvoorbeeld `VERIFY_FAILED`, `CONTEXT_EXHAUSTED`, `MODEL_ERROR`, `TOO_MANY_TOOL_ERRORS`), of `BUDGET_EXCEEDED` en `TIMED_OUT` bij die statussen;
 - vóór de modelloop: `PAYLOAD_INVALID`, `NO_TASK_CONFIG`, `CONTAINERS_LEFTOVER`, `GIT_SCAN_FAILED`, `NO_RECIPE`, `PREPARE_FAILED`;
 - na de modelloop: `GIT_ADMIN_CHANGED`, `COMMIT_FAILED`, `NO_CHANGES`, `PLAN_CHECK_FAILED`, `DONE_REFUSED`;
-- verder: `STOPPED` (service gestopt tijdens de job), `ABANDONED` (eigendom kwijt), `DONE_UNKNOWN` (uitkomst van `done` onbekend), `CONTAINER_UNCERTAIN`, `CLAIM_FILTER` en `HARNESS_ERROR`;
+- verder: `STOPPED` (service gestopt tijdens de job), `ABANDONED` (eigendom kwijt), `DONE_UNKNOWN` (uitkomst van `done` onbekend), `DONE_ENDED_FAILED`, `CONTAINER_UNCERTAIN`, `CLAIM_FILTER` en `HARNESS_ERROR`;
 - `JOB_FAILED` als restcategorie.
 
 Het plan koppelt elke aanroepplek in `task-impl.ts` en `worker.ts` aan een code.
@@ -197,6 +202,7 @@ Het plan koppelt elke aanroepplek in `task-impl.ts` en `worker.ts` aan een code.
 - `runOneJob` (`worker.ts:101`) opent het run-log direct na de claim, schrijft `claimed` en `config`, en geeft het door aan `runIdeaChatJob` en `runTaskJob`.
 - Die handlers geven het run-log mee aan hun trace, schrijven hun jobstappen als `step …` (naast de bestaande regel in journald) en roepen `fail()` aan op hun foutplekken (§5.6).
 - `runOneJob` sluit af volgens §5.6. Bij `ClaimFilterError` en `ContainerUncertainError` staat de code al via `fail()`; het `finally` schrijft het blok, daarna gaat de fout verder zoals nu.
+- Elke andere uitzondering uit de handler vangt `runOneJob` op: `fail('HARNESS_ERROR', bericht)`, uitkomst `failed`, het `finally` schrijft het blok, en daarna gaat de oorspronkelijke fout verder naar de bestaande afhandeling in de worker-lus (`worker.ts:219-232`).
 
 ### 6.5 Config (`src/worker/config.ts`)
 
@@ -224,7 +230,7 @@ Het plan koppelt elke aanroepplek in `task-impl.ts` en `worker.ts` aan een code.
    - Rol uit op max2 met de flow `redeploy_ops_dashboard`.
    - Bij de volgende ingest-ronde verschijnt de run uit stap 1, omdat hij nog niet als afgesloten was ingelezen.
 3. **Taakjob.** Een echte kleine taak via `dispatch_job` met `required_capability: 'local_llm'`.
-4. **Mislukte job en triage.** Met het altijd-rode recept uit M3-criterium 2 (een tijdelijke configwijziging), of de eerstvolgende echte fout. Na de ingest start JP de triage-service `worker-insights-triage.service` op scrum4me-srv (de timer draait alleen daar) en leest het `WorkerInsight` van de run terug; tijden en selectie worden vastgelegd. Een triage binnen een vaste tijd is geen eis van deze stap (§11).
+4. **Mislukte job en triage.** Met het altijd-rode recept uit M3-criterium 2 (een tijdelijke configwijziging), of de eerstvolgende echte fout. Na de ingest start JP de triage-service `worker-insights-triage.service` op scrum4me-srv (de timer draait alleen daar) en leest het `WorkerInsight` van de run terug. Een ronde neemt hooguit tien kandidaten, zonder vaste volgorde (`triage.ts:101-108,148`); heeft de run nog geen oordeel, dan wordt de start herhaald, hooguit vijf keer, tot de run een `WorkerInsight` heeft of een ronde niets meer verwerkt. Het aantal starts en de tijden worden vastgelegd; ontbrekende configuratie wordt gemeld in plaats van omzeild. Een triage binnen een vaste tijd is geen eis van deze stap (§11).
 
 ## 9. Tests (zonder netwerk)
 
@@ -250,6 +256,8 @@ Het plan koppelt elke aanroepplek in `task-impl.ts` en `worker.ts` aan een code.
   - Een geslaagde modelloop gevolgd door een fout na de loop (commit, plancontrole, `done` geweigerd) geeft `outcome` `failed` met de juiste code.
   - Een uitzondering in de omzetting bereikt de modelloop en de job niet.
   - Een wachtwoord in `model.baseUrl` dat in geen omgeving staat, wordt gemaskeerd.
+  - De voorrang van `fail()`: `VERIFY_FAILED` uit `failPath` blijft staan na `closeFailed`; een latere `abandon` vervangt hem wel.
+  - Een geïnjecteerde onverwachte uitzondering in de handler geeft precies één blok met `HARNESS_ERROR` en laat het foutgedrag van de worker-lus ongewijzigd.
 - **Trace.** De nieuwe velden in `model_response`, en `containers/<n>.txt`.
 
 **Ops-dashboard** (`npm test`):
@@ -260,9 +268,9 @@ Het plan koppelt elke aanroepplek in `task-impl.ts` en `worker.ts` aan een code.
   Deze fixture bewijst dat schrijver en lezer het eens zijn over de werkelijke uitvoer. De foutpaden zijn kleine gevallen, afgeleid uit §5.6.
 - `META_RE` voor beide tags, en de done-regel met `harness`.
 - `running` zonder afsluitregels, en ook `running` bij `harness.run_end` en een `ERROR`-regel zonder `exit code=` (een groeiend bestand).
-- `error` met een `ERROR`-regel, en `error` met een `run_end` waarvan de status ≠ `completed`.
+- `error` met een `ERROR`-regel gevolgd door `exit code=1`, en `error` met een `harness.run_end` waarvan `outcome` ≠ `done`, gevolgd door `exit code=1`.
 - Een onbekend `harness.*`-type wordt raw.
-- Argumenten `null`, een getal of ongeldige JSON worden `{"arguments": …}`.
+- Argumenten `null`, een getal, een JSON-string, een array of ongeldige JSON worden `{"arguments": …}`; alleen een JSON-object wordt opgemaakt.
 - Het geschoonde run-log van de eerste echte taakjob (stap 3 van §8) wordt een tweede fixture zodra het bestaat; dat blokkeert stap 1 en 2 niet.
 - De bestaande Claude- en Codex-tests blijven groen.
 
@@ -270,8 +278,12 @@ Het plan koppelt elke aanroepplek in `task-impl.ts` en `worker.ts` aan een code.
 
 1. Na een idee-chat-job op max2 staat, binnen 5 minuten na de uitrol van het Ops-dashboard, een `WorkerRun` met pool `harness`, host `max2` en status success, met `job_id`, `model`, `num_turns` en `duration_ms`. Het detail in scrum4me-workers toont denk-tekst, antwoord, toolblokken en de meetregel per beurt.
 2. Een taakjob toont daarnaast `worktree path=`, containerblokken voor prepare en gate met uitvoer, de `run_tests`-regels en de jobstappen: commit, push en jobstatus.
-3. Een mislukte job staat op status error met `error_summary` `<CODE>: …`. Na de ingest start JP de triage-service op scrum4me-srv; daarna heeft de run een `WorkerInsight`.
-4. Geen geheim komt voor in de run-logs. Voor elke variabele in `worker.env` en de MCP-omgeving waarvan de naam op het redactiepatroon matcht, geeft `grep -F` op de waarde over `/srv/scrum4me/worker-logs/harness` 0 treffers. Daarnaast een eenmalige controle op alleen de namen: elke variabele in `worker.env` die een geheim bevat, matcht op dat patroon. De controle draait op max2 en toont geen waarden.
+3. Een mislukte job staat op status error met `error_summary` `<CODE>: …`. Na de ingest start JP de triage-service op scrum4me-srv, zo nodig herhaald zoals in §8 stap 4; daarna heeft de run een `WorkerInsight`.
+4. Geen geheim komt voor in de run-logs. Per variabele in `worker.env` en de MCP-omgeving, over `/srv/scrum4me/worker-logs/harness`:
+   - matcht de naam op het redactiepatroon, dan geeft `grep -F` op de hele waarde 0 treffers;
+   - is de waarde een URL met wachtwoord (zoals `DATABASE_URL` en `DIRECT_URL`, `docs/runbooks/idea-chat-worker.md:29`), dan geeft `grep -F` op dat wachtwoord, ruw en gedecodeerd, 0 treffers.
+
+   Daarnaast een eenmalige controle op alleen de namen: elke variabele die een geheim bevat, valt onder een van beide regels. De controle draait op max2 en toont geen waarden.
 5. Tussen stap 1 en stap 2 van §8 geeft de ingest geen fouten op het harness-bestand.
 6. Bestaande Claude- en Codex-runs worden ongewijzigd geparst: de tests zijn groen, en na de uitrol verschijnen nieuwe idea- en codex-runs zoals voorheen.
 
@@ -309,3 +321,16 @@ Bevindingen, allemaal gecontroleerd tegen de bomen en overgenomen:
 - **MINOR codex:** de resultaatkaart in scrum4me-workers toont geen duur of beurten → verduidelijkt (§5.4).
 
 Afgewezen: geen. Scope: toegevoegd zijn foutcodes met `fail()`, het afsluitblok in één schrijfactie, de afsluitregel voor harness-logs, `model.baseUrl` in de redactie en een gecontroleerde triageproef; de `wx`-poging is teruggebracht tot één. Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
+
+### Ronde 2 — revisie 2 (`354d752`), 2026-09-28
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 4 MINOR; GO) en `mac:codex` (0 BLOCKER, 0 MAJOR, 3 MINOR; GO). Beide: de reparaties uit ronde 1 houden stand (de afsluitmarkering, `META_RE` op beide aanroepplekken, redactie van `model.baseUrl`, instance per host, robuustheid); geen onderdeel om te schrappen.
+
+MINOR-bevindingen, gecontroleerd en verwerkt in revisie 3 zonder nieuwe ronde, want het zijn verduidelijkingen binnen de bestaande scope:
+- **claude:** "de laatste `fail` telt" verloor de specifieke code, en vijf returnplekken riepen geen foutfunctie aan → voorrangsregel, `fail()` op die plekken, terugvalcode in `end()`, `DONE_ENDED_FAILED` (§5.6).
+- **codex:** een onverwachte uitzondering had geen expliciete classificatie → `catch` in `runOneJob` met `HARNESS_ERROR`, daarna de fout ongewijzigd verder (§6.4, §9).
+- **beide:** één handmatige triagestart garandeert de selectie niet → begrensde herhaling (hooguit vijf starts) met vastlegging (§8, §10).
+- **claude:** criterium 4 faalde op `DATABASE_URL` en `DIRECT_URL`, waarvan de naam niet matcht maar het URL-wachtwoord wel wordt gemaskeerd → criterium naar beide regels herschreven (§10).
+- **beide:** testregels liepen achter op het nieuwe contract → `outcome` ≠ `done` met `exit code=1`; JSON-string en array bij de argumenten (§5.4, §9).
+
+Afgewezen: geen. Scope: onveranderd; alleen verduidelijkingen.
