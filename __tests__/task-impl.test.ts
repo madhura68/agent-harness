@@ -12,6 +12,7 @@ import { WorkerConfigSchema } from '../src/worker/config.js'
 import type { SpawnFn } from '../src/worker/containers.js'
 import { createControlChannel } from '../src/worker/control.js'
 import { commitAll, snapshotGitAdmin } from '../src/worker/host-git.js'
+import { openRunLog } from '../src/worker/run-log.js'
 import { buildSummary, renderTaskPrompt, TaskPayloadSchema } from '../src/worker/task-impl.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
@@ -224,6 +225,7 @@ async function setup(s: Setup = {}) {
   }
   const docker = fakeDocker(s.docker)
   const out = tmp('out')
+  const runLogDir = tmp('runlog')
   const logs: string[] = []
   const client = mcp.client
   const deps: WorkerDeps = {
@@ -238,9 +240,13 @@ async function setup(s: Setup = {}) {
     errorBackoffMs: 0,
     log: (line) => logs.push(line),
     taskDeps: { spawn: docker.spawn, killGraceMs: 20, cleanupTimeoutMs: 500 },
+    // M4 Taak 5: a real run-log writer on every test (best-effort — spec §6.3 — so it must never change a
+    // job outcome). Taak 6 adds the task-job-specific run-log assertions; this task only wires it through.
+    runLogFor: (claim) =>
+      openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, { jobId: claim.jobId, kind: claim.kind, model: config.model, version: 'agent-harness@test', secrets: [] }),
   }
   const branchSha = () => git(cloneDir, ['rev-parse', 'feature1'])
-  return { deps, out, logs, mcp, model, docker, worktree, cloneDir, baseSha, branchSha, run: () => runWorker(deps) }
+  return { deps, out, runLogDir, logs, mcp, model, docker, worktree, cloneDir, baseSha, branchSha, run: () => runWorker(deps) }
 }
 
 const write = (path: string, content: string, id = 'w1'): FakeTurn => ({

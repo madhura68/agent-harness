@@ -9,6 +9,7 @@ import type { ClaimResult, LogArgs, StatusUpdate } from './control.js'
 import { buildScript, containerName, killLeftoverContainers, runInContainer } from './containers.js'
 import { startHeartbeat } from './heartbeat.js'
 import { commitAll, diffGitAdmin, snapshotGitAdmin, type GitAdminSnapshot } from './host-git.js'
+import type { RunLog } from './run-log.js'
 import { createTaskTools, type VerifyRun } from './task-tools.js'
 import type { JobOutcome, WorkerDeps } from './worker.js'
 
@@ -152,7 +153,7 @@ function runIdFor(jobId: string): string {
  * goes through one failure path without git; a lost heartbeat ends everything without updates; a container
  * that was not provably stopped throws ContainerUncertainError.
  */
-export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobContext = {}): Promise<JobOutcome> {
+export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobContext = {}, runLog: RunLog | null = null): Promise<JobOutcome> {
   const { control, config } = deps
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const { jobId } = claim
@@ -168,7 +169,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   const runId = runIdFor(jobId)
   let trace: TraceWriter
   try {
-    trace = openTrace(deps.out, runId)
+    trace = runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId)
   } catch (err) {
     return closeFailed(`harness: ${message(err)}`)
   }
@@ -179,6 +180,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     return closeFailed(`payload ongeldig: ${parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')}`)
   }
   const p = parsed.data
+  runLog?.worktree(p.worktree_path)
   const task = config.task
   if (!task) return closeFailed('worker heeft geen task-config')
   const containersClean = ctx.containersClean ?? (async () => (await killLeftoverContainers(deps.taskDeps)) === 'clean')

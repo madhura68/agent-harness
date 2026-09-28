@@ -12,6 +12,8 @@ import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
 import { loadWorkerConfig, workerMcpEnv } from './worker/config.js'
 import { createControlChannel } from './worker/control.js'
+import { collectSecretValues, workerSecretSources } from './worker/redact.js'
+import { openRunLog } from './worker/run-log.js'
 import { runWorker } from './worker/worker.js'
 
 const USAGE = `harness — agent-harness v0
@@ -128,6 +130,15 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
   return result.status === 'completed' ? 0 : 1
 }
 
+/**
+ * `agent-harness@<version>` from package.json (run-log spec §5.4). The relative path resolves both from
+ * `src/cli.ts` (tsx, vitest) and from the built `dist/cli.js`, since both sit one level under the repo root.
+ */
+function harnessVersion(): string {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown }
+  return `agent-harness@${typeof pkg.version === 'string' ? pkg.version : '0'}`
+}
+
 async function cmdWorker(values: Values): Promise<number> {
   if (!values.config) throw new UsageError('worker needs --config')
   const out = values.out ?? 'runs'
@@ -135,6 +146,10 @@ async function cmdWorker(values: Values): Promise<number> {
   if (values['skip-probe'] !== true && !passesProbeGate(config.model, out)) return 1
   // Expand ${VAR} before anything starts; the values only travel to the MCP child process.
   const env = workerMcpEnv(config)
+  // Computed once per worker run, not per job: the version never changes mid-run, and re-scanning every
+  // secret source on every claim would be wasted work.
+  const version = harnessVersion()
+  const secrets = collectSecretValues(...workerSecretSources(config, process.env))
 
   const stop = new AbortController()
   let interrupts = 0
@@ -158,6 +173,7 @@ async function cmdWorker(values: Values): Promise<number> {
       out,
       once: values.once === true,
       signal: stop.signal,
+      runLogFor: (claim) => openRunLog(config.workerLog, { jobId: claim.jobId, kind: claim.kind, model: config.model, version, secrets }),
     })
     process.stdout.write(`worker klaar — ${jobs.length} job(s): ${jobs.map((j) => `${j.jobId}=${j.outcome}`).join(', ') || 'geen'}\n`)
     return exitCode

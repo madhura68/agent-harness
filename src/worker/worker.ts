@@ -8,6 +8,7 @@ import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
 import { startHeartbeat } from './heartbeat.js'
 import { IDEA_CHAT_SYSTEM_PROMPT, IdeaChatPayloadSchema, pendingUserMessages, renderIdeaChatUserMessage } from './idea-chat.js'
+import type { RunLog } from './run-log.js'
 import { ContainerUncertainError, runTaskJob, type TaskJobContext } from './task-impl.js'
 
 export type WorkerDeps = {
@@ -26,6 +27,8 @@ export type WorkerDeps = {
   log?: (line: string) => void
   /** Test seam for the task containers (fake docker); production passes nothing. */
   taskDeps?: ContainerDeps
+  /** Opens the run-log for a claimed job (spec §6.4); no field, or a null return, means no run-log (as before M4). */
+  runLogFor?: (claim: Claim) => RunLog | null
 }
 
 export type JobOutcome = 'done' | 'failed' | 'abandoned' // abandoned = no longer ours, nothing closed
@@ -97,13 +100,39 @@ function closingUpdate(result: RunResult, config: WorkerConfig): StatusUpdate {
   return { status: 'failed', error: cut(failureText(result, config), ERROR_LIMIT) }
 }
 
-/** Routes a claim by kind: IDEA_CHAT and TASK_IMPLEMENTATION; anything else is a claim-filter breach. */
-export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJobContext): Promise<JobOutcome> {
-  if (claim.kind === 'TASK_IMPLEMENTATION') return runTaskJob(deps, claim, taskCtx)
-  return runIdeaChatJob(deps, claim)
+/**
+ * The RunLog.fail() code for a `failed` StatusUpdate coming out of closingUpdate (spec §5.6, table row
+ * "closingUpdate geeft failed"): a completed run only turns into `failed` on an empty answer (JOB_FAILED);
+ * an incomplete run uses the model loop's own error code, falling back to the budget/timeout status.
+ */
+function ideaChatFailCode(result: RunResult): string {
+  if (result.status === 'completed') return 'JOB_FAILED'
+  if (result.error) return result.error.code
+  if (result.status === 'budget_exceeded') return 'BUDGET_EXCEEDED'
+  if (result.status === 'timed_out') return 'TIMED_OUT'
+  return 'JOB_FAILED'
 }
 
-async function runIdeaChatJob(deps: WorkerDeps, claim: Claim): Promise<JobOutcome> {
+/** Routes a claim by kind: IDEA_CHAT and TASK_IMPLEMENTATION; anything else is a claim-filter breach. */
+export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJobContext): Promise<JobOutcome> {
+  const started = Date.now()
+  const runLog = deps.runLogFor?.(claim) ?? null
+  let outcome: JobOutcome = 'failed'
+  try {
+    outcome = claim.kind === 'TASK_IMPLEMENTATION'
+      ? await runTaskJob(deps, claim, taskCtx, runLog)
+      : await runIdeaChatJob(deps, claim, runLog)
+    return outcome
+  } catch (err) {
+    if (err instanceof ContainerUncertainError) outcome = err.outcome
+    else if (!(err instanceof ClaimFilterError)) runLog?.fail('HARNESS_ERROR', err instanceof Error ? err.message : String(err))
+    throw err // de worker-lus handelt de fout af zoals nu
+  } finally {
+    runLog?.end(outcome, Date.now() - started)
+  }
+}
+
+async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | null): Promise<JobOutcome> {
   const { control, config } = deps
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const { jobId } = claim
@@ -111,28 +140,36 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim): Promise<JobOutcom
   const close = async (update: StatusUpdate): Promise<JobOutcome> => {
     const res = await control.updateStatus(jobId, update)
     if (!res.ok) log(`job ${jobId}: update_job_status(${update.status}) mislukt: ${res.message ?? 'onbekend'}`)
+    runLog?.step(`job_status ${update.status === 'done' ? 'done' : 'failed'}`)
     return update.status === 'done' ? 'done' : 'failed'
   }
 
   // Second lock behind the claim filter: this worker runs IDEA_CHAT and TASK_IMPLEMENTATION only.
   if (claim.kind !== 'IDEA_CHAT') {
+    runLog?.fail('CLAIM_FILTER', `kind ${claim.kind} niet ondersteund door agent-harness`)
     await close({ status: 'failed', error: `kind ${claim.kind} niet ondersteund door agent-harness` })
     throw new ClaimFilterError(`kind ${claim.kind}`)
   }
   const parsed = IdeaChatPayloadSchema.safeParse(claim.payload)
   if (!parsed.success) {
     const issues = parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')
+    runLog?.fail('CLAIM_FILTER', `payload ongeldig: ${issues}`)
     await close({ status: 'failed', error: cut(`payload ongeldig: ${issues}`, ERROR_LIMIT) })
     throw new ClaimFilterError(`payload ongeldig (${issues})`)
   }
   const payload = parsed.data
-  if (pendingUserMessages(payload).length === 0) return close({ status: 'failed', error: 'geen onbeantwoord USER-bericht' })
+  if (pendingUserMessages(payload).length === 0) {
+    runLog?.fail('JOB_FAILED', 'geen onbeantwoord USER-bericht')
+    return close({ status: 'failed', error: 'geen onbeantwoord USER-bericht' })
+  }
 
   const running = await control.updateStatus(jobId, { status: 'running' })
   if (!running.ok) {
     log(`job ${jobId}: niet (meer) van deze worker (${running.message ?? 'onbekend'}); overgeslagen`)
+    runLog?.fail('ABANDONED', `niet (meer) van deze worker (${running.message ?? 'onbekend'})`)
     return 'abandoned'
   }
+  runLog?.step('job_status running')
 
   const inner = new AbortController()
   const onStop = () => inner.abort()
@@ -145,6 +182,7 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim): Promise<JobOutcom
   })
 
   let update: StatusUpdate
+  let failInfo: { code: string; message: string } | undefined
   try {
     const runId = runIdFor(jobId)
     const manifest: Manifest = {
@@ -158,14 +196,17 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim): Promise<JobOutcom
     }
     const result = await runManifest(manifest, {
       client: deps.modelClient,
-      trace: openTrace(deps.out, runId),
+      trace: runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId),
       connectRegistry: (signal) => deps.registryView(signal),
       signal: inner.signal,
       runStartExtra: { jobId, ideaId: payload.idea.id },
     })
     update = closingUpdate(result, config)
+    if (update.status === 'failed') failInfo = { code: ideaChatFailCode(result), message: update.error ?? '' }
   } catch (err) {
-    update = { status: 'failed', error: cut(`harness: ${err instanceof Error ? err.message : String(err)}`, ERROR_LIMIT) }
+    const msg = err instanceof Error ? err.message : String(err)
+    update = { status: 'failed', error: cut(`harness: ${msg}`, ERROR_LIMIT) }
+    failInfo = { code: 'HARNESS_ERROR', message: msg }
   } finally {
     stopBeat()
     deps.signal.removeEventListener('abort', onStop)
@@ -173,10 +214,17 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim): Promise<JobOutcom
 
   if (lost) {
     log(`job ${jobId}: eigendom kwijt tijdens de beurt (heartbeat geweigerd); niets afgesloten`)
+    runLog?.fail('ABANDONED', 'eigendom kwijt tijdens de beurt (heartbeat geweigerd)')
     return 'abandoned'
   }
   // A stop that lands after a completed turn keeps the answer.
-  if (deps.signal.aborted && update.status !== 'done') update = { status: 'failed', error: 'worker gestopt' }
+  if (deps.signal.aborted && update.status !== 'done') {
+    update = { status: 'failed', error: 'worker gestopt' }
+    failInfo = { code: 'STOPPED', message: 'worker gestopt' }
+  }
+  // The code is only recorded now, after the possible STOPPED override (spec §6.4): fail() keeps the first
+  // code, so recording the run's own code any earlier would block STOPPED from ever taking over.
+  if (update.status !== 'done' && failInfo) runLog?.fail(failInfo.code, failInfo.message)
   const outcome = await close(update)
   log(`job ${jobId}: ${outcome}`)
   return outcome

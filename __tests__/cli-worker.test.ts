@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ServerSpec } from '../src/types.js'
@@ -48,6 +48,7 @@ afterEach(async () => {
   model = undefined
   fakeMcp = undefined
   delete process.env.SCRUM4ME_TOKEN
+  delete process.env.TEST_HARNESS_SECRET
 })
 
 function workerConfig(dir: string, baseUrl: string, over: Record<string, unknown> = {}) {
@@ -126,6 +127,75 @@ describe('harness worker', () => {
     expect(readdirSync(out).some((n) => n.startsWith('job-job1-'))).toBe(true)
     expect(dirContains(out, 'sk-test-secret')).toBe(false)
     expect(stderr.join('')).not.toContain('sk-test-secret')
+  })
+
+  it('writes a run-log under <dir>/harness/max2/runs/ with the package.json version, when workerLog is configured (M4 Taak 5)', async () => {
+    model = await startFakeModelServer([{ body: completion({ content: 'Hier is je antwoord.', model: 'qwen3-coder:30b' }) }])
+    const dir = tmp('cli-worker')
+    const out = join(dir, 'runs')
+    writeProbe(out, model.baseUrl)
+    process.env.SCRUM4ME_TOKEN = 'sk-test-secret'
+    claims = [{ job: ideaChatPayload() }]
+    const logDir = join(dir, 'worker-logs')
+    const code = await main(['worker', '--config', workerConfig(dir, model.baseUrl, { workerLog: { dir: logDir, pool: 'harness', instance: 'max2' } }), '--out', out, '--once'])
+    expect(code).toBe(0)
+    const runsDir = join(logDir, 'harness', 'max2', 'runs')
+    const files = readdirSync(runsDir).filter((f) => f.endsWith('.log'))
+    expect(files).toHaveLength(1)
+    const lines = readFileSync(join(runsDir, files[0]), 'utf8').trim().split('\n')
+    const runStart = lines.filter((l) => l.startsWith('{')).map((l) => JSON.parse(l)).find((j) => j.type === 'harness.run_start')
+    const pkgVersion = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
+    expect(runStart.version).toBe(`agent-harness@${pkgVersion}`)
+  })
+
+  it('redacts a process-env secret, the expanded MCP token and model.apiKey from the run-log, leaving *** in their place (M4 Taak 5; a baseUrl password is covered by the Taak 3/4 tests instead, since the model call never reaches a turn)', async () => {
+    const dir = tmp('cli-worker')
+    const out = join(dir, 'runs')
+    const envSecret = 'proc-env-secret-fake-9001'
+    const tokenSecret = 'mcp-env-token-fake-9002'
+    const apiKeySecret = 'model-api-key-fake-9003'
+    process.env.TEST_HARNESS_SECRET = envSecret
+    process.env.SCRUM4ME_TOKEN = tokenSecret
+    model = await startFakeModelServer([
+      {
+        body: {
+          id: 'chatcmpl-fake',
+          object: 'chat.completion',
+          model: 'qwen3-coder:30b',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: `antwoord met ${envSecret} en ${tokenSecret} en ${apiKeySecret}`, reasoning: `denkt aan ${envSecret}, ${tokenSecret} en ${apiKeySecret}` },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 5 },
+        },
+      },
+    ])
+    writeProbe(out, model.baseUrl)
+    claims = [{ job: ideaChatPayload() }]
+    const logDir = join(dir, 'worker-logs')
+    const code = await main([
+      'worker',
+      '--config',
+      workerConfig(dir, model.baseUrl, {
+        model: { baseUrl: model.baseUrl, name: 'qwen3-coder:30b', apiKey: apiKeySecret },
+        workerLog: { dir: logDir, pool: 'harness', instance: 'max2' },
+      }),
+      '--out',
+      out,
+      '--once',
+    ])
+    expect(code).toBe(0)
+    const runsDir = join(logDir, 'harness', 'max2', 'runs')
+    const files = readdirSync(runsDir).filter((f) => f.endsWith('.log'))
+    expect(files).toHaveLength(1)
+    const text = readFileSync(join(runsDir, files[0]), 'utf8')
+    expect(text).not.toContain(envSecret)
+    expect(text).not.toContain(tokenSecret)
+    expect(text).not.toContain(apiKeySecret)
+    expect(text).toContain('***')
   })
 
   it('closes the MCP connection itself before returning, so systemd stop does not have to (Fix 2)', async () => {
