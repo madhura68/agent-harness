@@ -56,7 +56,9 @@ export function normalizeRepoUrl(url: string): string {
     u.host = u.host.toLowerCase()
     out = u.toString().replace(/\/+$/, '')
   } catch {
-    // Not a parseable URL (e.g. an scp-like git remote): fall back to the trimmed string as-is.
+    // Not a parseable URL (e.g. an scp-like git remote): lowercase the host between an optional user@ and the first ':'.
+    const scp = out.match(/^([^@/]+@)?([^:/]+):(.+)$/)
+    if (scp) out = `${scp[1] ?? ''}${scp[2].toLowerCase()}:${scp[3]}`
   }
   return out
 }
