@@ -297,6 +297,13 @@ describe('meta / step / worktree', () => {
     expect(lines[lines.length - 1]).toBe('2026-09-28T10:00:00.000Z [harness] before after')
   })
 
+  it('folds U+2028 and U+2029 to a space in meta text', () => {
+    const rl = openRunLog(cfg(), baseInit({ now: () => new Date('2026-09-28T10:00:00.000Z') }))!
+    rl.meta('a\u2028b\u2029c')
+    const lines = readLogLines()
+    expect(lines[lines.length - 1]).toBe('2026-09-28T10:00:00.000Z [harness] a b c')
+  })
+
   it('worktree() writes "worktree path=..." and overrides cwd used by a later harness.run_start', () => {
     const rl = openRunLog(cfg(), baseInit())!
     rl.worktree('/srv/worktrees/job-1')
@@ -782,6 +789,22 @@ describe('end()', () => {
     expect(lines[1]).toBe('2026-09-28T10:05:00.000Z [harness] ERROR JOB_FAILED: geen reden vastgelegd')
     expect(lines[2]).toBe('2026-09-28T10:05:00.000Z [harness] harness done job_id=job-9 exit_code=1 duration_ms=3000')
     expect(lines[3]).toBe('2026-09-28T10:05:00.000Z [harness] exit code=1')
+  })
+
+  it('failed: a lone \\r, U+2028 and U+2029 in the message stay on one ERROR line', () => {
+    const rl = openRunLog(cfg(), baseInit({ jobId: 'job-9', now: () => new Date('2026-09-28T10:05:00.000Z') }))!
+    rl.fail('VERIFY_FAILED', 'regel1\rregel2\u2028regel3\u2029regel4')
+    rl.end('failed', 100)
+    const lines = readLogLines().slice(-4)
+    expect(lines[1]).toBe('2026-09-28T10:05:00.000Z [harness] ERROR VERIFY_FAILED: regel1 regel2 regel3 regel4')
+    expect(lines[3]).toBe('2026-09-28T10:05:00.000Z [harness] exit code=1')
+  })
+
+  it('done: a line break in the job id is folded in the done line', () => {
+    const rl = openRunLog(cfg(), baseInit({ jobId: 'job\u20289', now: () => new Date('2026-09-28T10:05:00.000Z') }))!
+    rl.end('done', 5000)
+    const lines = readLogLines().slice(-2)
+    expect(lines[0]).toBe('2026-09-28T10:05:00.000Z [harness] harness done job_id=job 9 exit_code=0 duration_ms=5000')
   })
 
   it('failed with a prior fail(): uses that code/message instead of the default', () => {
