@@ -20,6 +20,8 @@ Recept voor `harness worker` met een `task`-blok ([spec](../specs/2026-09-27-tas
 
 Een sessie dispatcht zoals een gewone `TASK_IMPLEMENTATION`-job, met één toevoeging: `required_capability: 'local_llm'` (spec §5.1, alleen toegestaan bij die soort). Alleen taken op de default-branch komen in aanmerking — een taak die op ongemergd sprintwerk leunt hoort niet in de lokale wachtrij (spec §10). Status lezen gaat via de gewone taak-/jobtools; de taak zelf beheert de harness (`todo` → `in_progress` → `review`), niet de MCP.
 
+**Geen eigen `repo_url` als die gelijk is aan de product-repo.** Heeft de taak een `repo_url`, dan zoekt de MCP een repo-root onder `SCRUM4ME_REPO_ROOT_REPO_<repo-naam>`. Max2 heeft voor agent-harness alleen de product-sleutel `SCRUM4ME_REPO_ROOT_<product-id>`. Een taak met een expliciete agent-harness-`repo_url` faalt daardoor al bij de claim (`geen repo-root voor task.repo_url=… (local_llm vereist een expliciete SCRUM4ME_REPO_ROOT_*)`), zonder run-log. Zo ging het met T-44 op 2026-09-29. Laat `repo_url` leeg, dan gebruikt de MCP `product.repo_url`.
+
 ## Wat de worker doet (spec §4.3)
 
 1. Payload valideren, snapshot van de git-administratie in de worktree, recept kiezen op `task.repo_url ?? product.repo_url` (normalisatie: slash en `.git` weg, host lowercase). Geen recept → falen zonder dat er iets aan de taak wijzigt.
