@@ -51,6 +51,43 @@ Bewijs: job `cmujtwnbj001qvz7rn2ytmgct` (IDEA-224, 2026-09-27 13:02) DONE in 12 
 
 Aandachtspunten: het token is (nog) niet op Agent-harness gescopet; de MCP logt `MaxListenersExceededWarning` door een listener-lek in `wait_for_job` (ISS-8 op scrum4me-mcp, onschadelijk).
 
+## Run-logs in Worker Logs (M4)
+
+Sinds M4 ([spec](../specs/2026-09-28-harness-run-logging-design.md)) schrijft de worker per geclaimde job ook een run-log in het bestaande Worker-Log-formaat (hetzelfde formaat als de Claude- en Codex-runners), zodat harness-runs naast die runs in Worker Logs en Worker Insights verschijnen. Dit is een aparte, afgeleide en geredigeerde weergave; `trace.jsonl` in `/var/lib/agent-harness/runs/` blijft de volledige bron op max2 en verandert hierdoor niet.
+
+**Config.** Optioneel blok in `/etc/agent-harness/worker.json`:
+
+```json
+"workerLog": { "dir": "/srv/scrum4me/worker-logs", "pool": "harness", "instance": "max2" }
+```
+
+Zonder dit blok werkt de worker precies zoals vóór M4: geen run-log, verder geen andere wijziging. `pool` en `instance` moeten voldoen aan `^[A-Za-z0-9._-]{1,64}$`; de config controleert dat bij het opstarten. `dir` moet schrijfbaar zijn voor de service-user (`janpeter` op max2); zonder schrijfrecht faalt `openRunLog` stil (spec §6.3) en logt de worker per job precies één regel `run-log uitgeschakeld voor job …`, zonder de jobuitkomst te raken.
+
+**Waar de bestanden staan.** Eén bestand per geclaimde job: `<dir>/<pool>/<instance>/runs/<YYYYMMDDTHHMMSSZ>.log`, op max2 dus `/srv/scrum4me/worker-logs/harness/max2/runs/`. De bestandsnaam is het UTC-tijdstip direct ná de claim.
+
+**Snel controleren.**
+- Eerste twee regels (`head -2 <bestand>`): `claimed job_id=…` en `config job_id=… runtime=HARNESS kind=… model=… base_url=…`.
+- Is een run klaar: `tail -4 <bestand>` toont het afsluitblok — een `harness.run_end`-JSON-regel, bij een fout een `ERROR <CODE>: <bericht>`-regel, `harness done job_id=… exit_code=… duration_ms=…`, en als laatste `exit code=<0|1>`. **Alleen die laatste regel telt als afgesloten**; een bestand zonder `exit code=` hoort bij een nog lopende job, bij een harde crash die geen afsluitblok meer kon schrijven, of bij een mislukte schrijfpoging van het afsluitblok zelf (bijvoorbeeld een volle schijf of een verwijderde map) — in geen van die gevallen verandert dat de jobuitkomst (spec §5.6).
+- Alle jobstappen op een rij: `grep '\[harness\] step ' <bestand>`.
+
+**Controle op geheimen (spec §10 criterium 4).** Geen enkele waarde die de redactie hoort te raken — elke omgevingsvariabele in `/etc/agent-harness/worker.env` waarvan de naam matcht op `/(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE_KEY|_KEY$|DSN|CREDENTIAL)/i`, en het wachtwoord uit elke URL-waarde (zoals in `DATABASE_URL` en `DIRECT_URL`) — hoort **onveranderd** in een run-log voor te komen; `***` op die plek wel.
+
+`harness check-run-logs` doet deze controle geautomatiseerd, zonder ooit een waarde in argv, uitvoer of een log te zetten: hij leest de geheimen uit dezelfde vier bronnen als de redactie (`process.env`, de MCP-omgeving, `model.apiKey` en `model.baseUrl`), doorzoekt de run-logs recursief en drukt per geheim alleen de naam, het aantal treffers en of de waarde korter is dan 8 tekens af — nooit een waarde. Exitcode 1 bij minstens één treffer, en ook als er nul geheimen gecontroleerd zijn (dan draait hij waarschijnlijk zonder de service-omgeving). Draai het met de omgeving van de service, zodat er geen waarde in argv komt:
+
+```bash
+sudo systemd-run --wait --pipe --uid=janpeter -p EnvironmentFile=/etc/agent-harness/worker.env /usr/bin/node /home/janpeter/Development/agent-harness/dist/cli.js check-run-logs --config /etc/agent-harness/worker.json --dir /srv/scrum4me/worker-logs/harness
+```
+
+Een losse controle op alleen de namen (zonder een waarde te tonen): `sudo cut -s -d= -f1 /etc/agent-harness/worker.env` naast de lijst met redactiepatronen hierboven — elke naam die matcht hoort onder één van beide regels te vallen. De `-s` is verplicht: zonder die vlag drukt `cut -d= -f1` een regel zonder `=` in zijn geheel af, wat een waarde kan tonen; met `-s` wordt zo'n regel nooit afgedrukt. Deze controle zet nooit een waarde in argv, uitvoer of een log; alleen namen en tellingen.
+
+**Terugdraaien.** Verwijder het `workerLog`-blok uit `/etc/agent-harness/worker.json` (of zet de backup terug) en herstart de service:
+
+```bash
+sudo systemctl restart agent-harness-worker
+```
+
+Bestaande run-logs blijven staan; er is geen opruimstap of bewaartermijn voor harness-run-logs (spec §11).
+
 ## Lokaal draaien (Mac, ontwikkeling)
 
 Vereist de tunnel en de omgeving uit de voorwaarden hierboven.
@@ -59,6 +96,8 @@ Vereist de tunnel en de omgeving uit de voorwaarden hierboven.
 npm run dev -- worker --config examples/worker.json --out runs          # doorlopend
 npm run dev -- worker --config examples/worker.json --out runs --once   # één claim of één lege wachtronde
 ```
+
+`examples/worker.json` heeft sinds M4 een `workerLog`-blok dat naar `/srv/scrum4me/worker-logs` wijst (de padlocatie op max2). Die map bestaat lokaal op de Mac niet, dus print elke geclaimde job één regel `run-log uitgeschakeld voor job …` naar stderr; de job zelf loopt gewoon door (spec §6.3, geen andere wijziging). Verwijder het blok of wijs het naar een lokaal schrijfbare map om die regel te voorkomen.
 
 Draai lokaal niet tegelijk met de service zonder reden: beide claimen dezelfde jobs.
 

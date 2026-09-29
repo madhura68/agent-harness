@@ -7,12 +7,12 @@ export type TraceEvent =
   | { type: 'tool_snapshot'; names: string[]; hash: string }
   | { type: 'model_request'; turn: number; messages: number; tools: number; maxTokens: number; promptEstimate?: number }
   | { type: 'context_compacted'; turn: number; messages: number; bytes: number; estimateBefore: number; estimateAfter: number }
-  | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage }
+  | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage; reasoning?: string; durationMs: number; systemFingerprint?: string }
   | { type: 'tool_call'; callId: string; name: string; arguments: string; argumentsWasObject: boolean }
   | { type: 'tool_result'; callId: string; ok: boolean; errorCode?: ErrorCode; truncated: boolean; sha256: string; bytes: number }
   | { type: 'after_answer'; turn: number; outcome: 'accept' | 'retry' | 'fail' }
   // Written by the Task 11 task handler on the same trace as the run (prepare/verify containers around the gate).
-  | { type: 'container'; kind: 'prepare' | 'verify'; source: 'prepare' | 'run_tests' | 'gate'; exitCode: number | null; timedOut: boolean; durationMs: number }
+  | { type: 'container'; kind: 'prepare' | 'verify'; source: 'prepare' | 'run_tests' | 'gate'; n: number; exitCode: number | null; timedOut: boolean; durationMs: number; outputBytes: number }
   | { type: 'run_end'; status: RunStatus; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 // Exact spec §4.
@@ -29,6 +29,7 @@ export type RunResult = {
     turns: number
     toolCalls: number
     toolErrors: number
+    cachedTokens?: number
   }
   durationMs: number
   toolSnapshotHash?: string
@@ -38,6 +39,7 @@ export interface TraceWriter {
   readonly dir: string
   event(e: TraceEvent): void
   toolContent(callId: string, text: string): void
+  containerOutput(n: number, text: string): void
   result(r: RunResult): void
 }
 
@@ -62,6 +64,11 @@ export function openTrace(outDir: string, runId: string): TraceWriter {
       const toolsDir = join(dir, 'tools')
       mkdirSync(toolsDir, { recursive: true })
       writeFileSync(join(toolsDir, `${safeFileName(callId)}.txt`), text)
+    },
+    containerOutput(n, text) {
+      const containersDir = join(dir, 'containers')
+      mkdirSync(containersDir, { recursive: true })
+      writeFileSync(join(containersDir, `${n}.txt`), text)
     },
     result(r) {
       writeFileSync(join(dir, 'result.json'), JSON.stringify(r, null, 2) + '\n')

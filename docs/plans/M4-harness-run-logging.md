@@ -1,6 +1,6 @@
 # M4 — harness-runs volgen in Worker Logs: implementatieplan
 
-_Status: reviewed, revisie 8 (2026-09-28), dubbel GO in planronde 7. Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
+_Status: reviewed, revisie 9 (2026-09-28): dubbel GO in planronde 7, plus een doc-delta na de uitvoering (zie het review record). Een technisch GO autoriseert geen ceremonie, implementatie, merge of uitrol._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -205,7 +205,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
 | `run_end` | niets (spec §5.4) |
 | `result(runResult)` | `harness.loop_end {status, error?, turns, toolCalls, toolErrors, usageSource, inputTokens, outputTokens, cachedTokens?, durationMs}`; onthoud `answer` en `turns` voor `end` |
 
-- Elke string gaat door `redactDeep` vóór het afkappen (Global Constraints); daarna afkappen met de vlaggen `reasoningTruncated`, `contentTruncated`, `argumentsTruncated`, `answerTruncated` en de lengtes `contentLength` (volledige tooluitvoer) en `outputLength` (bewaarde staart).
+- Elke string gaat door `redactDeep` vóór het afkappen (Global Constraints); daarna afkappen met de vlaggen `reasoningTruncated`, `contentTruncated`, `argumentsTruncated`, `answerTruncated` en de lengtes `contentLength` (volledige tooluitvoer) en `outputLength` (de lengte vóór de grens van 8 192, spec §5.5).
 - `fail(code, message, {override})`: bewaart de eerste `fail`; een latere vervangt hem alleen met `override: true` (vanuit `abandon` en `uncertainPath`).
 - `end(outcome, durationMs)` schrijft het afsluitblok in één `appendFileSync`, precies één keer (een tweede aanroep doet niets), ook als eerdere schrijfacties mislukten:
 
@@ -552,3 +552,7 @@ Bevindingen, gecontroleerd tegen de bomen en overgenomen in revisie 8:
 Kanttekening claude, alleen over het reviewverzoek: de lijst aanroepers van `rollbackClaim` daarin was onvolledig. Het plan noemt geen lijst, en de conclusie dat ze allemaal binnen `wait_for_job` vallen, klopt.
 
 Afgewezen: geen. Scope: onveranderd; twee verduidelijkingen in de stopprocedure. Revisie 8 is niet opnieuw gereviewd: beide MINORs zijn uitvoeringsdetails zonder nieuwe eis.
+
+### Delta na de uitvoering — revisie 9, 2026-09-28
+
+Taak 4 noemde `outputLength` de lengte van de "bewaarde staart". De uitvoering las dat als de staart van 8 192 tekens, waardoor het veld geen afkapsignaal meer droeg; de eindreview van increment 1 ving dat. Taak 4 noemt nu de lengte vóór de grens, zoals spec §5.5 (revisie 4) en Taak 9 (`fullLength = outputLength`). Akkoord JP, 2026-09-28.

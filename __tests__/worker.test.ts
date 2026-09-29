@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -6,6 +6,7 @@ import { createModelClient } from '../src/model-client.js'
 import { createRegistryView } from '../src/tools/registry.js'
 import { createControlChannel } from '../src/worker/control.js'
 import { WorkerConfigSchema } from '../src/worker/config.js'
+import { openRunLog } from '../src/worker/run-log.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
@@ -48,6 +49,7 @@ async function setup(s: Setup) {
     waitSeconds: 1,
   })
   const out = tmp('worker')
+  const runLogDir = tmp('runlog')
   const logs: string[] = []
   const client = mcp.client
   const deps: WorkerDeps = {
@@ -61,12 +63,33 @@ async function setup(s: Setup) {
     heartbeatMs: s.heartbeatMs ?? 50,
     errorBackoffMs: 0,
     log: (line) => logs.push(line),
+    // M4 Taak 5: every test drives a real run-log writer (spec §6.3 is best-effort, so this must never
+    // change a job outcome); individual tests below override runLogFor for their own scenario.
+    runLogFor: (claim) =>
+      openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, { jobId: claim.jobId, kind: claim.kind, model: config.model, version: 'agent-harness@test', secrets: [] }),
   }
-  return { deps, out, logs, mcp, model, run: () => runWorker(deps) }
+  return { deps, out, runLogDir, logs, mcp, model, run: () => runWorker(deps) }
 }
 
 const controlCalls = (m: McpFake) => m.calls.filter((c) => c.name === 'update_job_status').map((c) => c.args)
 const job = (payload: unknown = ideaChatPayload()): ClaimStep => ({ job: payload })
+
+// ---- run-log helpers (M4 Taak 5) ----
+
+const runLogRunsDir = (dir: string): string => join(dir, 'harness', 'test', 'runs')
+
+function runLogLines(dir: string): string[] {
+  const runsDir = runLogRunsDir(dir)
+  const files = readdirSync(runsDir).filter((f) => f.endsWith('.log'))
+  expect(files).toHaveLength(1)
+  return readFileSync(join(runsDir, files[0]), 'utf8').trim().split('\n')
+}
+
+function runLogJsonLines(dir: string): Array<Record<string, unknown> & { type: string }> {
+  return runLogLines(dir)
+    .filter((l) => l.startsWith('{'))
+    .map((l) => JSON.parse(l))
+}
 
 describe('runWorker — a successful turn', () => {
   it('marks running, then done with the answer, model_id and tokens; writes the run dir', async () => {
@@ -510,5 +533,130 @@ describe('runWorker — review fixes', () => {
     u.deps.control = { ...u.deps.control, heartbeat: async () => { throw new Error('weg') } }
     const r2 = await u.run()
     expect(r2.jobs[0].outcome).toBe('abandoned')
+  })
+})
+
+describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
+  it('idea-chat done: claimed, config, harness.run_start/turn/loop_end, and a closing block with outcome done, exit code=0 and the answer', async () => {
+    const t = await setup({ claims: [job()], script: [answer('Zie de worker-runbook.', { usage: { prompt_tokens: 120, completion_tokens: 30 } })] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('done')
+    const lines = runLogLines(t.runLogDir)
+    expect(lines[0]).toMatch(/^\S+ \[harness\] claimed job_id=job1$/)
+    expect(lines[1]).toMatch(/^\S+ \[harness\] config job_id=job1 runtime=HARNESS kind=IDEA_CHAT model=qwen3-coder:30b base_url=/)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] step job_status running$/))
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] step job_status done$/))
+    const jsonTypes = runLogJsonLines(t.runLogDir).map((j) => j.type)
+    expect(jsonTypes).toEqual(expect.arrayContaining(['harness.run_start', 'harness.turn', 'harness.loop_end', 'harness.run_end']))
+    const runEnd = runLogJsonLines(t.runLogDir).find((j) => j.type === 'harness.run_end')
+    expect(runEnd).toMatchObject({ outcome: 'done', answer: 'Zie de worker-runbook.' })
+    expect(lines.at(-1)).toBe(`${String(runEnd?.timestamp)} [harness] exit code=0`)
+  })
+
+  it('an empty answer writes ERROR JOB_FAILED in the closing block', async () => {
+    const t = await setup({ claims: [job()], script: [answer('   \n')] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    const lines = runLogLines(t.runLogDir)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR JOB_FAILED: /))
+    expect(lines.at(-1)).toMatch(/ exit code=1$/)
+  })
+
+  it('running refused writes ABANDONED', async () => {
+    const t = await setup({ claims: [job()], script: [answer('nee')], failUpdate: ['running'] })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR ABANDONED: /))
+  })
+
+  it('a lost heartbeat writes ABANDONED', async () => {
+    const t = await setup({ claims: [job()], script: [{ ...answer('te laat'), delayMs: 2000 }], heartbeatMs: 30 })
+    t.mcp.state.heartbeatOk = false
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR ABANDONED: /))
+  })
+
+  it('a stop mid-turn writes STOPPED', async () => {
+    const stop = new AbortController()
+    const t = await setup({ claims: [job()], script: [{ ...answer('te laat'), delayMs: 3000 }], signal: stop.signal })
+    setTimeout(() => stop.abort(), 150)
+    const r = await t.run()
+    expect(r.exitCode).toBe(0)
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR STOPPED: worker gestopt$/))
+  })
+
+  it('an unsupported kind writes exactly one block with ERROR CLAIM_FILTER, and ClaimFilterError still reaches the worker loop', async () => {
+    const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'PR_REVIEW' }), job()], script: [answer('nee')], once: false })
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
+    const lines = runLogLines(t.runLogDir)
+    expect(lines.filter((l) => l.includes('"type":"harness.run_end"'))).toHaveLength(1)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CLAIM_FILTER: /))
+  })
+
+  it('an invalid payload (no pending_user_message_ids) writes exactly one block with ERROR CLAIM_FILTER, and ClaimFilterError still reaches the worker loop', async () => {
+    const payload = ideaChatPayload() as unknown as { chat: Record<string, unknown> }
+    delete payload.chat.pending_user_message_ids
+    const t = await setup({ claims: [job(payload), job()], script: [answer('nee')], once: false })
+    const r = await t.run()
+    expect(r.exitCode).toBe(1)
+    const lines = runLogLines(t.runLogDir)
+    expect(lines.filter((l) => l.includes('"type":"harness.run_end"'))).toHaveLength(1)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CLAIM_FILTER: /))
+  })
+
+  it('an injected unexpected error in the handler writes exactly one HARNESS_ERROR block, and the error keeps propagating unchanged', async () => {
+    const t = await setup({ claims: [job()], script: [answer('ok')] })
+    const boom = new Error('kapot onverwacht')
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = {
+      ...t.deps.control,
+      updateStatus: async (id, input) => {
+        if (input.status === 'done') throw boom
+        return orig(id, input)
+      },
+    }
+    await expect(t.run()).rejects.toThrow('kapot onverwacht')
+    const lines = runLogLines(t.runLogDir)
+    expect(lines.filter((l) => l.includes('"type":"harness.run_end"'))).toHaveLength(1)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR HARNESS_ERROR: kapot onverwacht$/))
+    expect(lines.at(-1)).toMatch(/ exit code=1$/)
+  })
+
+  it('without runLogFor the worker behaves exactly as before: same outcome, and no run-log is written', async () => {
+    const t = await setup({ claims: [job()], script: [answer('Zie de worker-runbook.')] })
+    t.deps.runLogFor = undefined
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('done')
+    expect(existsSync(runLogRunsDir(t.runLogDir))).toBe(false)
+  })
+
+  it('an unwritable run-log directory leaves the job outcome unchanged and logs exactly one line (Review Focus 4)', async () => {
+    const t = await setup({ claims: [job()], script: [answer('ok')] })
+    const blockerDir = tmp('runlog-blocker')
+    const blockerFile = join(blockerDir, 'blocker') // a plain file where openRunLog expects a directory: mkdir fails
+    writeFileSync(blockerFile, 'x')
+    const runLogErrors: string[] = []
+    t.deps.runLogFor = (claim) =>
+      openRunLog(
+        { dir: blockerFile, pool: 'harness', instance: 'test' },
+        { jobId: claim.jobId, kind: claim.kind, model: t.deps.config.model, version: 'agent-harness@test', secrets: [], log: (l) => runLogErrors.push(l) },
+      )
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('done')
+    expect(runLogErrors).toHaveLength(1)
+  })
+
+  it('a runLogFor that throws gives the same outcome as no run-log at all, plus exactly one log line (Review F2)', async () => {
+    const t = await setup({ claims: [job()], script: [answer('Zie de worker-runbook.')] })
+    t.deps.runLogFor = () => {
+      throw new Error('run-log kapot')
+    }
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'done' }], exitCode: 0 }) // same as without runLogFor at all
+    expect(t.logs.filter((l) => l.includes('run-log uitgeschakeld'))).toHaveLength(1)
+    expect(t.logs.filter((l) => l.includes('run-log uitgeschakeld'))[0]).toMatch(/^run-log uitgeschakeld voor job job1: run-log kapot$/)
+    expect(existsSync(runLogRunsDir(t.runLogDir))).toBe(false)
   })
 })

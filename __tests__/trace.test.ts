@@ -58,6 +58,12 @@ describe('openTrace', () => {
     expect(JSON.parse(readFileSync(join(t.dir, 'result.json'), 'utf8'))).toEqual(result)
   })
 
+  it('writes container output under containers/<n>.txt', () => {
+    const t = openTrace(out, 'r1')
+    t.containerOutput(1, 'npm ci uitvoer')
+    expect(readFileSync(join(t.dir, 'containers', '1.txt'), 'utf8')).toBe('npm ci uitvoer')
+  })
+
   it('keeps model-supplied call ids inside tools/', () => {
     const t = openTrace(out, 'r1')
     t.toolContent('../../escape', 'x')

@@ -38,6 +38,11 @@
     "contextTokens": 32768
   },
   "waitSeconds": 300,
+  "workerLog": {
+    "dir": "/srv/scrum4me/worker-logs",
+    "pool": "harness",
+    "instance": "max2"
+  },
   "task": {
     "limits": {
       "maxTurns": 40,

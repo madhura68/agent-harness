@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createModelClient, ModelError, transportTimeouts } from '../src/model-client.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
@@ -8,6 +10,8 @@ afterEach(async () => { await fake?.close(); fake = undefined })
 
 const msgs = [{ role: 'user' as const, content: 'hi' }]
 const opts = () => ({ signal: AbortSignal.timeout(5000), maxTokens: 64 })
+// Read verbatim so the server returns the fixture's exact bytes, not a re-stringified copy.
+const fixture = (name: string) => readFileSync(join('__tests__', 'fixtures', name), 'utf8')
 
 describe('fake model server', () => {
   it('plays scripted turns in order', async () => {
@@ -160,5 +164,53 @@ describe('transport timeouts', () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'late' }), delayMs: 800 }])
     const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
     expect(r.message.content).toBe('late')
+  })
+})
+
+describe('reasoning, cachedTokens, durationMs and systemFingerprint', () => {
+  it('reads reasoning, cachedTokens and systemFingerprint from a real Ollama response', async () => {
+    fake = await startFakeModelServer([{ body: fixture('ollama-v1-reasoning.json') }])
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    expect(r.message.content).toBe('51')
+    expect(r.reasoning).toBe(
+      'The user asks "Wat is 17*3?" (What is 17*3?) and asks to answer with only the number.\n\n17 * 3 = 51\n\nThey want only the number as the answer.',
+    )
+    expect(r.usage.cachedTokens).toBe(0)
+    expect(r.systemFingerprint).toBe('fp_ollama')
+  })
+
+  it('reads cachedTokens 22 from the second turn of the same conversation', async () => {
+    fake = await startFakeModelServer([{ body: fixture('ollama-v1-cached.json') }])
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    expect(r.usage.cachedTokens).toBe(22)
+  })
+
+  it('falls back to reasoning_content when the message has no reasoning field', async () => {
+    const renamed = JSON.parse(fixture('ollama-v1-reasoning.json'))
+    renamed.choices[0].message.reasoning_content = renamed.choices[0].message.reasoning
+    delete renamed.choices[0].message.reasoning
+    fake = await startFakeModelServer([{ body: renamed }])
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    expect(r.reasoning).toBe(
+      'The user asks "Wat is 17*3?" (What is 17*3?) and asks to answer with only the number.\n\n17 * 3 = 51\n\nThey want only the number as the answer.',
+    )
+  })
+
+  it('leaves reasoning, cachedTokens and systemFingerprint undefined when the response has none, without error', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    expect(r.reasoning).toBeUndefined()
+    expect(r.usage.cachedTokens).toBeUndefined()
+    expect(r.systemFingerprint).toBeUndefined()
+  })
+
+  it('measures durationMs from just before fetch to just after the body is read', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    const ticks = [1000, 1450]
+    let i = 0
+    const now = () => ticks[i++]
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm', now }).complete(msgs, opts())
+    expect(r.durationMs).toBe(450)
+    expect(i).toBe(2)
   })
 })
