@@ -131,6 +131,13 @@ function createRunLogFile(cfg: WorkerLogConfig, now: () => Date, sleep: (ms: num
   return opened.path
 }
 
+const LINE_BREAKS = /\r\n|[\r\n\u2028\u2029]/g
+
+/** Every line-terminator form (CRLF, lone CR, LF, U+2028, U+2029) becomes one space (spec §5.2). */
+function foldLines(text: string): string {
+  return text.replace(LINE_BREAKS, ' ')
+}
+
 export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): RunLog | null {
   if (!cfg) return null
 
@@ -174,7 +181,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
     // *_PRIVATE_KEY) carries its own \n's, so folding first would desync the text from the literal secret
     // and leave it unmasked (Review F4).
     const redacted = redactText(text, secrets)
-    const folded = redacted.replace(/\r\n|\r|\n/g, ' ') // any newline form (CRLF, lone CR, LF) becomes a space (spec §5.2)
+    const folded = foldLines(redacted) // any newline form (CRLF, lone CR, LF, U+2028, U+2029) becomes a space (spec §5.2)
     appendFileSync(filePath, `${now().toISOString()} [harness] ${folded}\n`)
   }
 
@@ -334,11 +341,11 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
     const exitCode = isDone ? 0 : 1
     const lines = [JSON.stringify({ type: 'harness.run_end', timestamp: iso, ...redacted })]
     if (!isDone) {
-      const code = String(redacted.code).replace(/\r?\n/g, ' ')
-      const message = String(redacted.message).replace(/\r?\n/g, ' ')
+      const code = foldLines(String(redacted.code))
+      const message = foldLines(String(redacted.message))
       lines.push(`${iso} [harness] ERROR ${code}: ${message}`)
     }
-    const safeJobId = redactText(jobId, secrets).replace(/\r?\n/g, ' ')
+    const safeJobId = foldLines(redactText(jobId, secrets))
     lines.push(`${iso} [harness] harness done job_id=${safeJobId} exit_code=${exitCode} duration_ms=${durationMs}`)
     lines.push(`${iso} [harness] exit code=${exitCode}`)
 
