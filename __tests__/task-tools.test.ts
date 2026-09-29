@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { createTaskTools, type VerifyRun } from '../src/worker/task-tools.js'
+import { createTaskTools, type TaskToolsOptions, type VerifyRun } from '../src/worker/task-tools.js'
 import { tmp } from './helpers.js'
 
 const sig = () => AbortSignal.timeout(5000)
@@ -12,7 +12,7 @@ function tools(root: string, runVerify: (signal: AbortSignal) => Promise<VerifyR
   return createTaskTools({ root, runVerify })
 }
 
-function toolsWithSearchLimits(root: string, searchLimits: { totalBytesCap?: number; timeoutMs?: number; perFileTimeoutMs?: number }) {
+function toolsWithSearchLimits(root: string, searchLimits: TaskToolsOptions['searchLimits']) {
   return createTaskTools({ root, runVerify: neverVerify, searchLimits })
 }
 
@@ -353,14 +353,27 @@ describe('search: incremental matching over large trees (fix round 2, Important)
 
   it('never reports "geen treffers" when a real hit exists but a time bound cut the search short', async () => {
     const root = tmp('root')
+    // a.txt's one line backtracks catastrophically, far past the 50 ms budget, so the budget runs out
+    // while the walk is still on a.txt and b.txt's real hit is never reached. The clock is
+    // frozen: read the moment the budget's timer fires, it is still before the deadline — the state
+    // that made this test flaky while it raced the machine's speed. It must be reported, never
+    // silently look like "no matches anywhere", and never become the ReDoS error either.
+    writeFileSync(join(root, 'a.txt'), `${'a'.repeat(34)}!\n`)
+    writeFileSync(join(root, 'b.txt'), 'TARGET should never be reached\n')
+    const reg = toolsWithSearchLimits(root, { timeoutMs: 50, perFileTimeoutMs: 2000, now: () => 0 })
+    const r = await reg.execute('search', { pattern: 'TARGET|^(a+)+$' }, sig())
+    expect(r).toMatchObject({ ok: true, content: 'geen treffers voor TARGET|^(a+)+$\n(zoekopdracht afgekapt: timeout; beperk met path)' })
+  })
+
+  it('never reports "geen treffers" when the time budget is already gone before the walk reaches the hit', async () => {
+    const root = tmp('root')
     writeFileSync(join(root, 'a.txt'), 'nothing interesting here\n')
     writeFileSync(join(root, 'b.txt'), 'TARGET should never be reached\n')
-    // An effectively-zero overall budget: the very first file already exceeds it, so the walk stops
-    // before ever reaching b.txt — this must be reported, never silently look like "no matches anywhere".
-    const reg = toolsWithSearchLimits(root, { timeoutMs: 1, perFileTimeoutMs: 1 })
+    // A zero budget on a frozen clock: the deadline has passed before the first file, so the walk
+    // stops before ever reaching b.txt.
+    const reg = toolsWithSearchLimits(root, { timeoutMs: 0, now: () => 0 })
     const r = await reg.execute('search', { pattern: 'TARGET' }, sig())
-    expect(r.ok).toBe(true)
-    expect(r.content).toContain('(zoekopdracht afgekapt: timeout; beperk met path)')
+    expect(r).toMatchObject({ ok: true, content: 'geen treffers voor TARGET\n(zoekopdracht afgekapt: timeout; beperk met path)' })
   })
 
   it('never reports "geen treffers" when a real hit exists but the byte budget cut the search short', async () => {
