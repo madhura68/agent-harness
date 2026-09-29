@@ -23,9 +23,11 @@ export type TaskToolsOptions = {
    * Test-only overrides for `search`'s internal bounds. Production callers never set this — each field
    * defaults to the real constant below. It exists so a test can deterministically exercise the
    * "a bound cut the search short" notice path in milliseconds, instead of needing an actual 5 s wall
-   * clock or 200 MB of files to genuinely hit the production limits.
+   * clock or 200 MB of files to genuinely hit the production limits. `now` replaces the clock the time
+   * budget is measured on (default `Date.now`), so a test can pin where on that clock the search is
+   * instead of racing the machine's speed.
    */
-  searchLimits?: { totalBytesCap?: number; timeoutMs?: number; perFileTimeoutMs?: number }
+  searchLimits?: { totalBytesCap?: number; timeoutMs?: number; perFileTimeoutMs?: number; now?: () => number }
 }
 
 const GIT_SEGMENT_ERROR = 'pad met .git is niet toegestaan'
@@ -382,7 +384,7 @@ async function* singleSearchableFile(path: string): AsyncGenerator<string> {
   yield path
 }
 
-type SearchBounds = { totalBytesCap: number; timeoutMs: number; perFileTimeoutMs: number }
+type SearchBounds = { totalBytesCap: number; timeoutMs: number; perFileTimeoutMs: number; now: () => number }
 
 async function search(
   root: string,
@@ -406,7 +408,7 @@ async function search(
     return toolError(`pad bestaat niet: ${message(err)}`)
   }
 
-  const deadline = Date.now() + bounds.timeoutMs
+  const deadline = bounds.now() + bounds.timeoutMs
   const worker = new Worker(SEARCH_WORKER_SOURCE, { eval: true })
   const hits: string[] = []
   let totalBytes = 0
@@ -417,7 +419,7 @@ async function search(
     const files = stat.isDirectory() ? walkSearchableFiles(resolved.target) : singleSearchableFile(resolved.target)
     for await (const full of files) {
       if (hits.length >= MAX_SEARCH_HITS) break // the documented output cap, not a search-space cut — no notice needed
-      if (signal.aborted || Date.now() >= deadline) {
+      if (signal.aborted || bounds.now() >= deadline) {
         truncatedReason = 'timeout'
         break
       }
@@ -446,16 +448,20 @@ async function search(
       const relFile = relPosix(root, full)
       const lines: SearchLine[] = text.split('\n').map((t, i) => ({ file: relFile, lineNo: i + 1, text: t }))
 
-      const remaining = deadline - Date.now()
+      const remaining = deadline - bounds.now()
       if (remaining <= 0) {
         truncatedReason = 'timeout'
         break
       }
+      // Which bound arms this file's timer is fixed here, not by re-reading the clock once it fires:
+      // timers run on libuv's own millisecond clock, so a budget timer can fire a fraction of a
+      // millisecond before `now()` reaches `deadline`.
+      const budgetArmsTimer = remaining <= bounds.perFileTimeoutMs
       const outcome = await matchInWorker(worker, pattern, lines, MAX_SEARCH_HITS - hits.length, Math.min(bounds.perFileTimeoutMs, remaining))
       if (!outcome.ok) {
         // A per-file timeout with the overall budget also gone is a shortage of time, not evidence the
         // regex itself is pathological — that stays a truncation notice, never the hard ReDoS error.
-        if (outcome.error === 'timeout' && Date.now() >= deadline) truncatedReason = 'timeout'
+        if (outcome.error === 'timeout' && (budgetArmsTimer || bounds.now() >= deadline)) truncatedReason = 'timeout'
         else redosError = outcome.error
         break
       }
@@ -551,6 +557,7 @@ export function createTaskTools(opts: TaskToolsOptions): ToolRegistry {
     totalBytesCap: opts.searchLimits?.totalBytesCap ?? MAX_SEARCH_TOTAL_BYTES,
     timeoutMs: opts.searchLimits?.timeoutMs ?? SEARCH_TIMEOUT_MS,
     perFileTimeoutMs: opts.searchLimits?.perFileTimeoutMs ?? SEARCH_PER_FILE_TIMEOUT_MS,
+    now: opts.searchLimits?.now ?? Date.now,
   }
 
   const entries: ToolSnapshotEntry[] = [...TOOL_DEFS]
