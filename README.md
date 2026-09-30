@@ -74,3 +74,24 @@ harness check-run-logs --config <worker.json> --dir <run-logs-dir>
 Controleert of een geheim dat de redactie hoort te maskeren onveranderd in een run-log staat, en drukt per geheim alleen de naam en het aantal treffers af, nooit een waarde. Exit 1 bij een treffer, of als er geen enkel geheim gecontroleerd is. Draai het met de omgeving van de service (zie het runbook).
 
 Ontwerp en plan: [docs/specs/2026-09-28-harness-run-logging-design.md](docs/specs/2026-09-28-harness-run-logging-design.md), [docs/plans/M4-harness-run-logging.md](docs/plans/M4-harness-run-logging.md). Recept en praktijkbewijs: [docs/runbooks/idea-chat-worker.md](docs/runbooks/idea-chat-worker.md#run-logs-in-worker-logs-m4).
+
+## Doc-server over een bevroren docset (M5)
+
+```bash
+harness doc-server --dir <docset-dir> --product-id <id>
+```
+
+Een stdio-MCP-server die de vier doc-tools van scrum4me-mcp (`search_product_docs`, `get_product_doc`, `list_product_docs`, `related_product_docs`) aanbiedt over een bevroren map met documenten. De modelvergelijking (M5) start hem als `tools.server` van een run met het profiel `tools`:
+
+```json
+"tools": {
+  "server": { "command": "harness", "args": ["doc-server", "--dir", "docset", "--product-id", "bench-agent-harness"] },
+  "allow": ["search_product_docs", "get_product_doc", "list_product_docs", "related_product_docs"]
+}
+```
+
+Het model leest dezelfde toolnamen, beschrijvingen en invoerschema's als in Scrum4Me (scrum4me-mcp op `285c98ae`), de resultaten hebben dezelfde sleutels en de fouten dezelfde tekst. De beschrijvingen zijn letterlijk overgenomen, ook waar ze Postgres noemen. `__tests__/fixtures/scrum4me-doc-tools.schema.json` bevat de vastgelegde definities van het echte MCP; een test vergelijkt ze met wat de server aanbiedt.
+
+De docset is `<dir>/docset.json` (`frozen_at` en `files: [{ folder, slug, … }]`; de andere sleutels worden niet gelezen) met de documenten op `<dir>/<folder>/<slug>.md`. `--product-id` is de id waarop de server antwoordt; een andere id geeft `Product '<id>' not found or not accessible`. Elk document is `active` in een ingeschakelde folder en heeft `frozen_at` als `updated_at`. De titel is de `title` uit de front matter, anders de eerste `# `-kop. De `slug` van een aanvraag wordt naar kleine letters gezet vóór het zoeken, zoals scrum4me-mcp doet; een slug met `.md` erachter is dus een onbekend document. `get_product_doc` pagineert in tekens (`byte_size` en `next_offset` tellen tekens), en `heading` is de koptekst zonder `#`, hoofdletterongevoelig, tot de volgende kop van gelijk of hoger niveau.
+
+**Bewust anders dan productie:** geen authenticatie en geen Postgres-FTS. Zoeken is woordherkenning: de inhoud, titel en slug worden in kleine letters geknipt op alles wat geen letter of cijfer is, en een term telt bij een heel woord. Alle termen moeten erin staan; `OR` tussen twee termen maakt er "een van beide" van (`a b OR c` is: a, en b of c); `-term` sluit uit; een frase tussen aanhalingstekens vraagt de woorden direct achter elkaar, en een term met leestekens erin zoals `tool-calling` ook. De score is het aantal treffers, bij gelijke score beslist de slug. De snippet is de tien woorden rond de eerste treffer, met `<<` en `>>` om de treffer. `related_product_docs` leest `[tekst](pad.md)` en `[tekst](pad.md#anker)`, opgelost ten opzichte van de folder van het document of als `docs/<folder>/<bestand>.md`; een link naar een `.md` die niet in de set zit staat onder `broken_links`.

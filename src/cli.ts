@@ -3,6 +3,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
+import { DocsetError, runDocServer } from './bench/doc-server.js'
 import { assertExtraBody, loadManifest, ManifestError, resolveServerEnv } from './manifest.js'
 import { createModelClient } from './model-client.js'
 import { probeDir, runProbe } from './probe.js'
@@ -24,6 +25,7 @@ Usage:
   harness run <manifest.json> --out <dir> [--skip-probe] [--api-key-env <VAR>]
   harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe]
   harness check-run-logs --config <worker.json> --dir <run-logs-dir>
+  harness doc-server --dir <docset-dir> --product-id <id>
 `
 
 // allowPositionals is required: without it Node throws ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL on the subcommand.
@@ -42,6 +44,7 @@ export const cliArgsConfig = {
     config: { type: 'string' },
     once: { type: 'boolean' },
     dir: { type: 'string' },
+    'product-id': { type: 'string' },
   },
 } satisfies ParseArgsConfig
 
@@ -244,6 +247,17 @@ async function cmdCheckRunLogs(values: Values): Promise<number> {
   return checked === 0 || results.some((r) => r.hits > 0) ? 1 : 0
 }
 
+/**
+ * M5: serves a frozen docset over stdio as the four doc tools of scrum4me-mcp (src/bench/doc-server.ts). Returns once
+ * connected; the process lives until the client closes its stdin. stdout belongs to the MCP protocol, so nothing is printed there.
+ */
+async function cmdDocServer(values: Values): Promise<number> {
+  if (!values.dir) throw new UsageError('doc-server needs --dir')
+  if (!values['product-id']) throw new UsageError('doc-server needs --product-id')
+  await runDocServer({ dir: values.dir, productId: values['product-id'] })
+  return 0
+}
+
 export async function main(argv: string[]): Promise<number> {
   let parsed
   try {
@@ -267,6 +281,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdWorker(values)
       case 'check-run-logs':
         return await cmdCheckRunLogs(values)
+      case 'doc-server':
+        return await cmdDocServer(values)
       default:
         process.stderr.write(`${positionals[0]}: not implemented\n`)
         return 1
@@ -276,7 +292,7 @@ export async function main(argv: string[]): Promise<number> {
       process.stderr.write(`${err.message}\n${USAGE}`)
       return 1
     }
-    if (err instanceof ManifestError) {
+    if (err instanceof ManifestError || err instanceof DocsetError) {
       process.stderr.write(`${err.message}\n`)
       return 1
     }

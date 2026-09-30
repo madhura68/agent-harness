@@ -1,0 +1,29 @@
+{
+  "source_repo": "fixture/agent-harness",
+  "source_commit": "0000000000000000000000000000000000000000",
+  "frozen_at": "2026-09-30T19:21:43Z",
+  "product_id": "fixture-docs",
+  "files": [
+    {
+      "folder": "runbooks",
+      "slug": "probe-runbook",
+      "source_path": "docs/runbooks/probe-runbook.md",
+      "sha256": "454c51f34006a8a7d0c83a28d311864c56aa0d6932d1ac879c33ae00bbc0d462",
+      "bytes": 180
+    },
+    {
+      "folder": "specs",
+      "slug": "probe-design",
+      "source_path": "docs/specs/probe-design.md",
+      "sha256": "3866c53c96e00c2f29753b051a858573fb7c9de8e8a28d90415bc1cc59df260b",
+      "bytes": 1081
+    },
+    {
+      "folder": "specs",
+      "slug": "alpha-notes",
+      "source_path": "docs/specs/alpha-notes.md",
+      "sha256": "d5f9521c4817096238ad0f094fb80adfe9d20b8bff71989a094cb717b94be697",
+      "bytes": 208
+    }
+  ]
+}
