@@ -93,7 +93,7 @@ Tussen de beurten gaat alleen de zichtbare tekst mee, niet de tooluitvoer van ee
 ### 5.1 Manifest en CLI (agent-harness)
 
 - **`history`** (optioneel): een lijst `{ role: "user" | "assistant", content }`. De lijst begint met `user`, wisselt af en eindigt met `assistant`. De berichten worden `[system, ...history, user(prompt)]`.
-- **`model.extraBody`** (optioneel): een object dat in de aanvraag wordt samengevoegd. De sleutels `model`, `messages`, `tools`, `stream` en `max_tokens` worden bij het laden geweigerd; `reasoning_effort` wordt geweigerd als `reasoningEffort` ook gezet is. Bedoeld voor `temperature`, `seed`, `provider` en de reasoning-instelling van een aanbieder.
+- **`model.extraBody`** (optioneel): een object dat in de aanvraag wordt samengevoegd. De sleutels `model`, `messages`, `tools`, `stream`, `max_tokens`, `max_completion_tokens` en `n` worden bij het laden geweigerd; `reasoning_effort` wordt geweigerd als `reasoningEffort` ook gezet is. Bedoeld voor `temperature`, `seed`, `provider` en de reasoning-instelling van een aanbieder.
 - **`harness run --api-key-env <VAR>`**: leest de sleutel uit de omgeving, zoals `probe` al doet. De sleutel komt niet in het manifest, de trace of het resultaat. Een niet-gezette variabele is een fout die de naam noemt.
 - **`harness probe --extra-body-file <pad>`**: hetzelfde object als `model.extraBody`, zodat de probe bij dezelfde aanbieders uitkomt als de runs.
 - `ModelSpecSchema` wordt gedeeld met de worker-config; `extraBody` werkt daar dus ook. De productieconfig op max2 verandert in deze stap niet.
@@ -170,9 +170,9 @@ De checks blijven heuristieken. Vaste transcripten in `test_refiner.py` bewijzen
 Een model komt per variant door de zeef als:
 - minstens 90% van de gesprekken met een prompt eindigt;
 - er geen vlag op A5 of D5 staat. Een vlag telt als gezakt; het rapport noemt de gevlagde transcripten, zodat JP er een kan verwerpen;
-- in de docs-variant D1, D2 en D3 elk in minstens 80% van de doc-gesprekken slagen.
+- in de docs-variant D1, D2 en D3 elk slagen in minstens 80% van de doc-gesprekken waarvoor de check geldt.
 
-De drempels zijn een startpunt; het rapport toont de ruwe tellingen. Het rapport noemt verder per model de aanbieder, de reasoning-instelling en de toestand van de GPU, en zet het lokale `qwen3.6:35b-a3b-coding` naast `qwen/qwen3.6-35b-a3b` via OpenRouter. Die twee hebben dezelfde gewichten; het verschil laat zien hoeveel de lokale kwantisatie kost.
+De drempels zijn een startpunt; het rapport toont de ruwe tellingen. Het rapport noemt verder per model de aanbieder, de reasoning-instelling en de toestand van de GPU, en zet het lokale `qwen3.6:35b-a3b-coding` naast `qwen/qwen3.6-35b-a3b` via OpenRouter. Dat is hetzelfde model (Qwen3.6-35B-A3B): lokaal in de kwantisatie van Ollama, via OpenRouter op de precisie van de aanbieder. Het verschil is een indicatie van wat lokaal draaien kost, geen zuivere meting: runtime en sampling verschillen ook.
 
 ## 6. Modellen en instellingen
 
@@ -180,10 +180,10 @@ De drempels zijn een startpunt; het rapport toont de ruwe tellingen. Het rapport
 |---|---|---|---|
 | `qwen3.8-gsq-rco:27b-iq3_s-text` | Ollama, max2 | ≤ 35B | Draait nu in de harness |
 | `qwen3.6:35b-a3b-coding` | Ollama, max2 | ≤ 35B | Gekozen verfijner zonder docs |
-| `qwen/qwen3.6-35b-a3b` | OpenRouter | ≤ 35B | Zelfde gewichten als lokaal: meet het kwantisatieverschil |
+| `qwen/qwen3.6-35b-a3b` | OpenRouter | ≤ 35B | Hetzelfde model als lokaal: indicatie van het kwantisatieverschil |
 | `qwen/qwen3.8-27b` | OpenRouter | ≤ 35B | Familie van het harness-model |
 | `google/gemma-4-31b-it` | OpenRouter | ≤ 35B | Andere familie in dezelfde klasse |
-| `qwen/qwen3-next-80b-a3b-instruct` | OpenRouter | ~80B | Wat 64 GB zou toevoegen; heeft geen reasoning-instelling |
+| `qwen/qwen3-next-80b-a3b-instruct` en `-thinking` | OpenRouter | ~80B | Wat 64 GB zou toevoegen. `-instruct` zonder docs, `-thinking` met docs: de instruct-variant kent geen reasoning |
 | `qwen/qwen3.5-122b-a10b` | OpenRouter | ~120B | Wat 96 GB of meer zou toevoegen |
 | `nvidia/nemotron-3-super-120b-a12b` | OpenRouter | ~120B | Tweede familie in die klasse |
 
@@ -193,7 +193,8 @@ De lijst is de stand van de catalogus op 2026-09-30. Een model dat bij de probe 
 
 **Instellingen, voor elk model gelijk:**
 - temperature 0,7 en een seed per herhaling, via `extraBody`; of een aanbieder de seed honoreert staat niet vast;
-- zonder docs: thinking uit, zoals de Open WebUI-preset; met docs: thinking aan. Hoe dat per aanbieder heet, wordt bij het eerste contact vastgesteld en in het rapport genoteerd;
+- zonder docs: thinking uit, zoals de Open WebUI-preset; met docs: thinking aan. De catalogus zegt per model of reasoning uit kan (`reasoning.mandatory`); de precieze aanvraagvelden worden bij het eerste contact vastgesteld en in het rapport genoteerd;
+- `num_ctx` is via `/v1` niet instelbaar: lokaal geldt de serverstandaard van 65536, waar de run van 29 september 16384 gebruikte;
 - de productielimieten uit §3, met `contextTokens 65536`;
 - OpenRouter: `provider: { data_collection: "deny", require_parameters: true }`. De kwantisatie wordt niet vastgezet; de aanbieder per respons wordt wel vastgelegd.
 
