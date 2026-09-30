@@ -67,6 +67,50 @@ describe('loadManifest', () => {
   })
 })
 
+describe('history in a manifest', () => {
+  type Turn = { role: 'user' | 'assistant'; content: string }
+  const user = (content: string): Turn => ({ role: 'user', content })
+  const assistant = (content: string): Turn => ({ role: 'assistant', content })
+  const two = [user('Wat is een PBI?'), assistant('Een product backlog item.')]
+  const four = [...two, user('En een story?'), assistant('Een verfijning van een PBI.')]
+
+  it('leaves history undefined when the manifest has none', () => {
+    expect(loadManifest(write(answer)).history).toBeUndefined()
+  })
+
+  it('accepts an empty history', () => {
+    expect(loadManifest(write({ ...answer, history: [] })).history).toEqual([])
+  })
+
+  it('accepts a history of two and of four messages and keeps their order', () => {
+    expect(loadManifest(write({ ...answer, history: two })).history).toEqual(two)
+    expect(loadManifest(write({ ...answer, history: four })).history).toEqual(four)
+  })
+
+  it('accepts a history on a tools manifest, next to the tools rule', () => {
+    expect(loadManifest(write({ ...tools, history: two })).history).toEqual(two)
+  })
+
+  // Each case breaks exactly one rule, so none of them can be rejected by another rule's check.
+  it.each([
+    ['starts with assistant', [assistant('a1'), user('u1'), assistant('a2')], /met een user-bericht beginnen/],
+    ['does not alternate', [user('u1'), user('u2'), assistant('a1')], /afwisselen.*bericht 2 is user/],
+    ['ends with user', [user('u1'), assistant('a1'), user('u2')], /met een assistant-bericht eindigen/],
+  ])('rejects a history that %s, with the path history in the message', (_why, history, rule) => {
+    const file = write({ ...answer, history })
+    expect(() => loadManifest(file)).toThrow(ManifestError)
+    // `loadManifest` prints `<path>: <message>`; the path here must be exactly `history`, not `history.N`.
+    expect(() => loadManifest(file)).toThrow(/: history: /)
+    expect(() => loadManifest(file)).toThrow(rule)
+  })
+
+  it('rejects a role other than user and assistant, naming the message', () => {
+    const file = write({ ...answer, history: [{ role: 'system', content: 'x' }, assistant('a1')] })
+    expect(() => loadManifest(file)).toThrow(ManifestError)
+    expect(() => loadManifest(file)).toThrow(/history\.0\.role/)
+  })
+})
+
 describe('expandEnv / resolveServerEnv', () => {
   it('replaces ${VAR} occurrences', () => {
     expect(expandEnv('a-${X}-${Y}', { X: '1', Y: '2' })).toBe('a-1-2')

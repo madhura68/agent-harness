@@ -159,6 +159,48 @@ describe('runManifest — answer profile', () => {
   })
 })
 
+describe('runManifest — history', () => {
+  type History = NonNullable<Manifest['history']>
+  const system = { role: 'system', content: 'Wees kort.' }
+  const prompt = { role: 'user', content: 'Wat is een sprint?' }
+  const two: History = [
+    { role: 'user', content: 'Wat is een PBI?' },
+    { role: 'assistant', content: 'Een product backlog item.' },
+  ]
+  const four: History = [
+    ...two,
+    { role: 'user', content: 'En een story?' },
+    { role: 'assistant', content: 'Een verfijning van een PBI.' },
+  ]
+
+  it('sends [system, user] when history is absent', async () => {
+    const { requests } = await run([{ body: completion({ content: 'ok' }) }], () => ({ system: system.content }))
+    expect(requests[0].body.messages).toEqual([system, prompt])
+  })
+
+  it('sends [system, user] when history is empty', async () => {
+    const { requests } = await run([{ body: completion({ content: 'ok' }) }], () => ({ system: system.content, history: [] }))
+    expect(requests[0].body.messages).toEqual([system, prompt])
+  })
+
+  it('puts a history of two messages between the system message and the prompt', async () => {
+    const { result, requests } = await run([{ body: completion({ content: 'ok' }) }], () => ({ system: system.content, history: two }))
+    expect(result.status).toBe('completed')
+    expect(requests).toHaveLength(1)
+    expect(requests[0].body.messages).toEqual([system, ...two, prompt])
+  })
+
+  it('puts a history of four messages in the given order, before the prompt', async () => {
+    const { requests } = await run([{ body: completion({ content: 'ok' }) }], () => ({ system: system.content, history: four }))
+    expect(requests[0].body.messages).toEqual([system, ...four, prompt])
+  })
+
+  it('starts with the history when there is no system message', async () => {
+    const { requests } = await run([{ body: completion({ content: 'ok' }) }], () => ({ history: two }))
+    expect(requests[0].body.messages).toEqual([...two, prompt])
+  })
+})
+
 const execFileP = promisify(execFile)
 async function cli(args: string[]) {
   try {

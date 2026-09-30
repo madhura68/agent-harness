@@ -175,6 +175,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
     const tools: ToolDef[] = registry ? registry.toOpenAiTools() : []
     const messages: ChatMessage[] = []
     if (manifest.system) messages.push({ role: 'system', content: manifest.system })
+    if (manifest.history) messages.push(...manifest.history)
     messages.push({ role: 'user', content: manifest.prompt })
     const toolsChars = tools.length > 0 ? charsOf(tools) : 0
 

@@ -16,6 +16,8 @@ export const ManifestSchema = z
     profile: z.enum(['answer', 'tools']),
     prompt: z.string().min(1),
     system: z.string().optional(),
+    /** Earlier visible turns of a conversation; run.ts places them between `system` and `prompt`. */
+    history: z.array(z.object({ role: z.enum(['user', 'assistant']), content: z.string() })).optional(),
     model: ModelSpecSchema,
     tools: z
       .object({
@@ -39,6 +41,14 @@ export const ManifestSchema = z
   .superRefine((m, ctx) => {
     if (m.profile === 'tools' && !m.tools) ctx.addIssue({ code: 'custom', path: ['tools'], message: 'tools is verplicht bij profile "tools"' })
     if (m.profile === 'answer' && m.tools) ctx.addIssue({ code: 'custom', path: ['tools'], message: 'tools is verboden bij profile "answer"' })
+
+    // The prompt is the next user message, so earlier turns must be whole exchanges: user, assistant, user, assistant, …
+    const history = m.history ?? []
+    const off = history.findIndex((h, i) => h.role !== (i % 2 === 0 ? 'user' : 'assistant'))
+    const historyIssue = (message: string) => ctx.addIssue({ code: 'custom', path: ['history'], message })
+    if (off === 0) historyIssue('history moet met een user-bericht beginnen')
+    else if (off > 0) historyIssue(`history moet afwisselen tussen user en assistant (bericht ${off + 1} is ${history[off].role})`)
+    else if (history.at(-1)?.role === 'user') historyIssue('history moet met een assistant-bericht eindigen')
   })
 
 export type Manifest = z.infer<typeof ManifestSchema>
