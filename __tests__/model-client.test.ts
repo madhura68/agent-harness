@@ -142,10 +142,13 @@ describe('maskKey', () => {
     expect(maskKey(text, undefined)).toBe(text)
     expect(maskKey(text, '')).toBe(text)
     expect(maskKey(text, 'abcdefg')).toBe(text) // 7 characters
+    expect(maskKey(text, 'abcdefg \n')).toBe(text) // 7 once trimmed: padding does not lift it over the floor
+    expect(maskKey(text, ' \n ')).toBe(text) // whitespace only: trims to nothing, and an empty needle must never reach replaceAll
   })
 
   it('masks a key of exactly 8 characters', () => {
     expect(maskKey('Bearer abcdefgh', 'abcdefgh')).toBe('Bearer <redacted>')
+    expect(maskKey('Bearer abcdefgh', 'abcdefgh \n')).toBe('Bearer <redacted>') // 8 once trimmed, the form a server echoes
   })
 
   it('matches the key literally, not as a pattern', () => {
@@ -156,8 +159,8 @@ describe('maskKey', () => {
 
 describe('the key in model errors', () => {
   // One call against the current fake server; returns the message of the ModelError it must throw.
-  async function errorMessage(baseUrl: string): Promise<string> {
-    const c = createModelClient({ baseUrl, name: 'm', apiKey: DUMMY_KEY })
+  async function errorMessage(baseUrl: string, apiKey = DUMMY_KEY): Promise<string> {
+    const c = createModelClient({ baseUrl, name: 'm', apiKey })
     const err = await c.complete(msgs, opts()).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ModelError)
     return (err as ModelError).message
@@ -195,6 +198,19 @@ describe('the key in model errors', () => {
     expect(message).toMatch(/^model request failed: /)
     expect(message).toContain('<redacted>')
     expect(leakedFragments(message)).toEqual([])
+  })
+
+  // undici trims a header value before it goes out, so the server never sees the padding and echoes the key without it.
+  it('masks the key without surrounding whitespace when the configured key has some', async () => {
+    const echo = { status: 401, body: bodyWithKeyAt(190, (p) => JSON.stringify({ error: { message: p } })) }
+    fake = await startFakeModelServer([echo, echo])
+    for (const padding of [' ', '\n']) {
+      const message = await errorMessage(fake.baseUrl, DUMMY_KEY + padding)
+      expect(message, JSON.stringify(padding)).toContain('<redacted>')
+      expect(leakedFragments(message), JSON.stringify(padding)).toEqual([])
+    }
+    // The premise: what reached the server was the trimmed key, for both paddings.
+    expect(fake.requests.map((r) => r.headers.authorization)).toEqual([`Bearer ${DUMMY_KEY}`, `Bearer ${DUMMY_KEY}`])
   })
 
   it('leaves a good answer untouched: only error messages are masked', async () => {

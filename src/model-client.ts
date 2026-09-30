@@ -39,10 +39,19 @@ const FINISH_REASONS = new Set(['stop', 'length', 'tool_calls'])
 // Same floor as worker/redact.ts: a shorter value is a placeholder (Ollama takes any string), and masking it would mangle ordinary text.
 const MIN_MASKED_KEY_LENGTH = 8
 
-/** Replaces every occurrence of the key with '<redacted>'. Without a key, or with one shorter than 8 characters, the text stays as it is. */
+/**
+ * Replaces every occurrence of the key with '<redacted>'. The key without surrounding whitespace counts too: undici
+ * trims a header value before sending it, so that is the form a server echoes. Each form needs 8 characters; without
+ * a key, or with one shorter than that, the text stays as it is.
+ */
 export function maskKey(text: string, apiKey: string | undefined): string {
-  if (!apiKey || apiKey.length < MIN_MASKED_KEY_LENGTH) return text
-  return text.replaceAll(apiKey, '<redacted>')
+  if (!apiKey) return text
+  let masked = text
+  // The padded form goes first: it contains the trimmed one, so masking it first removes it in full.
+  for (const form of new Set([apiKey, apiKey.trim()])) {
+    if (form.length >= MIN_MASKED_KEY_LENGTH) masked = masked.replaceAll(form, '<redacted>')
+  }
+  return masked
 }
 
 function excerpt(text: string): string {
