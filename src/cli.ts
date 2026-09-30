@@ -56,6 +56,16 @@ function readApiKey(varName: string | undefined): string | undefined {
   return v
 }
 
+/**
+ * --extra-body-file is a probe option. run and worker take extraBody from the model block, and ignoring the flag in
+ * silence would send every request without the fields it was meant to carry, such as the provider block.
+ */
+function rejectExtraBodyFile(values: Values, command: 'run' | 'worker'): void {
+  if (values['extra-body-file'] === undefined) return
+  const block = command === 'run' ? 'the model block of the manifest' : 'the model block of the worker config'
+  throw new UsageError(`--extra-body-file only applies to harness probe; for harness ${command} put extraBody in ${block} (model.extraBody)`)
+}
+
 /** The JSON object in --extra-body-file, held to the same rules as `model.extraBody` in a manifest. */
 function readExtraBodyFile(path: string): Record<string, unknown> {
   let raw: unknown
@@ -127,6 +137,7 @@ function passesProbeGate(model: { baseUrl: string; name: string }, out: string):
 
 async function cmdRun(values: Values, manifestPath: string | undefined): Promise<number> {
   if (!manifestPath) throw new UsageError('run needs a manifest path')
+  rejectExtraBodyFile(values, 'run')
   const out = values.out ?? 'runs'
   const manifest = loadManifest(manifestPath)
   const skipProbe = values['skip-probe'] === true
@@ -172,6 +183,7 @@ function harnessVersion(): string {
 
 async function cmdWorker(values: Values): Promise<number> {
   if (!values.config) throw new UsageError('worker needs --config')
+  rejectExtraBodyFile(values, 'worker')
   const out = values.out ?? 'runs'
   const config = loadWorkerConfig(values.config)
   if (values['skip-probe'] !== true && !passesProbeGate(config.model, out)) return 1

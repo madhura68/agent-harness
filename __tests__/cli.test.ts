@@ -319,10 +319,14 @@ describe('harness run — --api-key-env and model.extraBody', () => {
   const KEY_VAR = 'HARNESS_TEST_KEY'
   // No ordinary words in it: leakedFragments would otherwise match the word "manifest" in the trace.
   const MANIFEST_KEY = 'mk-Zk3Yq8Wn5Bv2Xc7Md1Lp4Ht9Rj6Sg0eUa'
+  // Also the prefix of the tmp dir, which stdout prints in full. It must not end in a window of DUMMY_KEY: a name ending in
+  // "-key-" did, and whenever mkdtemp's six random characters began with a Q, leakedFragments found "-key-Q" in stdout
+  // (two tests scan stdout, so roughly 1 run in 30).
+  const RUN_ID = 'cli-run-env'
   beforeEach(() => { process.env[KEY_VAR] = DUMMY_KEY })
   afterEach(() => { delete process.env[KEY_VAR] })
 
-  function answerManifest(dir: string, baseUrl: string, model: Record<string, unknown> = {}, id = 'cli-key'): string {
+  function answerManifest(dir: string, baseUrl: string, model: Record<string, unknown> = {}, id = RUN_ID): string {
     return writeJson(dir, `${id}.json`, {
       id, profile: 'answer', prompt: 'p',
       model: { baseUrl, name: 'm', ...model },
@@ -333,12 +337,12 @@ describe('harness run — --api-key-env and model.extraBody', () => {
 
   it('sends the key from the environment as a Bearer header and keeps it out of the run dir and the output', async () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'ok' }) }])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const out = join(dir, 'runs')
     const { code, stdout, stderr } = await runMain(['run', answerManifest(dir, fake.baseUrl), '--out', out, '--api-key-env', KEY_VAR])
     expect(code).toBe(0)
     expect(fake.requests[0].headers.authorization).toBe(`Bearer ${DUMMY_KEY}`)
-    const runDir = join(out, 'cli-key')
+    const runDir = join(out, RUN_ID)
     // The premise of the scan below: both files exist and are part of the text it reads.
     expect(allFiles(runDir).map((f) => f.slice(runDir.length + 1))).toEqual(expect.arrayContaining(['result.json', 'trace.jsonl']))
     expect(leakedFragments(runDirText(runDir)), 'trace.jsonl and result.json').toEqual([])
@@ -348,7 +352,7 @@ describe('harness run — --api-key-env and model.extraBody', () => {
 
   it('never puts the key in the manifest that runManifest receives', async () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'ok' }) }])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const { code } = await runMain(['run', answerManifest(dir, fake.baseUrl), '--out', join(dir, 'runs'), '--api-key-env', KEY_VAR])
     expect(code).toBe(0)
     expect(manifestsRun).toHaveLength(1)
@@ -358,18 +362,18 @@ describe('harness run — --api-key-env and model.extraBody', () => {
 
   it('lets the flag win over a model.apiKey in the manifest, which stays as it was', async () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'ok' }) }])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const out = join(dir, 'runs')
     const { code } = await runMain(['run', answerManifest(dir, fake.baseUrl, { apiKey: MANIFEST_KEY }), '--out', out, '--api-key-env', KEY_VAR])
     expect(code).toBe(0)
     expect(fake.requests[0].headers.authorization).toBe(`Bearer ${DUMMY_KEY}`)
     expect(manifestsRun[0].model.apiKey).toBe(MANIFEST_KEY) // the flag only reaches the client
-    expect(leakedFragments(runDirText(join(out, 'cli-key')), MANIFEST_KEY), 'the manifest key in the run dir').toEqual([])
+    expect(leakedFragments(runDirText(join(out, RUN_ID)), MANIFEST_KEY), 'the manifest key in the run dir').toEqual([])
   })
 
   it('still uses the model.apiKey of the manifest without the flag', async () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'ok' }) }])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const { code } = await runMain(['run', answerManifest(dir, fake.baseUrl, { apiKey: MANIFEST_KEY }), '--out', join(dir, 'runs')])
     expect(code).toBe(0)
     expect(fake.requests[0].headers.authorization).toBe(`Bearer ${MANIFEST_KEY}`)
@@ -377,13 +381,13 @@ describe('harness run — --api-key-env and model.extraBody', () => {
 
   it('sends model.extraBody with the request and records it in the trace, without the key', async () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'ok' }) }])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const out = join(dir, 'runs')
     const { code } = await runMain(['run', answerManifest(dir, fake.baseUrl, { extraBody }), '--out', out, '--api-key-env', KEY_VAR])
     expect(code).toBe(0)
     expect(fake.requests[0].body).toMatchObject({ model: 'm', stream: false, ...extraBody })
     expect(fake.requests[0].headers.authorization).toBe(`Bearer ${DUMMY_KEY}`)
-    const runDir = join(out, 'cli-key')
+    const runDir = join(out, RUN_ID)
     const start = readTrace(runDir)[0] as { manifest: { model: Record<string, unknown> } }
     expect(start.manifest.model.extraBody).toEqual(extraBody)
     expect(start.manifest.model).not.toHaveProperty('apiKey')
@@ -391,11 +395,11 @@ describe('harness run — --api-key-env and model.extraBody', () => {
 
   it('keeps the key out of trace.jsonl, result.json and the output when the server echoes it in an error', async () => {
     fake = await startFakeModelServer([{ status: 401, body: bodyWithKeyAt(190, (p) => JSON.stringify({ error: { message: p } })) }])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const out = join(dir, 'runs')
     const { code, stdout, stderr } = await runMain(['run', answerManifest(dir, fake.baseUrl), '--out', out, '--api-key-env', KEY_VAR])
     expect(code).toBe(1)
-    const runDir = join(out, 'cli-key')
+    const runDir = join(out, RUN_ID)
     expect(readFileSync(join(runDir, 'result.json'), 'utf8')).toContain('<redacted>') // the premise: the error did carry the key once
     expect(leakedFragments(runDirText(runDir)), 'trace.jsonl and result.json').toEqual([])
     expect(leakedFragments(stdout), 'stdout').toEqual([])
@@ -404,27 +408,60 @@ describe('harness run — --api-key-env and model.extraBody', () => {
 
   it('fails with an error naming the variable when it is not set, before any run dir or request', async () => {
     fake = await startFakeModelServer([])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const out = join(dir, 'runs')
     const unset = 'HARNESS_TEST_CERTAINLY_UNSET_VAR'
     delete process.env[unset]
     const { code, stderr } = await runMain(['run', answerManifest(dir, fake.baseUrl), '--out', out, '--api-key-env', unset])
     expect(code).toBe(1)
     expect(stderr).toContain(unset)
-    expect(existsSync(join(out, 'cli-key'))).toBe(false)
+    expect(existsSync(join(out, RUN_ID))).toBe(false)
     expect(fake.requests).toHaveLength(0)
     expect(manifestsRun).toHaveLength(0)
   })
 
   it('refuses a manifest whose extraBody holds a reserved key, before any run dir or request', async () => {
     fake = await startFakeModelServer([])
-    const dir = tmp('cli-key')
+    const dir = tmp(RUN_ID)
     const out = join(dir, 'runs')
     const { code, stderr } = await runMain(['run', answerManifest(dir, fake.baseUrl, { extraBody: { max_tokens: 1 } }), '--out', out, '--api-key-env', KEY_VAR])
     expect(code).toBe(1)
     expect(stderr).toContain('model.extraBody')
     expect(stderr).toContain('"max_tokens"')
-    expect(existsSync(join(out, 'cli-key'))).toBe(false)
+    expect(existsSync(join(out, RUN_ID))).toBe(false)
+    expect(fake.requests).toHaveLength(0)
+  })
+
+  // The flag carries things like the provider block. Ignoring it in silence would send the run without that block.
+  it('refuses --extra-body-file as a usage error: it only applies to probe, before any run dir or request', async () => {
+    fake = await startFakeModelServer([])
+    const dir = tmp(RUN_ID)
+    const out = join(dir, 'runs')
+    const file = writeJson(dir, 'extra.json', extraBody)
+    const { code, stderr } = await runMain(['run', answerManifest(dir, fake.baseUrl), '--out', out, '--extra-body-file', file])
+    expect(code).toBe(1)
+    expect(stderr).toContain('--extra-body-file only applies to harness probe')
+    expect(stderr).toContain('put extraBody in the model block of the manifest')
+    expect(stderr).toContain('Usage:') // printed by a UsageError, like every other wrong invocation
+    expect(existsSync(join(out, RUN_ID))).toBe(false)
+    expect(fake.requests).toHaveLength(0)
+    expect(manifestsRun).toHaveLength(0)
+  })
+})
+
+describe('harness worker — --extra-body-file', () => {
+  it('refuses it as a usage error: it only applies to probe, before the probe gate and before any request', async () => {
+    fake = await startFakeModelServer([])
+    const dir = tmp('cli-worker-extra')
+    const config = writeJson(dir, 'worker.json', { model: { baseUrl: fake.baseUrl, name: 'm' }, mcp: { command: 'mcp-bin', args: [] } })
+    const file = writeJson(dir, 'extra.json', extraBody)
+    // No probe.json on purpose: without the refusal this stops at PROBE_REQUIRED, so nothing can start either way.
+    const { code, stderr } = await runMain(['worker', '--config', config, '--out', join(dir, 'runs'), '--once', '--extra-body-file', file])
+    expect(code).toBe(1)
+    expect(stderr).toContain('--extra-body-file only applies to harness probe')
+    expect(stderr).toContain('put extraBody in the model block of the worker config')
+    expect(stderr).toContain('Usage:')
+    expect(stderr).not.toContain('PROBE_REQUIRED')
     expect(fake.requests).toHaveLength(0)
   })
 })

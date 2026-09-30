@@ -2,12 +2,16 @@ import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import { REASONING_EFFORTS } from './model-client.js'
 
-/** Request fields the model client sets itself; `extraBody` may not carry them. */
+/**
+ * Request fields `extraBody` may not carry. The client sets model, messages, tools, stream and max_tokens itself;
+ * max_completion_tokens would clash with max_tokens, and n asks for more choices than the single choices[0] it reads.
+ */
 export const RESERVED_BODY_KEYS = ['model', 'messages', 'tools', 'stream', 'max_tokens', 'max_completion_tokens', 'n'] as const
 
 /**
- * Throws a ManifestError for a reserved key, or for reasoning_effort next to reasoningEffort, which would set the same
- * field twice. The nested `reasoning` object (OpenRouter's form) is a different field and passes.
+ * Throws a ManifestError for a reserved key, or for reasoning_effort next to reasoningEffort: the client's own value
+ * would silently win there, so the config would not say what is sent. The nested `reasoning` object (OpenRouter's
+ * form) is a different field and passes.
  */
 export function assertExtraBody(extraBody: Record<string, unknown>, reasoningEffort?: string): void {
   const reserved: readonly string[] = RESERVED_BODY_KEYS
