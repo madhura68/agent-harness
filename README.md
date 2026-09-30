@@ -58,3 +58,15 @@ Dezelfde worker claimt met een `task`-blok in de config ook `TASK_IMPLEMENTATION
 Tot deze harness met een `task`-blok op max2 draait, wordt geen taak met `local_llm` gedispatcht (zie het runbook).
 
 Ontwerp en plan: [docs/specs/2026-09-27-task-implementation-local-llm-design.md](docs/specs/2026-09-27-task-implementation-local-llm-design.md), [docs/plans/M3-task-implementation-local-llm.md](docs/plans/M3-task-implementation-local-llm.md). Recept, faalredenen en opruimen: [docs/runbooks/task-worker.md](docs/runbooks/task-worker.md).
+
+## Run-logs in Worker Logs
+
+Met een `workerLog`-blok in de worker-config (`{ "dir": …, "pool": …, "instance": … }`) schrijft de worker per geclaimde job ook een geredigeerd run-log in het Worker-Log-formaat van de Claude- en Codex-runners, naast de ongewijzigde `trace.jsonl`. Zonder dat blok verandert er niets.
+
+```bash
+harness check-run-logs --config <worker.json> --dir <run-logs-dir>
+```
+
+Controleert of een geheim dat de redactie hoort te maskeren onveranderd in een run-log staat, en drukt per geheim alleen de naam en het aantal treffers af, nooit een waarde. Exit 1 bij een treffer, of als er geen enkel geheim gecontroleerd is. Draai het met de omgeving van de service (zie het runbook).
+
+Ontwerp en plan: [docs/specs/2026-09-28-harness-run-logging-design.md](docs/specs/2026-09-28-harness-run-logging-design.md), [docs/plans/M4-harness-run-logging.md](docs/plans/M4-harness-run-logging.md). Recept en praktijkbewijs: [docs/runbooks/idea-chat-worker.md](docs/runbooks/idea-chat-worker.md#run-logs-in-worker-logs-m4).
