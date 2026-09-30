@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { inspect } from 'node:util'
+import { fetch as undiciFetch } from 'undici'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createModelClient, maskKey, ModelError, transportTimeouts } from '../src/model-client.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
@@ -198,6 +200,36 @@ describe('the key in model errors', () => {
     expect(message).toMatch(/^model request failed: /)
     expect(message).toContain('<redacted>')
     expect(leakedFragments(message)).toEqual([])
+  })
+
+  // console.error(err) and util.inspect print the message, the stack and the whole cause chain. The chain is raw library
+  // text that maskKey never touches, so the key has to stay out of it altogether, not be masked inside it.
+  describe('in the whole error as util.inspect prints it', () => {
+    const shown = (err: unknown) => inspect(err, { depth: 10 })
+
+    it('holds no stretch of the key when the body is invalid JSON and begins with the key', async () => {
+      // JSON.parse quotes the start of the body in its SyntaxError: Unexpected token 'e', "test-key-Qx"... is not valid JSON.
+      // That is a part of the key, so masking the whole key inside the cause's message would not have removed it.
+      fake = await startFakeModelServer([{ body: DUMMY_KEY }])
+      const err = await createModelClient({ baseUrl: fake.baseUrl, name: 'm', apiKey: DUMMY_KEY }).complete(msgs, opts()).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ModelError)
+      expect((err as ModelError).message).toContain('invalid JSON') // the error under test is the one that was thrown
+      expect(leakedFragments(shown(err))).toEqual([])
+    })
+
+    it('holds no stretch of the key when the transport failure carries the key', async () => {
+      const baseUrl = `http://not a url ${DUMMY_KEY}`
+      // The premise: undici's own error for this URL holds the key, in its message and again further down its cause chain.
+      // That is the error the client used to hand on as the cause. (A stub of the global fetch would not reach the client,
+      // which calls the fetch it imports from undici.)
+      const raw = await undiciFetch(`${baseUrl}/chat/completions`).catch((e: unknown) => e)
+      expect((raw as Error).message).toContain(DUMMY_KEY)
+      expect(leakedFragments(shown(raw))).not.toEqual([])
+      const err = await createModelClient({ baseUrl, name: 'm', apiKey: DUMMY_KEY }).complete(msgs, opts()).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ModelError)
+      expect((err as ModelError).message).toMatch(/^model request failed: /) // the error under test is the one that was thrown
+      expect(leakedFragments(shown(err))).toEqual([])
+    })
   })
 
   // undici trims a header value before it goes out, so the server never sees the padding and echoes the key without it.

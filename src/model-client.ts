@@ -26,10 +26,16 @@ export type ModelClientOptions = {
 export type CompleteOptions = { signal: AbortSignal; maxTokens: number; tools?: ToolDef[] }
 export type ModelClient = { complete(messages: ChatMessage[], options: CompleteOptions): Promise<CompleteResult> }
 
+/**
+ * A ModelError holds its own message, which is masked, and nothing else. It takes no `cause` on purpose: the error a
+ * library throws can quote the response body (JSON.parse) or the URL (undici), so it can carry the API key, and
+ * util.inspect or console.error would print the whole chain. Masking a cause is no fix either: JSON.parse quotes only
+ * the start of the body, a part of the key that maskKey does not recognise.
+ */
 export class ModelError extends Error {
   readonly code = 'MODEL_ERROR' as const
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, options)
+  constructor(message: string) {
+    super(message)
     this.name = 'ModelError'
   }
 }
@@ -160,7 +166,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         text = await res.text()
       } catch (err) {
         const reason = options.signal.aborted ? 'aborted (deadline)' : err instanceof Error ? err.message : String(err)
-        throw new ModelError(`model request failed: ${maskKey(reason, opts.apiKey)}`, { cause: err })
+        throw new ModelError(`model request failed: ${maskKey(reason, opts.apiKey)}`)
       }
       const durationMs = now() - requestStart
       // Mask first, cut second: excerpt() keeps 200 characters, and a key that straddles the cut would leave a prefix
@@ -172,8 +178,8 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown; provider?: unknown }
       try {
         json = JSON.parse(text)
-      } catch (err) {
-        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(maskedText)}`, { cause: err })
+      } catch {
+        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(maskedText)}`)
       }
       if (json === null || typeof json !== 'object') {
         throw new ModelError(`model HTTP ${status}: unexpected body: ${excerpt(maskedText)}`)
