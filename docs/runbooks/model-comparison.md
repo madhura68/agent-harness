@@ -1,7 +1,7 @@
 ---
 title: "Modellen vergelijken via OpenRouter: eerste contact en recept"
 status: active
-last_updated: 2026-09-30
+last_updated: 2026-10-01
 ---
 
 # Modellen vergelijken via OpenRouter
@@ -91,24 +91,28 @@ Bij `qwen3.5-122b` antwoordde met seed een andere aanbieder (DeepInfra) dan zond
 
 `__tests__/fixtures/openrouter-chat-completion.json` is de respons `qwen36-medium` (AkashML, reasoning `medium`). Alleen `id` (`gen-fixture-0001`) en `created` (`1790000000`) zijn vervangen door vaste waarden; de rest is ongewijzigd, met `provider`, `usage.cost` (0,0000795) en `reasoning_tokens` (27).
 
-## Eerste run met docs (2026-10-01, Taak 7)
+## Eerste run met docs (2026-09-30 22:00 UTC, Taak 7)
 
-Vanaf branch `feat/m5-model-comparison` op `55f016b` (Taak 1–6), na `npm run build`. Werkmap buiten de repo: `~/Development/m5-first-contact/task7/`.
+Vanaf branch `feat/m5-model-comparison` op `55f016b` (Taak 1–6), na `npm run build`. Werkmap buiten de repo: `~/Development/m5-first-contact/task7/`; de commando's hieronder draaien vanuit die map, met `<repo>` voor de checkout van agent-harness.
 
 - `probe-extra.json`: het `provider`-blok en `"reasoning": {"effort": "none"}`.
-- `manifest.json`: profiel `tools`, model `qwen/qwen3.6-35b-a3b` via `https://openrouter.ai/api/v1`, `extraBody` met `temperature` 0,7, `seed` 1, het `provider`-blok en `"reasoning": {"effort": "medium"}`, een `history` van één eerdere beurt, en als server `node <repo>/dist/cli.js doc-server --dir <repo>/__tests__/fixtures/docset --product-id fixture-docs` met de vier doc-tools in `allow`. Limieten: `maxTurns` 8, `maxOutputTokens` 4096, `maxWallSeconds` 240, `maxToolErrors` 2, `contextTokens` 65536. Naar OpenRouter gingen alleen een korte systeemprompt, de vraag, de synthetische test-docset en de vier tooldefinities.
+- `manifest.json`: profiel `tools`, model `qwen/qwen3.6-35b-a3b` via `https://openrouter.ai/api/v1`, `extraBody` met `temperature` 0,7, `seed` 1, het `provider`-blok en `"reasoning": {"effort": "medium"}`, en als server `node <repo>/dist/cli.js doc-server --dir <repo>/__tests__/fixtures/docset --product-id fixture-docs` met de vier doc-tools in `allow`. Limieten: `maxTurns` 8, `maxOutputTokens` 4096, `maxWallSeconds` 240, `maxToolErrors` 2, `contextTokens` 65536.
+  - `system`: "Je beantwoordt vragen over de productdocumentatie. Zoek het antwoord op met de documentatietools en geef bij elke aanroep product_id "fixture-docs" mee. Noem bij je antwoord de doc waar het vandaan komt, als folder/slug."
+  - `history`: één user-bericht ("Ik ga je een paar vragen stellen over de probe.") en één assistant-bericht ("Prima. Stel je vraag, dan zoek ik het op in de documentatie.").
+  - `prompt`: "Hoeveel stappen noemt het ontwerp van de probe in de sectie Aanpak, en wat doet de laatste stap?"
+- Naar OpenRouter gingen alleen die systeemprompt, de twee history-berichten, de vraag, de vier tooldefinities en de twee tooluitkomsten (een zoektreffer en de sectie Aanpak uit de synthetische test-docset).
 
 ```bash
-node dist/cli.js probe --base-url https://openrouter.ai/api/v1 --model qwen/qwen3.6-35b-a3b --api-key-env OPENROUTER_API_KEY --out ./runs --extra-body-file ./probe-extra.json
-node dist/cli.js run ./manifest.json --out ./runs --api-key-env OPENROUTER_API_KEY
+node <repo>/dist/cli.js probe --base-url https://openrouter.ai/api/v1 --model qwen/qwen3.6-35b-a3b --api-key-env OPENROUTER_API_KEY --out ./runs --extra-body-file ./probe-extra.json
+node <repo>/dist/cli.js run ./manifest.json --out ./runs --api-key-env OPENROUTER_API_KEY
 ```
 
 Uitkomst:
 
-- **Probe:** vier keer PASS, `tool_calling: reliable`, met het `provider`-blok en reasoning uit.
-- **Run:** `completed` in 3 beurten en 4,7 s. Het model riep `search_product_docs` (`"probe ontwerp aanpak"`) en daarna `get_product_doc` (`specs/probe-design`, heading `Aanpak`) aan; beide `tool_result`s hebben `ok: true`. Het antwoord noemt de vijf stappen en de laatste stap, met `specs/probe-design` als bron.
-- **Kosten en aanbieder:** `result.json` meldt `usage.costUsd` 0,0007947 (drie responsen van 0,0002371, 0,0002713 en 0,0002863), 5319 invoer-, 388 uitvoer-, 1728 cache- en 169 reasoning-tokens. Alle drie de `model_response`-events noemen `provider` AkashML.
-- **Wat er verstuurd is:** de `run_start`-regel van de trace toont het `extraBody` met het `provider`-blok; `model.apiKey` staat er niet in.
-- **Sleutelcontrole:** `check.py` over `task7/`: 11 bestanden, 0 met de sleutel. Stand direct na afloop: `limit_remaining` 19,99195 (`usage` $0,00805); OpenRouter boekt met enige vertraging, dus de stand kan de laatste aanvragen nog missen.
+- **Probe:** vier keer PASS, `tool_calling: reliable`, met het `provider`-blok en reasoning uit. Vijf aanvragen, samen $0,0002169.
+- **Run:** `completed` in 3 beurten en 4,7 s. Het model riep `search_product_docs` (`"probe ontwerp aanpak"`) en daarna `get_product_doc` (`specs/probe-design`, heading `Aanpak`) aan; beide `tool_result`s hebben `ok: true`. Het antwoord zegt dat er vijf stappen zijn en geeft de laatste letterlijk weer, met `specs/probe-design` als bron.
+- **Kosten en aanbieder:** `result.json` meldt `usage.costUsd` 0,0007947 (drie responsen van 0,0002371, 0,0002713 en 0,0002863), 5319 invoertokens (waarvan 1728 uit de cache) en 388 uitvoertokens (waarvan 169 reasoning). Alle drie de `model_response`-events noemen `provider` AkashML. Probe en run samen: $0,0010116.
+- **Wat de trace vastlegt:** de `run_start`-regel toont het `extraBody` met het `provider`-blok en de `history`; `model.apiKey` staat er niet in. Dat `extraBody` in elke aanvraag wordt gemerged, dekt `__tests__/model-client.test.ts`; de trace bewaart geen aanvraagbodies.
+- **Sleutelcontrole en limiet:** `check.py` over heel `~/Development/m5-first-contact/` (de run- en probemappen van Taak 2 en 7 en de bewaarde antwoorden van het eerste contact): 50 bestanden, 0 met de sleutel. De geboekte stand ging van `usage` $0,007837 vóór Taak 7 naar $0,008849 erna: $0,001012, gelijk aan de gemelde $0,0010116. `limit_remaining` is nu 19,99115. Direct na de run stond er nog $0,00805; OpenRouter boekt dus met enige vertraging.
 
 Criterium 1 van de spec is daarmee gehaald: een docs-run tegen OpenRouter loopt door de harness met doc-server, `extraBody`, `history` en de sleutel uit de omgeving, en de trace legt kosten en aanbieder per respons vast.
