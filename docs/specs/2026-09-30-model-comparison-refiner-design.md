@@ -1,8 +1,8 @@
 ---
 title: "Agent-harness M5 — modellen vergelijken met de promptverfijner"
-status: draft
+status: reviewed
 last_updated: 2026-09-30
-revision: 4
+revision: 5
 ---
 
 # Agent-harness M5 — modellen vergelijken met de promptverfijner
@@ -171,9 +171,10 @@ De checks blijven heuristieken. Vaste transcripten in `test_refiner.py` bewijzen
 - `--backend ollama` blijft de standaard en verandert niet. `--backend harness` is nieuw, met `--variant nodocs|docs`, het pad naar de harness-CLI, `--base-url`, `--api-key-env`, een bestand met `extraBody`, de limieten, het aantal herhalingen en `--max-cost-usd`.
 - Per model draait `run.py` eerst `harness probe` in dezelfde uitvoermap. Is het oordeel niet `reliable`, dan vervalt de docs-variant voor dat model en noemt het rapport de redenen uit `probe.json`. Heeft OpenRouter voor een model geen aanbieder die aan het `provider`-blok voldoet, dan staat dat er als "geen aanbieder", los van het probe-oordeel.
 - Elke combinatie van backend, variant en promptversie krijgt een eigen run-map.
-- Een rij per beurt houdt de bestaande sleutels en krijgt erbij: `backend`, `variant`, de status en foutcode van de harness-run, het aantal modelbeurten, de toolaanroepen (naam, argumenten, geslaagd), tokens in, uit, cache en reasoning, `cost_usd`, de aanbieders en de laatste `finish_reason`.
+- Een rij per beurt houdt de bestaande sleutels en krijgt erbij: `backend`, `variant`, `poging` (1 of 2), de status en foutcode van de harness-run, het aantal modelbeurten, de toolaanroepen (naam, argumenten, geslaagd), tokens in, uit, cache en reasoning, `cost_usd`, de aanbieders en de laatste `finish_reason`.
 - Een beurt waarvan de harness-run niet `completed` is, sluit het gesprek af als `error` met die code.
-- `score.py` leest beide rijvormen.
+- Een aanroep die geen `result.json` oplevert (een manifestfout, `PROBE_REQUIRED`, een run-map die al bestaat) is een fout van de aanroep en niet van het model. De meting voor dat model stopt en er komt geen tweede poging.
+- `score.py` leest beide rijvormen en neemt per gesprek de hoogste `poging`.
 - `tei_state()` kijkt op de machine waar `run.py` draait. Voor de backend `harness` blijft `tei_on` daarom leeg; de toestand van de GPU komt uit één meting via `ssh max2` vóór en na de nulmeting.
 
 ### 5.8 Zeef en rapport
@@ -183,7 +184,7 @@ De zeef is voorlopig: de drempels zijn een startpunt en niet gevalideerd tegen J
 - er geen vlag op A5 of D5 staat. Een vlag telt als gezakt; het rapport noemt de gevlagde transcripten, zodat JP er een kan verwerpen;
 - elke andere check (A1–A4, A6–A8, en met docs D1–D4) slaagt in minstens 80% van de gesprekken waarvoor hij geldt. Een check met minder dan vijf gesprekken in de noemer wordt getoond maar telt niet mee: A8 geldt maar voor twee gesprekken.
 
-**Eén herhaling voor een gesprek dat niet afrondt.** Eindigt een harness-run in een gesprek anders dan `completed`, om welke reden ook, dan wordt dat gesprek één keer herhaald met `maxOutputTokens` en `maxWallSeconds` verdubbeld. Andere limieten blijven gelijk. De zeef rekent met de herhaling. Een indeling naar oorzaak is er niet: `result.json` onderscheidt een tokenbudget niet van `maxTurns`, en een model dat op zijn gedrag strandt, strandt bij de herhaling opnieuw. Een gesprek waarvan alle runs afronden maar dat geen prompt oplevert, wordt niet herhaald.
+**Eén tweede poging voor een gesprek dat niet afrondt.** Eindigt een harness-run in een gesprek anders dan `completed`, om welke reden ook, dan krijgt dat gesprek één tweede poging met dezelfde seed en met `maxOutputTokens` en `maxWallSeconds` verdubbeld. Andere limieten blijven gelijk. De zeef rekent met de tweede poging. Een indeling naar oorzaak is er niet: `result.json` onderscheidt een tokenbudget niet van `maxTurns`. Een model dat op zijn gedrag strandt, krijgt zo ook een tweede kans; dat geldt voor elk model gelijk en blijft zichtbaar. Een gesprek waarvan alle runs afronden maar dat geen prompt oplevert, krijgt geen tweede poging.
 
 Het rapport toont van beide pogingen de status, de foutcode en de kosten, en per model hoeveel gesprekken bij de eerste poging afrondden. Naast de uitkomst "gezakt" staat de regel waarop het model zakte, met de statussen van de niet-afgeronde gesprekken en de limieten die golden. Zo is te zien wanneer een model op een limiet of een storing strandde en niet op de inhoud.
 
@@ -222,8 +223,8 @@ De klasse rond 80B, die op 64 GB zou passen, is uitgesteld. De catalogus biedt d
 
 - **Sleutel:** alleen via de naam van een omgevingsvariabele. Hij komt niet in een manifest, trace, `raw.jsonl`, argv, rapport of commit. Na elke run telt een controle de treffers in de run-map, de probe-mappen en de bewaarde antwoorden van het eerste contact; het script leest de sleutel uit de omgeving en print alleen aantallen. Elke treffer boven nul is een stop. Geen aanroep met de echte sleutel schrijft ongemaskeerde uitvoer weg.
 - **Wat naar OpenRouter gaat:** de systeemprompt, de cases en de docset uit §5.5, met de id's, hostnamen en paden die daarin staan. Niets uit Scrum4Me, geen productdata.
-- **Kosten:** JP maakt een aparte sleutel met een limiet van $20; dat is de harde grens. `run.py` telt `cost_usd` op en begint boven `--max-cost-usd` geen nieuw gesprek. Het rapport toont die som naast de daling van `limit_remaining` en benoemt een verschil. Probes, losse aanvragen en herhalingen staan er apart in.
-- **Schatting:** een gesprek met docs kost $0,03 tot $0,07, met uitschieters tot enkele dubbeltjes als een model veel opzoekt; zonder docs rond een cent. Dat is ongeveer $1 per model en $5 voor vijf modellen. Verdubbelde limieten en herhalingen kunnen dat verhogen; de teller en de sleutellimiet begrenzen het.
+- **Kosten:** JP maakt een aparte sleutel met een limiet van $20; dat is de harde grens. `run.py` telt `cost_usd` op en begint boven `--max-cost-usd` geen nieuw gesprek. Het rapport toont die som naast de daling van `limit_remaining` en benoemt een verschil. Probes, losse aanvragen en tweede pogingen staan er apart in.
+- **Schatting:** een gesprek met docs kost $0,03 tot $0,07, met uitschieters tot enkele dubbeltjes als een model veel opzoekt; zonder docs rond een cent. Dat is ongeveer $1 per model en $5 voor vijf modellen. Verdubbelde limieten en tweede pogingen kunnen dat verhogen; de teller en de sleutellimiet begrenzen het.
 
 ## 8. Volgorde (serveracties en uitgaven op JP's go)
 
@@ -255,7 +256,7 @@ De klasse rond 80B, die op 64 GB zou passen, is uitgesteld. De catalogus biedt d
 - De backend `harness` tegen een nep-CLI die `result.json` en `trace.jsonl` schrijft: de rijvorm, de gespreksafloop, en een mislukte run die het gesprek afsluit.
 - De kostengrens stopt vóór het volgende gesprek.
 - De zeef: een mislukt gesprek telt mee in de noemer; een vlag op A5 of D5 laat het model zakken; een check met minder dan vijf gesprekken telt niet mee.
-- De herhaling: een gesprek met een niet-afgeronde run wordt precies één keer herhaald, met alleen `maxOutputTokens` en `maxWallSeconds` verdubbeld; een gesprek zonder prompt waarvan alle runs afrondden niet; beide pogingen staan in de uitvoer en de zeef rekent met de herhaling.
+- De tweede poging: een gesprek met een niet-afgeronde run krijgt er precies één, met dezelfde seed en alleen `maxOutputTokens` en `maxWallSeconds` verdubbeld; een gesprek zonder prompt waarvan alle runs afrondden niet; beide pogingen staan met hun `poging` in de uitvoer en de zeef rekent met de hoogste. Een aanroep zonder `result.json` stopt de meting voor dat model.
 - Het nieuwe R01-patroon geeft een vlag op een prompt die het antwoord bevat en geen vlag op een prompt die de begrippen alleen noemt.
 - De docset-controle geeft geen treffer op `task-implementation` en wel op een sleutelvorm en een Bearer-waarde.
 - D1–D6 tegen vaste transcripten: één goed gesprek slaagt, en per check zakt één bekend fout gesprek.
@@ -280,7 +281,7 @@ De klasse rond 80B, die op 64 GB zou passen, is uitgesteld. De catalogus biedt d
 - **De doc-server zoekt anders dan productie.** Een model dat hier vindt wat het zoekt, kan in Scrum4Me een andere rangorde krijgen. De jobsoort krijgt daarom een eigen proef op de echte docs.
 - **Kleine aantallen.** 15 cases met één tot drie herhalingen zijn indicatief; het rapport claimt geen significantie.
 - **Opnieuw opzoeken per beurt** kost tokens en tijd. Het aantal aanroepen per beurt staat in de rijen, zodat zichtbaar wordt of dat een probleem is.
-- **Limieten blijven een keuze.** Ze worden op de lokale modellen afgesteld en één keer verdubbeld bij een gesprek dat niet afrondt. Een model dat een herhaling nodig had, heeft met ruimere middelen gewerkt dan een model dat de eerste keer slaagde. En "gezakt" zegt alleen dat het binnen deze grenzen niet lukte; de statussen ernaast laten zien of dat een limiet, een storing of de inhoud was.
+- **Limieten blijven een keuze.** Ze worden op de lokale modellen afgesteld en verdubbeld voor de tweede poging van een gesprek dat niet afrondt. Een model dat een tweede poging nodig had, heeft met ruimere middelen gewerkt dan een model dat de eerste keer slaagde. En "gezakt" zegt alleen dat het binnen deze grenzen niet lukte; de statussen ernaast laten zien of dat een limiet, een storing of de inhoud was.
 - **De nulmeting legt de worker stil.** Jobs voor het lokale model wachten dan.
 - **De catalogus verandert.** Model-id's en prijzen zijn van 2026-09-30.
 - **De geheugenschatting is een schatting**, en snelheid op een Mac wordt niet gemeten. Voor de aankoop is daarna nog een meting op echte hardware nodig.
@@ -352,3 +353,15 @@ MINOR, verwerkt:
 Afgewezen: geen. Codex stelde voor de oorzaak uit de trace af te leiden of een extra veld aan het resultaat toe te voegen. Dat is niet gedaan, omdat de indeling zelf is vervallen.
 
 Scope: geschrapt zijn de indeling naar oorzaak, de derde zeef-uitkomst, de aparte herhaling bij een storing en de probe-omweg. Niets toegevoegd. Het eerste bruikbare resultaat en het eerste praktijkbewijs zijn ongewijzigd.
+
+### Ronde 4 — revisie 4 (`f7b22a8`), 2026-09-30
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 2 MINOR; GO) en `mac:codex` (0 BLOCKER, 0 MAJOR, 0 MINOR; GO). **Dubbel GO.** Beide: de kleinere regel is uit `result.json` alleen te beslissen, de kosten zijn begrensd, en buiten dit record staan geen resten van de geschrapte regels. Beide bevestigen dat de zorg uit ronde 1 (de zeef meet het budget) gedekt blijft door de expliciete reasoning-instelling, de limieten uit de nulmeting en de ene tweede poging, met de statussen naast de uitkomst.
+
+MINOR-bevindingen, gecontroleerd en verwerkt in revisie 5 zonder nieuwe ronde, want het zijn verduidelijkingen binnen de bestaande scope:
+- **claude:** `raw.jsonl` onderscheidde de twee pogingen niet, terwijl `score.py` op model, case en seed groepeert; en "herhaling" betekende zowel de drie draaiingen per case als de extra poging → het veld `poging`, dezelfde seed, en de extra poging heet overal "tweede poging" (§5.7, §5.8, §7, §9, §11).
+- **claude:** een aanroep zonder `result.json` viel buiten de formulering → dat is een fout van de aanroep: de meting voor dat model stopt, zonder tweede poging (§5.7, §9).
+
+Claude merkte op dat een model dat op gedrag strandt nu ook een tweede kans krijgt en dat "strandt opnieuw" bij temperature 0,7 niet zeker is. De zin is aangepast; het effect is voor elk model gelijk en het aantal gesprekken dat bij de eerste poging afrondde staat in het rapport.
+
+Afgewezen: geen. Scope: onveranderd. Revisie 5 is niet opnieuw gereviewd.
