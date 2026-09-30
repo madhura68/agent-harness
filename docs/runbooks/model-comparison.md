@@ -6,7 +6,7 @@ last_updated: 2026-09-30
 
 # Modellen vergelijken via OpenRouter
 
-Runbook voor M5 (spec `docs/specs/2026-09-30-model-comparison-refiner-design.md`, plan `docs/plans/M5-model-comparison-refiner.md`). Dit deel legt het eerste contact vast (Taak 2); Taak 7 vult het aan met de eerste run met docs.
+Runbook voor M5 (spec `docs/specs/2026-09-30-model-comparison-refiner-design.md`, plan `docs/plans/M5-model-comparison-refiner.md`). Dit deel legt het eerste contact vast (Taak 2) en de eerste run met docs (Taak 7).
 
 ## Sleutel en limiet
 
@@ -90,3 +90,25 @@ Bij `qwen3.5-122b` antwoordde met seed een andere aanbieder (DeepInfra) dan zond
 ### Fixture voor de kostenparser (Taak 5)
 
 `__tests__/fixtures/openrouter-chat-completion.json` is de respons `qwen36-medium` (AkashML, reasoning `medium`). Alleen `id` (`gen-fixture-0001`) en `created` (`1790000000`) zijn vervangen door vaste waarden; de rest is ongewijzigd, met `provider`, `usage.cost` (0,0000795) en `reasoning_tokens` (27).
+
+## Eerste run met docs (2026-10-01, Taak 7)
+
+Vanaf branch `feat/m5-model-comparison` op `55f016b` (Taak 1–6), na `npm run build`. Werkmap buiten de repo: `~/Development/m5-first-contact/task7/`.
+
+- `probe-extra.json`: het `provider`-blok en `"reasoning": {"effort": "none"}`.
+- `manifest.json`: profiel `tools`, model `qwen/qwen3.6-35b-a3b` via `https://openrouter.ai/api/v1`, `extraBody` met `temperature` 0,7, `seed` 1, het `provider`-blok en `"reasoning": {"effort": "medium"}`, een `history` van één eerdere beurt, en als server `node <repo>/dist/cli.js doc-server --dir <repo>/__tests__/fixtures/docset --product-id fixture-docs` met de vier doc-tools in `allow`. Limieten: `maxTurns` 8, `maxOutputTokens` 4096, `maxWallSeconds` 240, `maxToolErrors` 2, `contextTokens` 65536. Naar OpenRouter gingen alleen een korte systeemprompt, de vraag, de synthetische test-docset en de vier tooldefinities.
+
+```bash
+node dist/cli.js probe --base-url https://openrouter.ai/api/v1 --model qwen/qwen3.6-35b-a3b --api-key-env OPENROUTER_API_KEY --out ./runs --extra-body-file ./probe-extra.json
+node dist/cli.js run ./manifest.json --out ./runs --api-key-env OPENROUTER_API_KEY
+```
+
+Uitkomst:
+
+- **Probe:** vier keer PASS, `tool_calling: reliable`, met het `provider`-blok en reasoning uit.
+- **Run:** `completed` in 3 beurten en 4,7 s. Het model riep `search_product_docs` (`"probe ontwerp aanpak"`) en daarna `get_product_doc` (`specs/probe-design`, heading `Aanpak`) aan; beide `tool_result`s hebben `ok: true`. Het antwoord noemt de vijf stappen en de laatste stap, met `specs/probe-design` als bron.
+- **Kosten en aanbieder:** `result.json` meldt `usage.costUsd` 0,0007947 (drie responsen van 0,0002371, 0,0002713 en 0,0002863), 5319 invoer-, 388 uitvoer-, 1728 cache- en 169 reasoning-tokens. Alle drie de `model_response`-events noemen `provider` AkashML.
+- **Wat er verstuurd is:** de `run_start`-regel van de trace toont het `extraBody` met het `provider`-blok; `model.apiKey` staat er niet in.
+- **Sleutelcontrole:** `check.py` over `task7/`: 11 bestanden, 0 met de sleutel. Stand direct na afloop: `limit_remaining` 19,99195 (`usage` $0,00805); OpenRouter boekt met enige vertraging, dus de stand kan de laatste aanvragen nog missen.
+
+Criterium 1 van de spec is daarmee gehaald: een docs-run tegen OpenRouter loopt door de harness met doc-server, `extraBody`, `history` en de sleutel uit de omgeving, en de trace legt kosten en aanbieder per respons vast.
