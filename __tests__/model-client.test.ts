@@ -359,3 +359,112 @@ describe('reasoning, cachedTokens, durationMs and systemFingerprint', () => {
     expect(i).toBe(2)
   })
 })
+
+describe('costUsd, reasoningTokens and provider', () => {
+  // The real OpenRouter response from the first contact (Task 2). Every call gives a fresh copy, so a test can bend it.
+  const real = () => JSON.parse(fixture('openrouter-chat-completion.json'))
+  const complete = async (body: unknown) => {
+    fake = await startFakeModelServer([{ body }])
+    return createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+  }
+
+  it('reads costUsd, reasoningTokens and provider from the real OpenRouter response', async () => {
+    const file = real()
+    // The premise: the file holds all three. Without it the asserts below would also hold for three undefineds.
+    expect(typeof file.usage.cost).toBe('number')
+    expect(typeof file.usage.completion_tokens_details.reasoning_tokens).toBe('number')
+    expect(file.provider).toMatch(/\S/)
+    const r = await complete(fixture('openrouter-chat-completion.json')) // the bytes as they are in the file
+    expect(r.usage).toEqual({
+      source: 'provider_reported',
+      inputTokens: file.usage.prompt_tokens,
+      outputTokens: file.usage.completion_tokens,
+      cachedTokens: file.usage.prompt_tokens_details.cached_tokens,
+      costUsd: file.usage.cost,
+      reasoningTokens: file.usage.completion_tokens_details.reasoning_tokens,
+    })
+    expect(r.provider).toBe(file.provider)
+  })
+
+  it('keeps a cost and a reasoning-token count of 0: a free model reports them, and 0 is not absence', async () => {
+    const free = real()
+    free.usage.cost = 0
+    free.usage.completion_tokens_details.reasoning_tokens = 0
+    const r = await complete(free)
+    expect(r.usage.costUsd).toBe(0)
+    expect(r.usage.reasoningTokens).toBe(0)
+  })
+
+  it.each([
+    ['a body with usage but no cost', () => completion({ content: 'x' })],
+    ['a real Ollama response with reasoning', () => fixture('ollama-v1-reasoning.json')],
+    ['a real Ollama response with cached tokens', () => fixture('ollama-v1-cached.json')],
+  ])('leaves costUsd, reasoningTokens and provider undefined, and throws nothing, for %s', async (_label, body) => {
+    const r = await complete(body())
+    expect(r.usage.source).toBe('provider_reported')
+    expect(r.usage.costUsd).toBeUndefined()
+    expect(r.usage.reasoningTokens).toBeUndefined()
+    expect(r.provider).toBeUndefined()
+  })
+
+  it('reads the provider also when the response has no usage', async () => {
+    const file = real()
+    delete file.usage
+    const r = await complete(file)
+    expect(r.usage).toEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
+    expect(r.provider).toBe(real().provider)
+  })
+
+  // One field at a time is bent into something that is not a usable value; the rest of the real response must survive.
+  const NOT_A_NUMBER: Array<[label: string, value: unknown]> = [
+    ['a numeric string', '0.0000795'],
+    ['null', null],
+    ['an object', { usd: 0.0000795 }],
+    ['a boolean', true],
+  ]
+
+  it.each(NOT_A_NUMBER)('ignores usage.cost when it is %s', async (_label, cost) => {
+    const body = real()
+    body.usage.cost = cost
+    const r = await complete(body)
+    expect(r.usage.costUsd).toBeUndefined()
+    expect(r.usage.reasoningTokens).toBe(real().usage.completion_tokens_details.reasoning_tokens)
+    expect(r.provider).toBe(real().provider)
+    expect(r.usage.source).toBe('provider_reported')
+  })
+
+  it.each(NOT_A_NUMBER)('ignores reasoning_tokens when it is %s', async (_label, tokens) => {
+    const body = real()
+    body.usage.completion_tokens_details.reasoning_tokens = tokens
+    const r = await complete(body)
+    expect(r.usage.reasoningTokens).toBeUndefined()
+    expect(r.usage.costUsd).toBe(real().usage.cost)
+    expect(r.usage.source).toBe('provider_reported')
+  })
+
+  it.each([
+    ['null', null],
+    ['a string', 'details'],
+    ['a number', 27],
+  ])('ignores completion_tokens_details when it is %s', async (_label, details) => {
+    const body = real()
+    body.usage.completion_tokens_details = details
+    const r = await complete(body)
+    expect(r.usage.reasoningTokens).toBeUndefined()
+    expect(r.usage.costUsd).toBe(real().usage.cost)
+    expect(r.usage.source).toBe('provider_reported')
+  })
+
+  it.each([
+    ['an empty string', ''],
+    ['null', null],
+    ['a number', 42],
+    ['an object', { name: 'AkashML' }],
+  ])('ignores a provider that is %s: only a non-empty string counts', async (_label, provider) => {
+    const body = real()
+    body.provider = provider
+    const r = await complete(body)
+    expect(r.provider).toBeUndefined()
+    expect(r.usage.costUsd).toBe(real().usage.cost)
+  })
+})

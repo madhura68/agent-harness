@@ -64,15 +64,27 @@ function excerpt(text: string): string {
   return text.slice(0, 200)
 }
 
+// Only a real number counts: a string ('0.01'), null or an object is ignored rather than coerced. 0 is a number.
+function numberOrUndefined(v: unknown): number | undefined {
+  return typeof v === 'number' ? v : undefined
+}
+
 function parseUsage(raw: unknown): Usage {
-  const u = raw as { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } } | undefined
+  const u = raw as {
+    prompt_tokens?: unknown
+    completion_tokens?: unknown
+    cost?: unknown // OpenRouter: what the request cost, in dollars
+    prompt_tokens_details?: { cached_tokens?: unknown }
+    completion_tokens_details?: { reasoning_tokens?: unknown }
+  } | undefined
   if (u && typeof u.prompt_tokens === 'number' && typeof u.completion_tokens === 'number') {
-    const cached = u.prompt_tokens_details?.cached_tokens
     return {
       source: 'provider_reported',
       inputTokens: u.prompt_tokens,
       outputTokens: u.completion_tokens,
-      cachedTokens: typeof cached === 'number' ? cached : undefined,
+      cachedTokens: numberOrUndefined(u.prompt_tokens_details?.cached_tokens),
+      costUsd: numberOrUndefined(u.cost),
+      reasoningTokens: numberOrUndefined(u.completion_tokens_details?.reasoning_tokens),
     }
   }
   return { source: 'missing', inputTokens: 0, outputTokens: 0 }
@@ -149,7 +161,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       if (status < 200 || status >= 300) {
         throw new ModelError(`model HTTP ${status}: ${excerpt(maskedText)}`)
       }
-      let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown }
+      let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown; provider?: unknown }
       try {
         json = JSON.parse(text)
       } catch (err) {
@@ -178,6 +190,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         reasoning: parseReasoning(message),
         durationMs,
         systemFingerprint: nonEmptyString(json.system_fingerprint),
+        provider: nonEmptyString(json.provider),
       }
     },
   }

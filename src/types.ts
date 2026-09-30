@@ -22,6 +22,8 @@ export type Usage = {
   inputTokens: number
   outputTokens: number
   cachedTokens?: number
+  costUsd?: number // usage.cost; only when the response gives a number (0 is a number: a free model reports it)
+  reasoningTokens?: number // usage.completion_tokens_details.reasoning_tokens; only when the response gives a number
 }
 
 export type CompleteResult = {
@@ -32,6 +34,7 @@ export type CompleteResult = {
   reasoning?: string // message.reasoning, otherwise message.reasoning_content; only ever a non-empty string
   durationMs: number // measured from just before fetch to just after the response body is read
   systemFingerprint?: string // system_fingerprint
+  provider?: string // top-level `provider` of the response (OpenRouter names who served the request); only ever a non-empty string
 }
 
 export type RunStatus = 'completed' | 'failed' | 'budget_exceeded' | 'timed_out'
