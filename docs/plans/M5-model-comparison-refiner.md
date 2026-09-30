@@ -1,6 +1,6 @@
 # M5 — modellen vergelijken met de promptverfijner: implementatieplan
 
-_Status: draft, revisie 4 (2026-09-30). Een technisch GO autoriseert geen ceremonie, implementatie, uitgave, merge of serveractie._
+_Status: reviewed, revisie 5 (2026-09-30); dubbel GO in ronde 4. Een technisch GO autoriseert geen ceremonie, implementatie, uitgave, merge of serveractie._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -283,12 +283,12 @@ You can look things up in the product documentation with the tools search_produc
 ```
 
 - Nieuw veld `forbid_statement` (A5 en D5): regexen die alleen in een bewering tellen, over alle tekst en dus ook binnen het codeblok.
-  - De tekst wordt in zinnen geknipt op `.`, `!` of `?` gevolgd door witruimte, en op regeleinden. Een zin die op `?` eindigt, telt niet.
-  - In de andere zinnen telt een treffer alleen als hij helemaal vóór het eerste vraagwoord van de zin ligt (`QWORD` in Taak 10: `of`, `whether`, `if`, `wanneer`, `when`, `hoe`, `how`, `wat`, `what`): er wordt alleen gezocht in het stuk vóór dat vraagwoord. Een werkwoordenlijst is er niet.
-  - Zo vlagt "Leg uit dat een user story een type PBI is" wel, en "Leg uit of een user story een type PBI is" niet. "Een user story is een type PBI; bespreek of voorbeelden nodig zijn" vlagt ook, want de bewering staat vóór het vraagwoord. "Beschrijf de rol van maxToolErrors en wanneer de run eindigt" vlagt niet: de treffer zou over het vraagwoord heen lopen.
+  - De tekst wordt in zinsdelen geknipt op `.`, `!`, `?`, `:` of `;` gevolgd door witruimte, en op regeleinden (`clauses()` in Taak 10). Een zinsdeel dat op `?` eindigt, telt niet.
+  - In de andere zinsdelen telt een treffer alleen als hij helemaal vóór het eerste vraagwoord ligt (`QWORD` in Taak 10: `of`, `whether`, `if`, `wanneer`, `when`, `hoe`, `how`, `wat`, `what`): er wordt alleen gezocht in het stuk vóór dat vraagwoord. Een werkwoordenlijst is er niet.
+  - Zo vlagt "Leg uit dat een user story een type PBI is" wel, en "Leg uit of een user story een type PBI is" niet. "Een user story is een type PBI; bespreek of voorbeelden nodig zijn" vlagt ook, want de bewering staat vóór het vraagwoord. "Beschrijf de rol van maxToolErrors en wanneer de run eindigt" vlagt niet: de treffer zou over het vraagwoord heen lopen. "Leg uit wat het verschil is: een user story is een type PBI" vlagt wel, want na de dubbele punt begint een nieuw zinsdeel.
   - Bewuste grenzen, elk met een test die de grens vastlegt:
     - Nederlands "of" betekent ook "or". Een bewering na zo'n "of" telt niet: "Een bug of een user story is een type PBI", "De run stopt of faalt zodra maxToolErrors is overschreden";
-    - een zin die met een vraagwoord begint zonder een vraag te zijn, telt niet: "Wanneer je het verschil uitlegt: een user story is een type PBI".
+    - een zinsdeel dat met een vraagwoord begint zonder een vraag te zijn, telt niet: "When you explain the difference, make clear that every user story is a PBI".
 - R01 krijgt deze vijf als `forbid_statement`. `forbid_regex` blijft voor R01 leeg, en de bestaande `outside_fence_forbid` blijft.
 
 ```text
@@ -300,7 +300,7 @@ You can look things up in the product documentation with the tools search_produc
 ```
 
   - Getoetst op de acht echte R01-gesprekken van 29 september (`results/refiner-2026-09-29` en `refiner-2026-09-29-taalregel2`). De vijf gesprekken met een vlag houden die. Erbij komen `ac5133` en `03c8eb`, beide met "Leg uit dat een User Story een specifiek type PBI is." in de constraints van de prompt. `dc973d` blijft zonder vlag.
-  - De twintig vraagvormen uit ronde 1 tot 3 van de planreview geven binnen een promptblok geen treffer; acht lekzinnen, ook met een latere vraagbijzin, geven er wel een.
+  - De tweeëntwintig vraagvormen uit ronde 1 tot 4 van de planreview geven binnen een promptblok geen treffer; dertien lekzinnen, ook met een latere vraagbijzin of na een dubbele punt, geven er wel een.
   - JP beoordeelde `ac5133` blind als plakklaar en zonder A5-fout. De spec (§3, §5.4) wil dit lek wel vlaggen. Het rapport noemt daarom bij elke vlag het patroon, zodat JP een vlag kan verwerpen.
 - Vijf nieuwe cases met `"variant": "docs"`. Zo'n case draait alleen in de docs-variant; een case zonder `variant` alleen zonder docs. Nieuwe velden:
   - `doc_must_include` (D2): een waarde die met `(?` begint is een regex, anders letterlijk, zoals bij `must_include`;
@@ -353,7 +353,8 @@ You can look things up in the product documentation with the tools search_produc
   - R01 binnen een volledig promptblok geeft geen vlag op: "Leg uit of een user story een type PBI is.", "Is elke user story een PBI?", "Ga in op de vraag of een PBI een overkoepelend begrip is.", "Explain whether every user story counts as a PBI.", "Onderzoek of iedere user story een PBI is.", "Bespreek of PBI als overkoepelend begrip wordt gebruikt.", "Leg uit wat een PBI is en wat een user story is.", "Beschrijf of elke user story een PBI is.", "Zoek uit of iedere user story een PBI is.", "Find out whether every user story is a PBI.", "Controleer voor elke user story of die als PBI in de backlog staat." en "Beschrijf per user story het type en of het een PBI is.";
   - R01 geeft wel een vlag op: "Een user story is een type PBI; bespreek of voorbeelden nodig zijn." en "Leg uit dat een user story een type PBI is, en controleer of de rest van de tekst daarmee klopt.";
   - D02 geeft geen vlag op: "Leg uit wat er gebeurt als `maxToolErrors` wordt overschreden; zie specs/2026-09-26-agent-harness-v0-design, kopje 6.", "Geef aan of de run stopt of faalt bij het overschrijden van maxToolErrors.", "Beschrijf de rol van maxToolErrors en wanneer de run eindigt." en "Onderzoek het effect van maxToolErrors en of de run dan stopt."; wel op "De run eindigt als failed zodra het aantal toolfouten maxToolErrors overschrijdt.";
-  - de grenzen: "Een bug of een user story is een type PBI.", "De run stopt of faalt zodra maxToolErrors is overschreden." en "Wanneer je het verschil uitlegt: een user story is een type PBI." geven geen vlag;
+  - R01 geeft ook een vlag op een bewering na een dubbele punt: "Leg uit wat het verschil is: een user story is een type PBI.", "Beschrijf hoe het zit: een PBI is de overkoepelende term voor alles op de backlog." en "Explain what the difference is: every user story is a PBI."; geen vlag op "Beantwoord de vraag: is elke user story een PBI?" en "Taak: bepaal of elke user story een PBI is.";
+  - de grenzen: "Een bug of een user story is een type PBI.", "De run stopt of faalt zodra maxToolErrors is overschreden." en "When you explain the difference, make clear that every user story is a PBI." geven geen vlag;
   - het uitgewerkte voorbeeld uit de systeemprompt slaagt nog voor A1–A8.
 - [ ] Werk `SPECS/promptverfijner-systeemprompt` in de docs-store van product max2 (`cmsx8wyex0000hk7rx1428yyl`) bij naar v3, met de nieuwe sectie en het addendum.
 - [ ] FAIL → implementeer → PASS; unittest groen.
@@ -380,11 +381,15 @@ MARK = re.compile(r"(?i)onbekend|unknown|niet bekend|not known|ontbre|missing|no
                   r"|aanname|assumption|\[(FILL IN|INVULLEN)")
 
 def sentences(text):
-    """De zinnen van text: geknipt op . ! ? gevolgd door witruimte, en op regeleinden."""
+    """De zinnen van text: geknipt op . ! ? gevolgd door witruimte, en op regeleinden. Voor de D04-markering en CHANNEL_CONTEXT."""
+
+def clauses(text):
+    """Als sentences(), maar ook geknipt op : en ; gevolgd door witruimte. Alleen voor statement_hits(): in de
+    D04-markering zou die knip onderwerp en invulplek scheiden ("Webhook: [FILL IN: …]")."""
 
 def statement_hits(patterns, text):
-    """De patronen met een treffer in een bewering: in een zin die niet op '?' eindigt, en helemaal vóór het
-    eerste QWORD van die zin (er wordt alleen gezocht in s[:start van dat QWORD]). forbid_statement telt alleen zo."""
+    """De patronen met een treffer in een bewering: in een zinsdeel uit clauses() dat niet op '?' eindigt, en helemaal
+    vóór het eerste QWORD van dat zinsdeel (er wordt alleen gezocht in s[:start van dat QWORD]). forbid_statement telt alleen zo."""
 
 def load_run(rundir):
     """Zoals nu {(model, case, seed): gesprek}. Heeft een gesprek rijen met `poging`, dan telt de hoogste;
@@ -614,3 +619,12 @@ MINOR, verwerkt:
 Afgewezen: geen. Het alternatief om de twee D02-patronen te schrappen (claude, voor de tweede keer voorgesteld) is niet nodig: met de nieuwe regel vlaggen de nette D02-zinnen niet meer, en codex wil de dekking voor een bewering over stoppen of falen zonder foutcode houden.
 
 Scope, herbeoordeeld vóór ronde 4 zoals de loop voorschrijft. Drie rondes scherpten vooral de heuristieken van de checks aan (R01, D02, D04); er kwam geen nieuw subsysteem bij. De reeks convergeert: 4, 3 en 1 MAJOR, en codex gaf in ronde 3 GO. De D04-regel kwam twee keer terug, maar beide reviewers noemen hem nu goed, dus terugvallen op "D3 bij D04 indicatief" is niet nodig. Geen schrapkandidaat; het eerste bruikbare resultaat en het eerste praktijkbewijs zijn ongewijzigd.
+
+### Ronde 4 — revisie 4 (`80235e2`), 2026-09-30
+
+Reviewers: `mac:codex` (0 BLOCKER, 0 MAJOR, 0 MINOR; GO) en `mac:claude` (0 BLOCKER, 0 MAJOR, 1 MINOR; GO). **Dubbel GO.** Beide: de prefix-regel, de kanaalregel, de gedocumenteerde grenzen en de voorrang van de HTTP-stop houden stand; `calibrate6.py` is gereproduceerd (38 zinnen en 18 D04-gevallen zonder fout, de echte R01-gesprekken ongewijzigd). Beide: geen schrapkandidaat, en de scope-herbeoordeling klopt.
+
+MINOR, gecontroleerd en verwerkt in revisie 5 zonder nieuwe ronde, want het is een kleine aanscherping binnen dezelfde check en de uitkomst is gekalibreerd:
+- **claude:** een lek achter "werkwoord + vraagwoord …:" ontsnapte ("Leg uit wat het verschil is: een user story is een type PBI."), omdat de bewering na de dubbele punt buiten het doorzochte stuk viel → `statement_hits()` knipt ook na `:` en `;` gevolgd door witruimte (`clauses()`). `sentences()` voor de D04-markering blijft ongewijzigd, want daar zou dezelfde knip drie van de achttien gevallen laten zakken. `calibrate7.py`: 45 zinnen zonder fout, waaronder de drie lekvormen en twee nette vormen met een dubbele punt; de echte R01-gesprekken houden hun uitkomst. De grens van het leidende vraagwoord geldt nu alleen nog zonder dubbele punt.
+
+Afgewezen: geen. Scope: onveranderd. Revisie 5 is niet opnieuw gereviewd.
