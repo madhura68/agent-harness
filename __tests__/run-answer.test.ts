@@ -314,6 +314,44 @@ describe('runManifest — cost, reasoning tokens and provider', () => {
     expect(result.usage).toHaveProperty('costUsd', 0)
     expect(result.usage).toHaveProperty('reasoningTokens', 0)
   })
+
+  // A response can say what it cost without giving the token counts (source 'missing'). Its cost still counts: the run's
+  // costUsd is the sum the runner checks its spending cap against, and a billed amount must not vanish.
+  describe('a response without token counts', () => {
+    it.each(ORDERS)('adds its cost and reasoning tokens to the sums, next to a normal response: %s', async (_label, order) => {
+      const file = real()
+      const countlessCost = 0.0004321
+      const countlessReasoning = 9
+      const countless = real()
+      countless.usage = { cost: countlessCost, completion_tokens_details: { reasoning_tokens: countlessReasoning } }
+      const { result, trace, responses } = await runBodies(order<unknown>(file, countless))
+      const written = JSON.parse(readFileSync(join(trace.dir, 'result.json'), 'utf8'))
+      for (const usage of [result.usage, written.usage]) {
+        expect(usage.costUsd).toBeCloseTo(file.usage.cost + countlessCost, 12) // a float sum: compare within rounding
+        expect(usage.costUsd).toBeGreaterThan(file.usage.cost)
+        expect(usage.reasoningTokens).toBe(file.usage.completion_tokens_details.reasoning_tokens + countlessReasoning)
+      }
+      // The counts are what is missing, and the run says so; the tokens of the response that has them still count.
+      expect(result.usage.source).toBe('missing')
+      expect(result.usage.inputTokens).toBe(file.usage.prompt_tokens)
+      expect(result.usage.outputTokens).toBe(file.usage.completion_tokens)
+      // The trace shows the countless response as it came.
+      const event = responses.find((r) => (r.usage as { source: string }).source === 'missing')
+      expect(event?.usage).toStrictEqual({
+        source: 'missing', inputTokens: 0, outputTokens: 0, costUsd: countlessCost, reasoningTokens: countlessReasoning,
+      })
+    })
+
+    it('keeps the cost of a run whose only response has no token counts', async () => {
+      const file = real()
+      const cost = file.usage.cost
+      file.usage = { cost }
+      const { result, trace } = await runBodies([file])
+      expect(result.usage).toMatchObject({ source: 'missing', inputTokens: 0, outputTokens: 0, costUsd: cost })
+      expect(result.usage).not.toHaveProperty('reasoningTokens')
+      expect(JSON.parse(readFileSync(join(trace.dir, 'result.json'), 'utf8'))).toEqual(result)
+    })
+  })
 })
 
 const execFileP = promisify(execFile)

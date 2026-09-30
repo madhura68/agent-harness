@@ -22,8 +22,12 @@ export type Usage = {
   inputTokens: number
   outputTokens: number
   cachedTokens?: number
-  costUsd?: number // usage.cost; only when the response gives a number (0 is a number: a free model reports it)
-  reasoningTokens?: number // usage.completion_tokens_details.reasoning_tokens; only when the response gives a number
+  // The next two are read whenever the response gives a finite number, also when the token counts are missing
+  // (source 'missing'): a billed amount must not vanish. Absent otherwise. 0 is a number: a free model reports it.
+  costUsd?: number // usage.cost
+  // usage.completion_tokens_details.reasoning_tokens. These are part of outputTokens (the fixture: 27 of its 44), not on
+  // top of it: never add them to outputTokens.
+  reasoningTokens?: number
 }
 
 export type CompleteResult = {

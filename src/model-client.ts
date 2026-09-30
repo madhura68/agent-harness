@@ -64,9 +64,10 @@ function excerpt(text: string): string {
   return text.slice(0, 200)
 }
 
-// Only a real number counts: a string ('0.01'), null or an object is ignored rather than coerced. 0 is a number.
-function numberOrUndefined(v: unknown): number | undefined {
-  return typeof v === 'number' ? v : undefined
+// Only a finite number counts: a string ('0.01'), null or an object is ignored rather than coerced, and so is 1e999,
+// which JSON.parse reads as Infinity and JSON.stringify would write as null. 0 is a number.
+function finiteOrUndefined(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
 function parseUsage(raw: unknown): Usage {
@@ -77,17 +78,24 @@ function parseUsage(raw: unknown): Usage {
     prompt_tokens_details?: { cached_tokens?: unknown }
     completion_tokens_details?: { reasoning_tokens?: unknown }
   } | undefined
+  // Read whether or not the token counts are there: a billed amount must not vanish because a count is missing. The
+  // fields are spread in only when present, so a response that gives neither leaves no undefined keys behind.
+  const costUsd = finiteOrUndefined(u?.cost)
+  const reasoningTokens = finiteOrUndefined(u?.completion_tokens_details?.reasoning_tokens)
+  const extras: Pick<Usage, 'costUsd' | 'reasoningTokens'> = {
+    ...(costUsd !== undefined ? { costUsd } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+  }
   if (u && typeof u.prompt_tokens === 'number' && typeof u.completion_tokens === 'number') {
     return {
       source: 'provider_reported',
       inputTokens: u.prompt_tokens,
       outputTokens: u.completion_tokens,
-      cachedTokens: numberOrUndefined(u.prompt_tokens_details?.cached_tokens),
-      costUsd: numberOrUndefined(u.cost),
-      reasoningTokens: numberOrUndefined(u.completion_tokens_details?.reasoning_tokens),
+      cachedTokens: finiteOrUndefined(u.prompt_tokens_details?.cached_tokens),
+      ...extras,
     }
   }
-  return { source: 'missing', inputTokens: 0, outputTokens: 0 }
+  return { source: 'missing', inputTokens: 0, outputTokens: 0, ...extras }
 }
 
 function nonEmptyString(v: unknown): string | undefined {

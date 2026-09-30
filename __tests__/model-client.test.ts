@@ -404,6 +404,9 @@ describe('costUsd, reasoningTokens and provider', () => {
     expect(r.usage.source).toBe('provider_reported')
     expect(r.usage.costUsd).toBeUndefined()
     expect(r.usage.reasoningTokens).toBeUndefined()
+    // Absent, not present as undefined: a key with no value would still count as a property.
+    expect(r.usage).not.toHaveProperty('costUsd')
+    expect(r.usage).not.toHaveProperty('reasoningTokens')
     expect(r.provider).toBeUndefined()
   })
 
@@ -413,6 +416,72 @@ describe('costUsd, reasoningTokens and provider', () => {
     const r = await complete(file)
     expect(r.usage).toEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
     expect(r.provider).toBe(real().provider)
+  })
+
+  // The token counts are not both numbers, but the response still says what it cost. A billed amount must not vanish:
+  // the runner sums costUsd for its spending cap. source stays 'missing', since it is the counts that are missing.
+  // toStrictEqual: what the response does not give is absent from the usage, not present as undefined.
+  describe('when the token counts are missing', () => {
+    it.each([
+      ['only a cost', (cost: number) => ({ cost })],
+      ['only one of the two counts, and a cost', (cost: number) => ({ completion_tokens: 5, cost })],
+      ['counts that are strings, and a cost', (cost: number) => ({ prompt_tokens: '399', completion_tokens: '44', cost })],
+    ])('keeps the cost when usage has %s', async (_label, usageWith) => {
+      const file = real()
+      file.usage = usageWith(file.usage.cost)
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0, costUsd: real().usage.cost })
+      expect(r.provider).toBe(real().provider) // the rest of the response is read as usual
+    })
+
+    it('keeps a cost of 0: a free model reports it, and 0 is not absence', async () => {
+      const file = real()
+      file.usage = { cost: 0 }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0, costUsd: 0 })
+    })
+
+    it('keeps the reasoning tokens as well as the cost', async () => {
+      const file = real()
+      file.usage = { cost: file.usage.cost, completion_tokens_details: file.usage.completion_tokens_details }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({
+        source: 'missing', inputTokens: 0, outputTokens: 0,
+        costUsd: real().usage.cost,
+        reasoningTokens: real().usage.completion_tokens_details.reasoning_tokens,
+      })
+    })
+
+    it('keeps the reasoning tokens when there is no cost', async () => {
+      const file = real()
+      file.usage = { completion_tokens_details: file.usage.completion_tokens_details }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({
+        source: 'missing', inputTokens: 0, outputTokens: 0,
+        reasoningTokens: real().usage.completion_tokens_details.reasoning_tokens,
+      })
+    })
+
+    it('does not read a cost that is not a number, here either', async () => {
+      const file = real()
+      file.usage = { cost: '0.0000795', completion_tokens_details: { reasoning_tokens: null } }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
+    })
+
+    // usage that is no object at all: reading a cost from it must not throw, and there is nothing to keep.
+    it.each([
+      ['a string', 'n/a'],
+      ['a number', 42],
+      ['an array', []],
+      ['null', null],
+      ['an empty object', {}],
+    ])('reads usage that is %s as missing, without a cost and without error', async (_label, usage) => {
+      const file = real()
+      file.usage = usage
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
+    })
   })
 
   // One field at a time is bent into something that is not a usable value; the rest of the real response must survive.
@@ -466,5 +535,31 @@ describe('costUsd, reasoningTokens and provider', () => {
     const r = await complete(body)
     expect(r.provider).toBeUndefined()
     expect(r.usage.costUsd).toBe(real().usage.cost)
+  })
+
+  // JSON.parse reads 1e999 as Infinity, and JSON.stringify writes Infinity as null. The body goes out as raw text on
+  // purpose: an Infinity put into a JS object would already be null when it was serialised, and the test would pass
+  // for nothing. The premise check below proves the text really parses to an infinite number.
+  const at = (body: unknown, path: string[]) => path.reduce<unknown>((o, k) => (o as Record<string, unknown>)[k], body)
+  it.each([
+    ['usage.cost of 1e999', ['usage', 'cost'], '"cost": 7.95e-05', '"cost": 1e999', 'costUsd'],
+    ['usage.cost of -1e999', ['usage', 'cost'], '"cost": 7.95e-05', '"cost": -1e999', 'costUsd'],
+    ['reasoning_tokens of 1e999', ['usage', 'completion_tokens_details', 'reasoning_tokens'], '"reasoning_tokens": 27', '"reasoning_tokens": 1e999', 'reasoningTokens'],
+    ['cached_tokens of 1e999', ['usage', 'prompt_tokens_details', 'cached_tokens'], '"cached_tokens": 0', '"cached_tokens": 1e999', 'cachedTokens'],
+  ] as const)('ignores a %s, which JSON reads as infinite', async (_label, path, from, to, field) => {
+    const text = fixture('openrouter-chat-completion.json').replace(from, to)
+    expect(Math.abs(at(JSON.parse(text), [...path]) as number)).toBe(Infinity) // the premise
+    const r = await complete(text)
+    expect(r.usage[field]).toBeUndefined()
+    expect(JSON.stringify(r.usage)).not.toContain('null') // the symptom: an infinite number written out as null
+    expect(r.usage.source).toBe('provider_reported') // the rest of the real response survives
+    expect(r.provider).toBe(real().provider)
+  })
+
+  it('ignores an infinite cost when the token counts are missing too', async () => {
+    const text = JSON.stringify({ ...real(), usage: { cost: 0 } }).replace('"cost":0', '"cost":1e999')
+    expect(at(JSON.parse(text), ['usage', 'cost'])).toBe(Infinity) // the premise
+    const r = await complete(text)
+    expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
   })
 })

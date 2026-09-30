@@ -32,6 +32,7 @@ export type RunResult = {
     // The three below are sums over the responses that reported the field, and absent when no response did.
     cachedTokens?: number
     costUsd?: number
+    // Part of outputTokens (the fixture: 27 of its 44), not on top of it: never add it to outputTokens.
     reasoningTokens?: number
   }
   durationMs: number
