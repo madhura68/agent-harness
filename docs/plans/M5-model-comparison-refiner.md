@@ -1,6 +1,6 @@
 # M5 — modellen vergelijken met de promptverfijner: implementatieplan
 
-_Status: reviewed, revisie 5 (2026-09-30); dubbel GO in ronde 4. Een technisch GO autoriseert geen ceremonie, implementatie, uitgave, merge of serveractie._
+_Status: reviewed, revisie 6 (2026-09-30); dubbel GO in ronde 4, plus een volgordecorrectie bij de ceremonie (zie het Review record). Een technisch GO autoriseert geen ceremonie, implementatie, uitgave, merge of serveractie._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -349,13 +349,8 @@ You can look things up in the product documentation with the tools search_produc
   - elke case in `cases.jsonl` heeft de dertien bestaande velden, en een case met `variant: "docs"` heeft minstens één van de vier nieuwe velden;
   - elke letterlijke waarde in `doc_must_include` komt voor in de docset en elke regex heeft daar minstens één treffer; de alternatieven in de doc-verwijzing van D02 zijn precies de slugs van de docs waarin `TOO_MANY_TOOL_ERRORS` staat;
   - `Slack` en `webhook` komen in de docset niet voor;
-  - R01 op echte transcripten uit de repo: `ac5133` (`results/refiner-2026-09-29/raw.jsonl`) geeft een vlag met een treffer binnen het codeblok; `dc973d` (`results/refiner-2026-09-29-taalregel2/raw.jsonl`) geeft geen vlag;
-  - R01 binnen een volledig promptblok geeft geen vlag op: "Leg uit of een user story een type PBI is.", "Is elke user story een PBI?", "Ga in op de vraag of een PBI een overkoepelend begrip is.", "Explain whether every user story counts as a PBI.", "Onderzoek of iedere user story een PBI is.", "Bespreek of PBI als overkoepelend begrip wordt gebruikt.", "Leg uit wat een PBI is en wat een user story is.", "Beschrijf of elke user story een PBI is.", "Zoek uit of iedere user story een PBI is.", "Find out whether every user story is a PBI.", "Controleer voor elke user story of die als PBI in de backlog staat." en "Beschrijf per user story het type en of het een PBI is.";
-  - R01 geeft wel een vlag op: "Een user story is een type PBI; bespreek of voorbeelden nodig zijn." en "Leg uit dat een user story een type PBI is, en controleer of de rest van de tekst daarmee klopt.";
-  - D02 geeft geen vlag op: "Leg uit wat er gebeurt als `maxToolErrors` wordt overschreden; zie specs/2026-09-26-agent-harness-v0-design, kopje 6.", "Geef aan of de run stopt of faalt bij het overschrijden van maxToolErrors.", "Beschrijf de rol van maxToolErrors en wanneer de run eindigt." en "Onderzoek het effect van maxToolErrors en of de run dan stopt."; wel op "De run eindigt als failed zodra het aantal toolfouten maxToolErrors overschrijdt.";
-  - R01 geeft ook een vlag op een bewering na een dubbele punt: "Leg uit wat het verschil is: een user story is een type PBI.", "Beschrijf hoe het zit: een PBI is de overkoepelende term voor alles op de backlog." en "Explain what the difference is: every user story is a PBI."; geen vlag op "Beantwoord de vraag: is elke user story een PBI?" en "Taak: bepaal of elke user story een PBI is.";
-  - de grenzen: "Een bug of een user story is een type PBI.", "De run stopt of faalt zodra maxToolErrors is overschreden." en "When you explain the difference, make clear that every user story is a PBI." geven geen vlag;
   - het uitgewerkte voorbeeld uit de systeemprompt slaagt nog voor A1–A8.
+  - De vlaggen van R01 en D02 op `forbid_statement` worden getest in Taak 10: daar gaat `statement_hits()` meetellen in A5 en D5.
 - [ ] Werk `SPECS/promptverfijner-systeemprompt` in de docs-store van product max2 (`cmsx8wyex0000hk7rx1428yyl`) bij naar v3, met de nieuwe sectie en het addendum.
 - [ ] FAIL → implementeer → PASS; unittest groen.
 - [ ] Commit: `llm-bench: promptverfijner v3, docs-addendum en doc-cases`
@@ -447,6 +442,13 @@ def sieve(scored, planned=None, probe=None):
     - de grens: "Stuur naar het Slack-kanaal harness-alerts." met een gemarkeerde webhook slaagt;
   - D4: de regel "Ik ga uit van testcommando `npm run verify`." zakt niet; de vraag "Welk testcommando gebruik je? [npm test]" wel;
   - `statement_hits()`: "Leg uit dat …" telt, "Leg uit of …", "Explain whether …" en een zin op `?` niet; een bewering vóór het vraagwoord in dezelfde zin telt wel, een treffer die over het vraagwoord heen loopt niet;
+  - met de cases uit Taak 9: een vlag op `forbid_statement` bestaat pas zodra `statement_hits()` in deze taak meetelt in A5 en D5, dus deze tests staan hier:
+    - R01 op echte transcripten uit de repo: `ac5133` (`results/refiner-2026-09-29/raw.jsonl`) geeft een vlag met een treffer binnen het codeblok; `dc973d` (`results/refiner-2026-09-29-taalregel2/raw.jsonl`) geeft geen vlag;
+    - R01 binnen een volledig promptblok geeft geen vlag op: "Leg uit of een user story een type PBI is.", "Is elke user story een PBI?", "Ga in op de vraag of een PBI een overkoepelend begrip is.", "Explain whether every user story counts as a PBI.", "Onderzoek of iedere user story een PBI is.", "Bespreek of PBI als overkoepelend begrip wordt gebruikt.", "Leg uit wat een PBI is en wat een user story is.", "Beschrijf of elke user story een PBI is.", "Zoek uit of iedere user story een PBI is.", "Find out whether every user story is a PBI.", "Controleer voor elke user story of die als PBI in de backlog staat." en "Beschrijf per user story het type en of het een PBI is.";
+    - R01 geeft wel een vlag op: "Een user story is een type PBI; bespreek of voorbeelden nodig zijn." en "Leg uit dat een user story een type PBI is, en controleer of de rest van de tekst daarmee klopt.";
+    - D02 geeft geen vlag op: "Leg uit wat er gebeurt als `maxToolErrors` wordt overschreden; zie specs/2026-09-26-agent-harness-v0-design, kopje 6.", "Geef aan of de run stopt of faalt bij het overschrijden van maxToolErrors.", "Beschrijf de rol van maxToolErrors en wanneer de run eindigt." en "Onderzoek het effect van maxToolErrors en of de run dan stopt."; wel op "De run eindigt als failed zodra het aantal toolfouten maxToolErrors overschrijdt.";
+    - R01 geeft ook een vlag op een bewering na een dubbele punt: "Leg uit wat het verschil is: een user story is een type PBI.", "Beschrijf hoe het zit: een PBI is de overkoepelende term voor alles op de backlog." en "Explain what the difference is: every user story is a PBI."; geen vlag op "Beantwoord de vraag: is elke user story een PBI?" en "Taak: bepaal of elke user story een PBI is.";
+    - de grenzen: "Een bug of een user story is een type PBI.", "De run stopt of faalt zodra maxToolErrors is overschreden." en "When you explain the difference, make clear that every user story is a PBI." geven geen vlag;
   - `load_run` neemt de rijen van poging 2 als die er zijn, onthoudt de status van poging 1 en struikelt niet over een rij met `turn` `"plan"`, `"probe"` of `"stop"`;
   - de zeef: een mislukt gesprek telt in de noemer; één vlag geeft "gezakt"; A8 met twee gesprekken telt niet mee; 13 van de 15 afgerond geeft "gezakt" en 14 van de 15 "door"; 15 geplande gesprekken waarvan er 13 aanwezig en afgerond zijn, geeft 13 van de 15 en dus "gezakt"; geen plan en geen gesprekken geeft "niet gedraaid" met de reden uit de proberij;
   - een kopie van de run van 29 september (`results/refiner-2026-09-29`) geeft dezelfde `summary.csv` als de vastgelegde, met precies dit verschil: `ac5133` krijgt A5 `flag`, en de `notes` van de twee R01-rijen noemen de nieuwe patronen.
@@ -628,3 +630,7 @@ MINOR, gecontroleerd en verwerkt in revisie 5 zonder nieuwe ronde, want het is e
 - **claude:** een lek achter "werkwoord + vraagwoord …:" ontsnapte ("Leg uit wat het verschil is: een user story is een type PBI."), omdat de bewering na de dubbele punt buiten het doorzochte stuk viel → `statement_hits()` knipt ook na `:` en `;` gevolgd door witruimte (`clauses()`). `sentences()` voor de D04-markering blijft ongewijzigd, want daar zou dezelfde knip drie van de achttien gevallen laten zakken. `calibrate7.py`: 45 zinnen zonder fout, waaronder de drie lekvormen en twee nette vormen met een dubbele punt; de echte R01-gesprekken houden hun uitkomst. De grens van het leidende vraagwoord geldt nu alleen nog zonder dubbele punt.
 
 Afgewezen: geen. Scope: onveranderd. Revisie 5 is niet opnieuw gereviewd.
+
+### Na dubbel GO — bij de ceremonie (revisie 6), 2026-09-30
+
+Bij het opdelen in Scrum4Me-taken bleek een volgordefout die de rondes niet vingen. De tests die een vlag van R01 of D02 op `forbid_statement` verwachten, stonden in Taak 9. Dat veld telt pas mee in A5 en D5 zodra `statement_hits()` bestaat, en dat bouwt Taak 10. In Taak 9 zouden ze dus falen, of zonder de functie slagen. Die zes testregels staan nu in Taak 10; Taak 9 houdt de tests op de casedata. Inhoud, scope en acceptatie zijn ongewijzigd. Niet opnieuw gereviewd.
