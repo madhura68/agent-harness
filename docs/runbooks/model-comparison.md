@@ -67,6 +67,26 @@ Bevindingen:
 - **Geen aanbieder:** een aanvraag met `provider.only: ["no-such-provider"]` gaf HTTP 404, zonder kosten. De melding: `{"error":{"message":"No allowed providers are available for the selected model. Providers serving …","code":404,…}}`. Via de harness wordt dat de reden `model HTTP 404: …`, met een melding die providers noemt. Dat past op de regel "geen aanbieder" in Taak 11 (404 of 503 met een providermelding).
 - **Sleutelcontrole:** `check.py` over `~/Development/m5-first-contact/` na afloop: 29 bestanden, 0 met de sleutel.
 
+### Aanvulling: temperature en seed onder `require_parameters`
+
+De runs sturen ook `temperature` 0,7 en een `seed`, en `require_parameters: true` routeert alleen naar aanbieders die elk meegestuurd veld ondersteunen. Daarom per model nog één aanvraag met reasoning uit, `"temperature": 0.7` en `"seed": 1`. Alle vijf gaven HTTP 200:
+
+| Model | Aanbieder | Kosten ($) |
+|---|---|---|
+| `qwen/qwen3.6-35b-a3b` | AkashML | 0,0000369 |
+| `qwen/qwen3.8-27b` | Reka | 0,0000200 |
+| `google/gemma-4-31b-it` | Friendli | 0,0000109 |
+| `qwen/qwen3.5-122b-a10b` | DeepInfra | 0,0000881 |
+| `nvidia/nemotron-3-super-120b-a12b` | DekaLLM | 0,0000333 |
+
+Bij `qwen3.5-122b` antwoordde met seed een andere aanbieder (DeepInfra) dan zonder (Alibaba): de seed verkleint de kring van aanbieders. Stand daarna: `limit_remaining` 19,99235; sleutelcontrole over 39 bestanden: 0 met de sleutel.
+
+### Kanttekeningen
+
+- **Reasoning-niveau:** dat `{"effort": "medium"}` reasoning aanzet, is aangetoond; of het niveau `medium` ook als zodanig wordt gehonoreerd, is met één korte vraag niet te zien. Het rapport noemt de instelling, niet een gemeten niveau.
+- **"Geen aanbieder":** de 404 hierboven komt van een `provider.only`-filter. De variant waarin `data_collection` of `require_parameters` de laatste aanbieder uitsluit (en de 503 uit de docs) is niet waargenomen; de regel in Taak 11 dekt 404 en 503 met een providermelding.
+- **Probe van qwen3.6:** stap d werd afgekapt op 512 tokens (`finishReason` `length`, `content` leeg) en slaagde omdat er geen vreemde toolaanroep was. Zonder reasoning-instelling denkt dit model standaard; de probe van Taak 14 draait daarom met reasoning uit.
+
 ### Fixture voor de kostenparser (Taak 5)
 
 `__tests__/fixtures/openrouter-chat-completion.json` is de respons `qwen36-medium` (AkashML, reasoning `medium`). Alleen `id` (`gen-fixture-0001`) en `created` (`1790000000`) zijn vervangen door vaste waarden; de rest is ongewijzigd, met `provider`, `usage.cost` (0,0000795) en `reasoning_tokens` (27).
