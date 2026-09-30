@@ -1,6 +1,6 @@
 # M5 — modellen vergelijken met de promptverfijner: implementatieplan
 
-_Status: draft, revisie 2 (2026-09-30). Een technisch GO autoriseert geen ceremonie, implementatie, uitgave, merge of serveractie._
+_Status: draft, revisie 3 (2026-09-30). Een technisch GO autoriseert geen ceremonie, implementatie, uitgave, merge of serveractie._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -105,7 +105,7 @@ curl -sS --max-time 120 https://openrouter.ai/api/v1/chat/completions \
 ```
 
   Geen `-v`. `printf` is een shell-builtin, dus de sleutel staat niet in argv.
-- [ ] Stel per model vast, en schrijf in de runbook: welke aanbieder antwoordde, of er een aanbieder is onder het `provider`-blok met tools, welke `reasoning`-velden reasoning uit zetten en welke `medium` of "aan" geven, of de respons `provider`, `usage.cost` en `completion_tokens_details.reasoning_tokens` draagt, en wat de aanvraag kostte.
+- [ ] Stel per model vast, en schrijf in de runbook: welke aanbieder antwoordde, of er een aanbieder is onder het `provider`-blok met tools (en zo niet: welke HTTP-status en melding OpenRouter geeft; volgens de docs 404 "No allowed providers are available…" of 503 "no available model provider that meets your routing requirements"), welke `reasoning`-velden reasoning uit zetten en welke `medium` of "aan" geven, of de respons `provider`, `usage.cost` en `completion_tokens_details.reasoning_tokens` draagt, en wat de aanvraag kostte.
 - [ ] Maak van één respons de fixture: id's vervangen door vaste waarden, verder ongewijzigd, met de aanbiedernaam en het `usage`-blok erin. Dit is de bron voor Taak 5.
 - [ ] Sleutelcontrole over `~/Development/m5-first-contact/` met het script van de eerste stap, uitgebreid met een telling van bestanden waarin de sleutel voorkomt: nul treffers. Noteer `limit_remaining` na afloop.
 - [ ] Commit: `docs(runbook): eerste contact met OpenRouter, fixture voor de kostenparser`
@@ -283,9 +283,10 @@ You can look things up in the product documentation with the tools search_produc
 ```
 
 - Nieuw veld `forbid_statement` (A5 en D5): regexen die alleen in een bewering tellen, over alle tekst en dus ook binnen het codeblok.
-  - De tekst wordt in zinnen geknipt op `.`, `!` of `?` gevolgd door witruimte, en op regeleinden.
-  - Een zin telt niet als hij op `?` eindigt of een onderzoeksvraag is (`INQUIRY` in Taak 10: "leg uit of", "onderzoek of", "de vraag of", "explain whether").
-  - Zo vlagt "Leg uit dat een user story een type PBI is" wel, en "Leg uit of een user story een type PBI is" niet.
+  - De tekst wordt in zinnen geknipt op `.`, `!` of `?` gevolgd door witruimte, en op regeleinden. Een zin die op `?` eindigt, telt niet.
+  - In de andere zinnen telt een treffer alleen als hij begint vóór het eerste vraagwoord van de zin (`QWORD` in Taak 10: `of`, `whether`, `if`, `wanneer`, `when`, `hoe`, `how`, `wat`, `what`). Een werkwoordenlijst is er niet.
+  - Zo vlagt "Leg uit dat een user story een type PBI is" wel, en "Leg uit of een user story een type PBI is" niet. "Een user story is een type PBI; bespreek of voorbeelden nodig zijn" vlagt ook, want de bewering staat vóór het vraagwoord.
+  - Bewuste grens: Nederlands "of" betekent ook "or". Een bewering na zo'n "of", zoals "Een bug of een user story is een type PBI", telt niet.
 - R01 krijgt deze vijf als `forbid_statement`. `forbid_regex` blijft voor R01 leeg, en de bestaande `outside_fence_forbid` blijft.
 
 ```text
@@ -297,7 +298,7 @@ You can look things up in the product documentation with the tools search_produc
 ```
 
   - Getoetst op de acht echte R01-gesprekken van 29 september (`results/refiner-2026-09-29` en `refiner-2026-09-29-taalregel2`). De vijf gesprekken met een vlag houden die. Erbij komen `ac5133` en `03c8eb`, beide met "Leg uit dat een User Story een specifiek type PBI is." in de constraints van de prompt. `dc973d` blijft zonder vlag.
-  - De zeven vraagvormen uit ronde 1 van de planreview geven binnen een promptblok geen treffer.
+  - De achttien vraagvormen uit ronde 1 en 2 van de planreview geven binnen een promptblok geen treffer; zeven lekzinnen, ook met een latere vraagbijzin, geven er wel een.
   - JP beoordeelde `ac5133` blind als plakklaar en zonder A5-fout. De spec (§3, §5.4) wil dit lek wel vlaggen. Het rapport noemt daarom bij elke vlag het patroon, zodat JP een vlag kan verwerpen.
 - Vijf nieuwe cases met `"variant": "docs"`. Zo'n case draait alleen in de docs-variant; een case zonder `variant` alleen zonder docs. Nieuwe velden:
   - `doc_must_include` (D2): een waarde die met `(?` begint is een regex, anders letterlijk, zoals bij `must_include`;
@@ -327,7 +328,7 @@ You can look things up in the product documentation with the tools search_produc
 {"id": "D04", "titel": "feit niet in de docs", "lang": "nl", "variant": "docs",
  "input": "Laat de harness bij een mislukte job een melding naar ons Slack-kanaal sturen.",
  "replies": ["Akkoord met je voorstellen."],
- "doc_absent_topic": "(?i)slack|kanaal|channel|webhook",
+ "doc_absent_topic": "(?i)kanaal|channel|webhook",
  "doc_absent_forbid": ["hooks\\.slack\\.com/services/[A-Z0-9]"]}
 {"id": "D05", "titel": "Engelse invoer", "lang": "en", "variant": "docs",
  "input": "I want a prompt that has Claude review the task worker's stop behaviour under a systemd restart.",
@@ -339,7 +340,7 @@ You can look things up in the product documentation with the tools search_produc
   - D01: de aanroep `harness check-run-logs --config <worker.json> --dir <run-logs-dir>` en de gate `npm run verify` staan in de docset; de vlag `--json` niet.
   - D02: de doc-verwijzing mag naar elke doc waarin `TOO_MANY_TOOL_ERRORS` staat; dat zijn deze drie. De slug alleen volstaat, zodat ook een URI of een losse vermelding telt. Het antwoord zelf is de foutcode, en een bewering dat de run bij `maxToolErrors` stopt of faalt. De naam van de limiet mag in een verwijzing of een vraag staan.
   - D03: het pad is het feit dat alleen uit de docs komt; de tweede waarde is de markering van een mislukte job (`ERROR <CODE>: …`, en `exit code=1` als laatste regel).
-  - D04: de check slaagt als het model naar het kanaal of de webhook vroeg, of het in zijn laatste beurt als onbekend of als aanname markeert (Taak 10, D3). Een webhook-adres laat hem altijd zakken.
+  - D04: de check slaagt als het model naar het kanaal of de webhook vroeg, of het in zijn laatste beurt als onbekend of als aanname markeert (Taak 10, D3). Een verzonnen kanaalnaam of een webhook-adres laat hem altijd zakken. `slack` hoort niet in het onderwerp: het is het onderwerp van de hele taak, dus bijna elke vraag of aanname noemt het.
   - D05: de waarden `mixed` en `180` komen uit de docs; de namen van de instellingen kent een model ook zonder.
 
 - [ ] Tests:
@@ -347,8 +348,9 @@ You can look things up in the product documentation with the tools search_produc
   - elke letterlijke waarde in `doc_must_include` komt voor in de docset en elke regex heeft daar minstens één treffer; de alternatieven in de doc-verwijzing van D02 zijn precies de slugs van de docs waarin `TOO_MANY_TOOL_ERRORS` staat;
   - `Slack` en `webhook` komen in de docset niet voor;
   - R01 op echte transcripten uit de repo: `ac5133` (`results/refiner-2026-09-29/raw.jsonl`) geeft een vlag met een treffer binnen het codeblok; `dc973d` (`results/refiner-2026-09-29-taalregel2/raw.jsonl`) geeft geen vlag;
-  - R01 binnen een volledig promptblok geeft geen vlag op: "Leg uit of een user story een type PBI is.", "Is elke user story een PBI?", "Ga in op de vraag of een PBI een overkoepelend begrip is.", "Explain whether every user story counts as a PBI.", "Onderzoek of iedere user story een PBI is.", "Bespreek of PBI als overkoepelend begrip wordt gebruikt." en "Leg uit wat een PBI is en wat een user story is.";
-  - D02: "Leg uit wat er gebeurt als `maxToolErrors` wordt overschreden; zie specs/2026-09-26-agent-harness-v0-design, kopje 6." geeft geen vlag; "De run eindigt als failed zodra het aantal toolfouten maxToolErrors overschrijdt." wel;
+  - R01 binnen een volledig promptblok geeft geen vlag op: "Leg uit of een user story een type PBI is.", "Is elke user story een PBI?", "Ga in op de vraag of een PBI een overkoepelend begrip is.", "Explain whether every user story counts as a PBI.", "Onderzoek of iedere user story een PBI is.", "Bespreek of PBI als overkoepelend begrip wordt gebruikt.", "Leg uit wat een PBI is en wat een user story is.", "Beschrijf of elke user story een PBI is.", "Zoek uit of iedere user story een PBI is." en "Find out whether every user story is a PBI.";
+  - R01 geeft wel een vlag op: "Een user story is een type PBI; bespreek of voorbeelden nodig zijn." en "Leg uit dat een user story een type PBI is, en controleer of de rest van de tekst daarmee klopt.";
+  - D02: "Leg uit wat er gebeurt als `maxToolErrors` wordt overschreden; zie specs/2026-09-26-agent-harness-v0-design, kopje 6." en "Geef aan of de run stopt of faalt bij het overschrijden van maxToolErrors." geven geen vlag; "De run eindigt als failed zodra het aantal toolfouten maxToolErrors overschrijdt." wel;
   - het uitgewerkte voorbeeld uit de systeemprompt slaagt nog voor A1–A8.
 - [ ] Werk `SPECS/promptverfijner-systeemprompt` in de docs-store van product max2 (`cmsx8wyex0000hk7rx1428yyl`) bij naar v3, met de nieuwe sectie en het addendum.
 - [ ] FAIL → implementeer → PASS; unittest groen.
@@ -368,12 +370,17 @@ PATH_ABS = re.compile(r"(?<![\w.:/~-])~?/[\w.~-]+(?:/[\w.~-]+)+")               
 PATH_REL = re.compile(r"(?<![\w.:/~-])[a-z_.][\w.-]*(?:/[\w.-]+)+\.[A-Za-z]{1,6}(?![\w/-])")   # src/cli.ts, docs/x/y.md
 DOC_REF = re.compile(r"(?<![\w.:/~-])(?:adr|architecture|grills|patterns|plans|runbooks|specs|manual|api)"
                      r"/[a-z0-9][a-z0-9-]*(?![\w/.-])")                                        # specs/<slug>
-INQUIRY = re.compile(r"(?i)\b(onderzoek|leg uit|bespreek|ga na|controleer|bepaal|kijk|vraag|beoordeel|toets|check|explain"
-                     r"|discuss|examine|investigate|assess|determine|consider)\b[^.?!\n]{0,20}\b(of|whether|if)\b")
+QWORD = re.compile(r"(?i)\b(of|whether|if|wanneer|when|hoe|how|wat|what)\b")
+CHANNEL = re.compile(r"(?<![\w&])#[a-z][a-z0-9_-]+")                                           # #harness-alerts
+MARK = re.compile(r"(?i)onbekend|unknown|niet bekend|not known|ontbre|missing|nog in te vullen|to be provided"
+                  r"|aanname|assumption|\[(FILL IN|INVULLEN)")
 
-def statements(text):
-    """De zinnen van text (geknipt op . ! ? gevolgd door witruimte, en op regeleinden) die niet op '?' eindigen
-    en geen INQUIRY bevatten. forbid_statement telt alleen hierin."""
+def sentences(text):
+    """De zinnen van text: geknipt op . ! ? gevolgd door witruimte, en op regeleinden."""
+
+def statement_hits(patterns, text):
+    """De patronen met een treffer in een bewering: in een zin die niet op '?' eindigt, en met de treffer
+    vóór het eerste QWORD van die zin. forbid_statement telt alleen zo."""
 
 def load_run(rundir):
     """Zoals nu {(model, case, seed): gesprek}. Heeft een gesprek rijen met `poging`, dan telt de hoogste;
@@ -385,23 +392,25 @@ def load_meta(rundir):
 def score_conversation(case, turns, rows=None, docset=None):
     """Bestaande A1-A8. Voor een case met variant 'docs' ook D1-D6; rows en docset zijn dan verplicht."""
 
-def sieve(scored, planned=None):
-    """scored: de gescoorde gesprekken van één model en één variant; planned: de (case, seed)-paren uit de plan-rij.
-    Geeft {'outcome': 'door' | 'gezakt', 'completed': (n, totaal), 'first_attempt_completed': n,
-           'flags': [blind_id, ...], 'checks': {naam: (geslaagd, van, telt_mee)}, 'reasons': [...]}."""
+def sieve(scored, planned=None, probe=None):
+    """scored: de gescoorde gesprekken van één model en één variant; planned: de (case, seed)-paren uit de plan-rij;
+    probe: de proberij. Geeft {'outcome': 'door' | 'gezakt' | 'niet gedraaid', 'completed': (n, totaal),
+    'first_attempt_completed': n, 'flags': [blind_id, ...], 'checks': {naam: (geslaagd, van, telt_mee)}, 'reasons': [...]}.
+    Zonder geplande en zonder aanwezige gesprekken is de uitkomst 'niet gedraaid', met de reden uit de proberij."""
 ```
 
-- A5 telt voortaan ook `forbid_statement`: een treffer in een zin uit `statements()`. `forbid_regex` en `outside_fence_forbid` werken zoals nu.
+- A5 telt voortaan ook `forbid_statement`, via `statement_hits()`. `forbid_regex` en `outside_fence_forbid` werken zoals nu.
 - "De laatste prompt" is het laatste codeblok over alle modelbeurten van het gesprek.
 - D1: in de rij van beurt 1 staat minstens één toolaanroep met `ok: true` en een naam uit `DOC_TOOLS`.
 - D2: elke waarde uit `doc_must_include` staat in de laatste prompt.
 - D3: elke treffer van de drie patronen in de laatste prompt, zonder een afsluitend `.`, `,`, `;` of `:`, komt voor in de docset of in een gebruikersbericht van het gesprek.
   - "Komt voor" is: letterlijk in de inhoud van een docset-bestand of in een gebruikersbericht; voor een `DOC_REF` telt ook een folder en slug uit `docset.json`.
   - De patronen zijn bewust smal. Op de laatste prompts van de drie refiner-runs van 29 september vinden ze zes verschillende treffers, alle echte paden (zoals `/srv/backups` en `/usr/local/bin/nas-sync.sh`); "alles met een slash" gaf daar 69 verschillende treffers, vooral XML-sluittags als `</task>` en woorden als `Python/Airflow`.
-  - Bij een case met `doc_absent_topic` (D04) slaagt D3 alleen als het model het ontbrekende gegeven vroeg of markeerde, en geen treffer van `doc_absent_forbid` in een modelbeurt schreef:
-    - gevraagd: een vraagregel (zie D4) vóór het eerste codeblok noemt het onderwerp. Een voorgestelde standaard die de gebruiker daarna accepteert, geldt dan als afgesproken;
-    - gemarkeerd, in de laatste modelbeurt: een `[FILL IN`- of `[INVULLEN`-plek; of een regel die het onderwerp noemt samen met `onbekend`, `unknown`, `niet bekend`, `not known`, `ontbre…`, `missing`, `aanname` of `assumption`; of een bullet in de aannamesectie die het onderwerp noemt. De aannamesectie is de regel met "Aannames" of "Assumptions" en de bullets direct eronder, buiten het codeblok;
-    - een kopje "Aannames" zonder het onderwerp telt niet. De systeemprompt schrijft die sectie in elk eindantwoord voor; op 29 september stond hij in 20 van de 20 laatste beurten.
+  - Bij een case met `doc_absent_topic` (D04) slaagt D3 alleen als het model het ontbrekende gegeven vroeg of markeerde, en niets verzon:
+    - gevraagd: een vraagregel (zie D4) vóór het eerste codeblok noemt het onderwerp;
+    - gemarkeerd, in de laatste modelbeurt: een zin (`sentences()`) die het onderwerp noemt en een treffer van `MARK` heeft, dus ook een `[FILL IN`- of `[INVULLEN`-plek in dezelfde zin; of een bullet in de aannamesectie die het onderwerp noemt. De aannamesectie is de regel met "Aannames" of "Assumptions" en de bullets direct eronder, buiten het codeblok. Een kopje "Aannames" zonder het onderwerp telt niet: de systeemprompt schrijft die sectie in elk eindantwoord voor, en op 29 september stond hij in 20 van de 20 laatste beurten. Een invulplek voor iets anders telt ook niet;
+    - verzonnen: een treffer van `doc_absent_forbid` in een modelbeurt, of een kanaalnaam (`CHANNEL`) in de laatste prompt die niet in een vraagregel vóór het eerste codeblok stond en niet in een gebruikersbericht. Een voorgestelde standaard die de gebruiker daarna accepteert, is zo afgesproken en niet verzonnen.
+    - Getoetst op vijftien vaste gevallen, waaronder alle tegenvoorbeelden uit ronde 1 en 2 van de planreview: nul verkeerde uitkomsten.
 - D4: geen treffer van `doc_forbid_ask` in een vraagregel vóór het eerste codeblok. Een vraagregel bevat een `?` of begint met een nummer (`NUMBERED`).
 - D5: voor een docs-case met `forbid_regex`, `forbid_statement` of `outside_fence_forbid`, nu alleen D02: dezelfde regel als A5, met `flag` als uitkomst. A5 zelf is bij die cases "n.v.t.".
 - D6: elke rij van het gesprek heeft de harness-status `completed`.
@@ -422,10 +431,13 @@ def sieve(scored, planned=None):
     - een aannamebullet over het Slack-kanaal slaagt, en een `[FILL IN: …]`-plek ook;
     - een gevraagd kanaal met een geaccepteerde standaard slaagt;
     - een webhook-adres zakt, ook na een vraag;
+    - `#harness-alerts` in de prompt zakt ook bij een vraag die alleen over de inhoud of het tijdstip van het Slack-bericht gaat, bij een algemene aannamebullet over Slack, bij een foutafhandelingsregel met "webhook" en "ontbreekt", en bij "Repository: [FILL IN: pad]";
+    - "Stuur de melding naar het Slack-kanaal. Repository: [FILL IN: pad]." zakt: de invulplek gaat over iets anders;
+    - een markdown-anker als `docs/runbooks/idea-chat-worker.md#run-logs-in-worker-logs-m4` is geen kanaalnaam;
   - D4: de regel "Ik ga uit van testcommando `npm run verify`." zakt niet; de vraag "Welk testcommando gebruik je? [npm test]" wel;
-  - `statements()`: "Leg uit dat …" telt, "Leg uit of …", "Explain whether …" en een zin op `?` niet;
+  - `statement_hits()`: "Leg uit dat …" telt, "Leg uit of …", "Explain whether …" en een zin op `?` niet; een bewering vóór het vraagwoord in dezelfde zin telt wel;
   - `load_run` neemt de rijen van poging 2 als die er zijn, onthoudt de status van poging 1 en struikelt niet over een rij met `turn` `"plan"`, `"probe"` of `"stop"`;
-  - de zeef: een mislukt gesprek telt in de noemer; één vlag geeft "gezakt"; A8 met twee gesprekken telt niet mee; 13 van de 15 afgerond geeft "gezakt" en 14 van de 15 "door"; 15 geplande gesprekken waarvan er 13 aanwezig en afgerond zijn, geeft 13 van de 15 en dus "gezakt";
+  - de zeef: een mislukt gesprek telt in de noemer; één vlag geeft "gezakt"; A8 met twee gesprekken telt niet mee; 13 van de 15 afgerond geeft "gezakt" en 14 van de 15 "door"; 15 geplande gesprekken waarvan er 13 aanwezig en afgerond zijn, geeft 13 van de 15 en dus "gezakt"; geen plan en geen gesprekken geeft "niet gedraaid" met de reden uit de proberij;
   - een kopie van de run van 29 september (`results/refiner-2026-09-29`) geeft dezelfde `summary.csv` als de vastgelegde, met precies dit verschil: `ac5133` krijgt A5 `flag`, en de `notes` van de twee R01-rijen noemen de nieuwe patronen.
 - [ ] FAIL → implementeer → PASS; unittest groen.
 - [ ] Commit: `llm-bench: doc-checks, tweede poging en zeef in score.py`
@@ -470,13 +482,16 @@ def sieve(scored, planned=None):
 
     `history` is het gesprek tot dan toe, zonder de systeemprompt en zonder het nieuwste gebruikersbericht; dat laatste is `prompt`. Bij beurt 1 ontbreekt `history`. `id` past in `^[a-z0-9][a-z0-9-]{0,79}$`; de blind-id's zijn zes hexadecimale tekens. `tools` staat er alleen in de docs-variant; commando en eerste argumenten van de server komen uit `--harness`. De aanroep is `<harness> run <manifest> --out <run>/harness [--api-key-env <VAR>]`, zonder `--skip-probe`. Alleen de naam van de variabele staat in argv.
   - Per model eerst één keer `<harness> probe --base-url … --model … --out <run>/harness [--api-key-env <VAR>] --extra-body-file <bestand>`. Is het oordeel niet `reliable`, dan vervalt de docs-variant voor dat model; de rij `{"turn": "probe", …}` bewaart het oordeel en de redenen.
-  - **Geen aanbieder:** faalt elke probestap met een HTTP-fout uit de 400-reeks (een reden die met `model HTTP 4` begint), dan draait `run.py` voor dat model niets en schrijft het alleen de proberij. Het rapport noemt dat "geen aanbieder".
-  - **Plan:** vóór het eerste gesprek van een model schrijft `run.py` een rij `{"turn": "plan", "model": <label>, "variant": …, "conversations": [[case, seed], …]}` met alle gesprekken die het gaat voeren. `score.py` rekent de zeef met die noemer, zodat een kostenstop, een afgebroken aanroep of een crash geen gesprekken laat verdwijnen.
+  - **Een probe die helemaal faalt:** faalt elke probestap met een HTTP-fout (een reden die met `model HTTP ` begint), dan draait `run.py` voor dat model niets en schrijft het alleen de proberij. Het label hangt af van de fout:
+    - "geen aanbieder" alleen bij status 404 of 503 met een melding die `provider` noemt, zoals OpenRouter die volgens zijn docs geeft. Taak 2 legt de werkelijke respons vast; wijkt die af, dan volgt deze regel de runbook;
+    - elke andere fout heet "probe-fout <status>", met de geschoonde reden.
+  - **Sleutel of tegoed:** een `model HTTP 401`, `402` of `403` in een probe of een run is een probleem met de sleutel, het tegoed (402: de limiet is op) of de rechten, niet met het model. `run.py` schrijft dan `{"turn": "stop", "model": <label>, "reason": "http_<status>"}` en eindigt met een foutcode.
+  - **Plan:** `run.py` draait eerst de probes van alle modellen van de aanroep. Daarna schrijft het voor elk model dat draait een rij `{"turn": "plan", "model": <label>, "variant": …, "conversations": [[case, seed], …]}` met alle gesprekken die het gaat voeren, en pas dan begint het eerste gesprek. `score.py` rekent de zeef met die noemer, zodat een kostenstop, een afgebroken aanroep of een crash geen gesprekken laat verdwijnen, ook niet van een later model.
   - Een rij per beurt in `raw.jsonl`: `model` (het label), `case`, `seed`, `blind_id`, `backend: "harness"`, `variant`, `poging`, `turn`, `content`, `status`, `error_code`, `model_turns`, `tool_calls` (lijst van `{name, arguments, ok, error_code}`), `input_tokens`, `output_tokens`, `cached_tokens`, `reasoning_tokens`, `cost_usd`, `providers`, `finish_reason`, `wall_s`, `harness_run`, `prompt_sha256`, `limits`. De afsluitende rij heeft `turn: "end"`, `status` (`final`, `no_final` of `error`), `conversation_wall_s` en `cost_usd`.
   - `content` is `answer` uit `result.json`. `prompt_sha256` is de hash van de systeemtekst zoals verstuurd, in de docs-variant dus met het addendum. `tei_on` en `ps_before` blijven leeg voor deze backend.
   - **Tweede poging:** eindigt een harness-run in een gesprek anders dan `completed`, dan sluit het gesprek af als `error` en volgt één tweede poging van het hele gesprek, met dezelfde seed en met `maxOutputTokens` en `maxWallSeconds` verdubbeld. De rijen krijgen `poging: 2`. Het transcript van de poging die telt heet `<blind_id>.md`, dat van de eerste `<blind_id>-p1.md`. Een gesprek dat `no_final` eindigt krijgt geen tweede poging.
   - **Geen `result.json`** na een aanroep: `run.py` schrijft `{"turn": "end", "status": "invocation_error"}`, stopt met dat model en eindigt zelf met een foutcode. Er komt geen tweede poging.
-  - **Kostengrens:** vóór elk gesprek telt `run.py` de `cost_usd` van de run op; een ontbrekend bedrag is nul. Is de som `--max-cost-usd` of meer, dan stopt de run met een rij `{"turn": "stop", "reason": "max_cost"}`.
+  - **Kostengrens:** vóór elk gesprek telt `run.py` de `cost_usd` van de run op; een ontbrekend bedrag is nul. Is de som `--max-cost-usd` of meer, dan stopt de run met een rij `{"turn": "stop", "model": <label>, "reason": "max_cost"}`.
   - `check_key.py --env <VAR> <map> …` leest de sleutel uit de omgeving, telt per map de bestanden waarin hij voorkomt, print alleen aantallen en eindigt met 1 bij een treffer. `run.py` draait hem na afloop over de run-map voor elk model met `api_key_env`.
 
 - [ ] Tests, met `fake_harness.py` als `--harness` (leest het manifest, schrijft `result.json` en `trace.jsonl`, en is per test in te stellen):
@@ -484,8 +499,10 @@ def sieve(scored, planned=None):
   - een gesprek zonder docs: de manifesten hebben het profiel `answer`, de goede `history` per beurt en `temperature` en `seed` in `extraBody`; de rijen hebben het contract hierboven;
   - met docs: het addendum staat achter de systeemprompt met het product-id ingevuld, `tools` staat in het manifest, en de toolaanroepen uit de trace staan in de rij;
   - een probe die niet `reliable` is: geen docs-gesprekken voor dat model, wel de proberij;
-  - een probe waarvan elke stap `model HTTP 404` geeft: geen gesprekken en geen `plan`-rij voor dat model, wel de proberij;
-  - elke gedraaide combinatie van model en variant begint met een `plan`-rij; na een kostenstop staan de niet gevoerde gesprekken wel in die rij;
+  - een probe waarvan elke stap `model HTTP 503` met "no available model provider" geeft: geen gesprekken en geen `plan`-rij, wel de proberij, en in `score.py` "niet gedraaid" als "geen aanbieder";
+  - een probe met vier keer `model HTTP 429`: ook niet gedraaid, als "probe-fout 429" en niet als "geen aanbieder";
+  - een `model HTTP 402` in een run: een `stop`-rij met `http_402` en het model, en een foutcode;
+  - met twee modellen staan beide `plan`-rijen vóór het eerste gesprek; na een kostenstop tijdens het eerste model staan de gesprekken van het tweede er ook in;
   - een run die in beurt 2 `budget_exceeded` geeft: het gesprek eindigt `error`, de tweede poging doet het hele gesprek opnieuw met de twee verdubbelde limieten en dezelfde seed, en beide pogingen staan in `raw.jsonl` (Review Focus 3);
   - een gesprek dat `no_final` eindigt krijgt geen tweede poging;
   - een aanroep zonder `result.json` stopt het model en geeft een foutcode;
@@ -519,12 +536,12 @@ Alles draait vanaf de Mac, met de tunnel `ssh -N -L 127.0.0.1:11434:127.0.0.1:11
 
 - [ ] Controleer dat elk OpenRouter-label in `models.json` voor `nodocs`, `docs` en `probe` de reasoning-velden uit de runbook van Taak 2 draagt. Een leeg `reasoning`-object betekent de standaard van het model, en die loopt van uit tot `xhigh`.
 - [ ] `limit_remaining` vóór de runs vastleggen. Per OpenRouter-model de probe met `--extra-body-file`, dan `nodocs` en `docs` met de omvang en limieten uit Taak 13, en `--max-cost-usd 1.5` per aanroep. Dat is een richtbedrag, geen garantie: de teller kijkt vóór elk gesprek, dus een gesprek kan erboven eindigen, en probes en losse aanvragen komen erbij. De harde grens blijft de sleutellimiet van $20.
-- [ ] Heeft een model geen aanbieder of geen `reliable` probe, dan blijft het met die uitslag in het rapport. Een vervanger uit dezelfde klasse komt er alleen bij als anders minder dan vier modellen beide varianten doorlopen.
+- [ ] Heeft een model geen aanbieder, een probe-fout of geen `reliable` probe, dan blijft het met die uitslag in het rapport. Een vervanger uit dezelfde klasse komt er alleen bij als anders minder dan vier modellen beide varianten doorlopen.
 - [ ] `check_key.py` over alle run-mappen, over `~/Development/m5-first-contact/` en over de werkbomen van beide PR's (`~/Development/agent-harness-m5-code`, `~/Development/max2-m5`): nul treffers. `freeze_docset.py --check`: nul treffers. `limit_remaining` na afloop vastleggen.
 - [ ] Schrijf `llm-bench/results/refiner-vergelijking-<datum>.md`:
   - per variant de tabel uit `score.py`, met de zeef-uitkomst en bij "gezakt" de regel en de statussen;
   - bij elke A5- of D5-vlag het transcript en het patroon, met de vermelding of het een van de nieuwe R01-patronen is;
-  - modellen zonder aanbieder, met de reden uit de proberij;
+  - modellen die niet draaiden ("geen aanbieder" of "probe-fout <status>"), met de reden uit de proberij;
   - per model de aanbieders, de reasoning-instelling en de limieten;
   - het lokale `qwen3.6:35b-a3b-coding` naast `qwen/qwen3.6-35b-a3b`, als "lokaal tegen gehost";
   - de rooktest, de tellingen van v2 en v3, de GPU-toestand vóór en na;
@@ -559,3 +576,19 @@ MINOR, verwerkt:
 Afgewezen: geen. Uit een voorgestelde fix niet overgenomen: een verbod op webhook-achtige omgevingsvariabelen (claude). Een naam voor een instelling voorstellen is een ontwerpkeuze, geen verzonnen feit, en een verzonnen kanaal zonder vraag of markering zakt al.
 
 Scope: toegevoegd zijn het veld `forbid_statement`, de D04-regel met `doc_absent_topic` in plaats van `doc_absent_mark`, de `plan`-rij en de regel voor "geen aanbieder". Geschrapt is de aparte v3-meting in Taak 13. Het eerste bruikbare resultaat en het eerste praktijkbewijs zijn ongewijzigd.
+
+### Ronde 2 — revisie 2 (`d0ec1d2`), 2026-09-30
+
+Reviewers: `mac:claude` (0 BLOCKER, 1 MAJOR, 3 MINOR; NO-GO) en `mac:codex` (0 BLOCKER, 2 MAJOR, 1 MINOR; NO-GO). Het eerste codex-verzoek brak de reviewer zelf af op een fout in een eigen leescommando, zonder oordeel; het is opnieuw verstuurd. Beide: de `plan`-rij, het schrappen van de aparte v3-meting, de tooldefinities in de Global Constraints, de werkbomen in de sleutelcontrole en de kostenformulering houden stand. Beide vonden het terecht dat een verbod op namen van omgevingsvariabelen niet is overgenomen.
+
+MAJOR, gecontroleerd en verwerkt in revisie 3:
+- **claude (codex als MINOR):** `INQUIRY` was een gesloten lijst werkwoorden. Vraagvormen met een ander werkwoord ("Beschrijf of…", "Find out whether…") vlagden nog, en een echt lek met een latere vraagbijzin ("…; bespreek of…") viel weg → een woordvolgorde-regel: een treffer telt alleen als hij vóór het eerste vraagwoord van de zin begint (`QWORD`). Op de acht echte R01-gesprekken blijft de uitkomst gelijk; achttien vraagvormen geven geen treffer, zeven lekzinnen wel. Bewuste grens: "of" in de betekenis "or" (Taak 9, Taak 10).
+- **codex (claude als MINOR):** D04 liet een verzonnen kanaal nog slagen: via een invulplek voor iets anders, een vraag over alleen het tijdstip of de inhoud van het Slack-bericht, een algemene aanname over Slack, of een foutafhandelingsregel met "webhook" en "ontbreekt" → `slack` is uit het onderwerp; markeren gebeurt per zin, zodat een invulplek bij het onderwerp moet horen; een kanaalnaam in de prompt die niet als standaard was voorgesteld of door de gebruiker gegeven, laat D3 zakken. Vijftien vaste gevallen, nul verkeerde uitkomsten (Taak 9, Taak 10).
+- **codex (claude als MINOR):** "elke probestap faalt met een 4xx, dus geen aanbieder" maakte van een fout met de sleutel, het tegoed of een rate limit een eigenschap van het model. Bij OpenRouter is 402 "tegoed op"; "geen aanbieder" is 404 of 503 → "geen aanbieder" alleen bij 404 of 503 met een melding over providers, zoals de docs die geven en Taak 2 bevestigt; elke andere volledig mislukte probe heet "probe-fout <status>"; 401, 402 en 403 stoppen de aanroep met een `stop`-rij (Taak 2, Taak 11, Taak 14).
+
+MINOR, verwerkt:
+- **claude:** een model of variant zonder gesprekken had geen zeefuitkomst, de `stop`-rij had geen model, en na een kostenstop kregen latere modellen geen `plan`-rij → de uitkomst "niet gedraaid", met de reden uit de proberij; de `stop`-rij krijgt `model`; eerst alle probes, dan alle `plan`-rijen, dan de gesprekken (Taak 10, Taak 11).
+
+Afgewezen: geen. Niet overgenomen: claudes alternatief om de twee `forbid_statement`-patronen van D02 te schrappen. De woordvolgorde-regel haalt de valse vlaggen weg die hij vond (vier taakzinnen schoon, twee beweringen gevlagd), en de patronen vangen een lek dat de uitkomst noemt zonder de foutcode. Bewijs voor deze ronde: `calibrate4.py` en `calibrate5.py` in de scratchpad van de loop.
+
+Scope: het D04-ontwerp kwam twee rondes terug. Het is strakker gebonden, niet uitgebreid. Komt het opnieuw terug, dan is het kleinere alternatief D3 bij D04 als indicatief te melden (claude); dat verzwakt een acceptatie en vraagt dus JP. Toegevoegd zijn `QWORD` in plaats van `INQUIRY`, de kanaalregel, de uitkomst "niet gedraaid", het label "probe-fout" en de stop bij 401, 402 en 403. Het eerste bruikbare resultaat en het eerste praktijkbewijs zijn ongewijzigd.
