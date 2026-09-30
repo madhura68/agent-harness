@@ -6,6 +6,7 @@ import { main } from '../src/cli.js'
 import { createModelClient } from '../src/model-client.js'
 import { probeDir, runProbe } from '../src/probe.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
+import { bodyWithKeyAt, DUMMY_KEY, leakedFragments } from './helpers.js'
 
 type Fake = Awaited<ReturnType<typeof startFakeModelServer>>
 let fake: Fake | undefined
@@ -21,9 +22,9 @@ const good: FakeTurn[] = [
   { body: completion({ content: 'Dat kan ik niet doen.' }) },
 ]
 
-async function probe(script: FakeTurn[]) {
+async function probe(script: FakeTurn[], apiKey?: string) {
   fake = await startFakeModelServer(script)
-  const client = createModelClient({ baseUrl: fake.baseUrl, name: 'm' })
+  const client = createModelClient({ baseUrl: fake.baseUrl, name: 'm', apiKey })
   return runProbe(client, { baseUrl: fake.baseUrl, model: 'm', stepTimeoutMs: 2000 })
 }
 
@@ -83,6 +84,17 @@ describe('runProbe', () => {
     const script = [...good]
     script[0] = { body: completion({ content: 'pong', usage: null }) }
     expect((await probe(script)).usage_reported).toBe(false)
+  })
+
+  it('keeps the api key out of every reason when the server echoes it', async () => {
+    const echo = { status: 401, body: bodyWithKeyAt(190, (p) => JSON.stringify({ error: { message: p } })) }
+    const r = await probe([echo, echo, echo, echo], DUMMY_KEY)
+    expect(fake!.requests).toHaveLength(4) // each step failed on its first request
+    for (const s of Object.values(r.steps)) {
+      expect(s.reason).toContain('<redacted>')
+      expect(leakedFragments(s.reason)).toEqual([])
+    }
+    expect(leakedFragments(JSON.stringify(r))).toEqual([])
   })
 })
 

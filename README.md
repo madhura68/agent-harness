@@ -22,7 +22,7 @@ Ollama op max2 luistert alleen op localhost. Open eerst een tunnel: `ssh -N -L 1
 harness probe --base-url http://127.0.0.1:11434/v1 --model qwen3-coder:30b --out runs
 ```
 
-Draait vier vaste stappen met een dummy-tool `echo` en schrijft `runs/probe-<model>/probe.json` met `tool_calling: reliable | unreliable | none`. Exit 0 alleen bij `reliable`. Opties: `--api-key-env <VAR>` leest een API-key uit de omgeving, `--step-timeout <sec>` (standaard 120).
+Draait vier vaste stappen met een dummy-tool `echo` en schrijft `runs/probe-<model>/probe.json` met `tool_calling: reliable | unreliable | none`. Exit 0 alleen bij `reliable`. Opties: `--api-key-env <VAR>` leest een API-key uit de omgeving, `--step-timeout <sec>` (standaard 120), `--extra-body-file <json>` leest een JSON-object met extra aanvraagvelden (dezelfde regels als `model.extraBody`, zie hieronder) en stuurt die met elke probe-aanvraag mee, zodat de probe bij dezelfde aanbieders uitkomt als de runs. Een bestand met een gereserveerde sleutel wordt geweigerd voordat er een aanvraag uitgaat. De optie geldt alleen voor `probe`: `harness run` en `harness worker` weigeren haar, omdat een stil genegeerd `provider`-blok de aanvragen zonder dat blok zou laten uitgaan; daar hoort `extraBody` in het `model`-blok.
 
 ## Een run uitvoeren
 
@@ -36,6 +36,14 @@ Elke run schrijft `runs/<id>/trace.jsonl`, `runs/<id>/tools/<callId>.txt` en `ru
 Het profiel `tools` weigert met `PROBE_REQUIRED` zolang er geen `probe.json` met `reliable` is voor hetzelfde `baseUrl` en model in de `--out`-map. `--skip-probe` omzeilt dat bewust en wordt in de trace vastgelegd.
 
 Secrets horen in de omgeving, niet in het manifest: `tools.server.env` gebruikt `${VAR}`-verwijzingen die pas op weg naar het MCP-kindproces worden ingevuld. Het kindproces krijgt alleen `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER` plus wat het manifest noemt. `model.apiKey` en de env-waarden komen nooit in trace of `result.json`.
+
+`harness run <manifest> --out <dir> --api-key-env <VAR>` leest de API-key voor het model uit die omgevingsvariabele, zoals `probe` dat al deed. De flag wint van een `model.apiKey` in het manifest, die dan ongemoeid blijft; de sleutel gaat alleen naar de model-client en komt niet in het manifest, de trace of `result.json`. Een niet-gezette variabele is een fout die de naam noemt, nog voordat de run-map bestaat.
+
+`model.extraBody` (optioneel object, ook in het `model`-blok van de worker-config) wordt in elke chat-completions-aanvraag gemerged, voor velden als `temperature`, `seed`, een `provider`-blok of een `reasoning`-object (de geneste vorm van OpenRouter), bijvoorbeeld `"extraBody": { "temperature": 0.7, "seed": 1, "provider": { "data_collection": "deny", "require_parameters": true } }`. De sleutels `model`, `messages`, `tools`, `stream` en `max_tokens` zet de harness zelf; `max_completion_tokens` en `n` zijn ook gereserveerd, want ze botsen met `max_tokens` en met de ene `choices[0]` die de client leest. Al deze sleutels worden bij het laden geweigerd. `reasoning_effort` wordt alleen geweigerd als `reasoningEffort` ook gezet is: de waarde van de client wint dan stilzwijgend, dus het is onduidelijk welke geldt. Het `reasoning`-object is een ander veld en mag wel. De velden staan, net als de rest van het manifest, in de `run_start`-regel van de trace.
+
+`history` (optioneel, op het hoogste niveau van het manifest naast `system` en `prompt`: een lijst van `{ "role": "user" | "assistant", "content": "…" }`) geeft eerdere berichten van een gesprek mee; de worker-config kent het niet. De harness zet ze tussen `system` en `prompt`: `[system?, ...history, user(prompt)]`. Een gevulde lijst begint met `user`, wisselt af en eindigt met `assistant`, want de prompt is de volgende gebruikersbeurt; een andere lijst wordt bij het laden geweigerd met het pad `history` in de melding.
+
+Meldt een respons kosten, reasoning-tokens of de naam van de aanbieder die hem leverde (OpenRouter meldt alle drie; `provider` is dan bijvoorbeeld `AkashML`), dan staan die per respons in de trace (`model_response.usage.costUsd`, `.reasoningTokens`, `model_response.provider`) en opgeteld in `result.json` (`usage.costUsd`, `usage.reasoningTokens`). Reasoning-tokens zijn een deel van `outputTokens`, tel ze er dus niet bij op. Een veld dat geen enkele respons meldde, ontbreekt.
 
 ## Worker-modus (IDEA_CHAT via een lokaal model)
 
@@ -70,3 +78,24 @@ harness check-run-logs --config <worker.json> --dir <run-logs-dir>
 Controleert of een geheim dat de redactie hoort te maskeren onveranderd in een run-log staat, en drukt per geheim alleen de naam en het aantal treffers af, nooit een waarde. Exit 1 bij een treffer, of als er geen enkel geheim gecontroleerd is. Draai het met de omgeving van de service (zie het runbook).
 
 Ontwerp en plan: [docs/specs/2026-09-28-harness-run-logging-design.md](docs/specs/2026-09-28-harness-run-logging-design.md), [docs/plans/M4-harness-run-logging.md](docs/plans/M4-harness-run-logging.md). Recept en praktijkbewijs: [docs/runbooks/idea-chat-worker.md](docs/runbooks/idea-chat-worker.md#run-logs-in-worker-logs-m4).
+
+## Doc-server over een bevroren docset (M5)
+
+```bash
+harness doc-server --dir <docset-dir> --product-id <id>
+```
+
+Een stdio-MCP-server die de vier doc-tools van scrum4me-mcp (`search_product_docs`, `get_product_doc`, `list_product_docs`, `related_product_docs`) aanbiedt over een bevroren map met documenten. De modelvergelijking (M5) start hem als `tools.server` van een run met het profiel `tools`:
+
+```json
+"tools": {
+  "server": { "command": "harness", "args": ["doc-server", "--dir", "docset", "--product-id", "bench-agent-harness"] },
+  "allow": ["search_product_docs", "get_product_doc", "list_product_docs", "related_product_docs"]
+}
+```
+
+Het model leest dezelfde toolnamen, beschrijvingen en invoerschema's als in Scrum4Me (scrum4me-mcp op `285c98ae`), de resultaten hebben dezelfde sleutels en de fouten dezelfde tekst. De beschrijvingen zijn letterlijk overgenomen, ook waar ze Postgres noemen. `__tests__/fixtures/scrum4me-doc-tools.schema.json` bevat de vastgelegde definities van het echte MCP; een test vergelijkt ze met wat de server aanbiedt.
+
+De docset is `<dir>/docset.json` (`frozen_at` en `files: [{ folder, slug, … }]`; de andere sleutels worden niet gelezen) met de documenten op `<dir>/<folder>/<slug>.md`. `--product-id` is de id waarop de server antwoordt; een andere id geeft `Product '<id>' not found or not accessible`. Elk document is `active` in een ingeschakelde folder en heeft `frozen_at` als `updated_at`. De titel is de `title` uit de front matter, anders de eerste `# `-kop. De `slug` van een aanvraag wordt naar kleine letters gezet vóór het zoeken, zoals scrum4me-mcp doet; een slug met `.md` erachter is dus een onbekend document. `get_product_doc` pagineert in tekens (`byte_size` en `next_offset` tellen tekens), en `heading` is de koptekst zonder `#`, hoofdletterongevoelig, tot de volgende kop van gelijk of hoger niveau.
+
+**Bewust anders dan productie:** geen authenticatie en geen Postgres-FTS. Zoeken is woordherkenning: de inhoud, titel en slug worden in kleine letters geknipt op alles wat geen letter of cijfer is, en een term telt bij een heel woord. Alle termen moeten erin staan; `OR` tussen twee termen maakt er "een van beide" van (`a b OR c` is: a, en b of c), terwijl productie (Postgres `websearch_to_tsquery`) dezelfde zoekopdracht leest als (a en b) of c, zodat een zoekopdracht met zowel gewone termen als `OR` hier minder documenten kan geven; `-term` sluit uit; een frase tussen aanhalingstekens vraagt de woorden direct achter elkaar, en een term met leestekens erin zoals `tool-calling` ook. De score is het aantal treffers, bij gelijke score beslist de slug. De snippet is de tien woorden rond de eerste treffer, met `<<` en `>>` om de treffer. `related_product_docs` leest `[tekst](pad.md)` en `[tekst](pad.md#anker)`, opgelost ten opzichte van de folder van het document of als `docs/<folder>/<bestand>.md` (die vorm lost hier op, maar de resolver van productie meldt hem onder `broken_links`); een link naar een `.md` die niet in de set zit staat onder `broken_links`. Een link naar het document zelf wordt overgeslagen in plaats van, zoals in het origineel, als gebroken gemeld. Een href naar een `.md` onder paden die het origineel negeert (zoals `/lib/` of `/app/`) telt hier wel mee en staat onder `broken_links` als het doel niet in de set zit. Het antwoord van `get_product_doc` blijft binnen de tool-uitvoergrens van de harness (`TOOL_OUTPUT_LIMIT`, 16 384 bytes, gemeten aan de geserialiseerde JSON): is het gevraagde stuk groter, dan levert de server het grootste stuk dat past en zet hij `truncated` en `next_offset` zoals het origineel bij `max_chars` doet, zodat paging met `offset` het hele bestand geeft (een sectie met `heading` wordt dan afgekapt zonder `next_offset`, net als bij `max_chars`).

@@ -128,7 +128,10 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   let toolErrors = 0
   let inputTokens = 0
   let outputTokens = 0
+  // Each stays undefined until a response reports the field: a response without it (Ollama has no cost) adds nothing.
   let cachedTokens: number | undefined
+  let costUsd: number | undefined
+  let reasoningTokens: number | undefined
   let usageComplete = true
   let responses = 0
   let reportedModel: string | undefined
@@ -175,6 +178,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
     const tools: ToolDef[] = registry ? registry.toOpenAiTools() : []
     const messages: ChatMessage[] = []
     if (manifest.system) messages.push({ role: 'system', content: manifest.system })
+    if (manifest.history) messages.push(...manifest.history)
     messages.push({ role: 'user', content: manifest.prompt })
     const toolsChars = tools.length > 0 ? charsOf(tools) : 0
 
@@ -257,11 +261,14 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         usageComplete = false
       }
       if (typeof res.usage.cachedTokens === 'number') cachedTokens = (cachedTokens ?? 0) + res.usage.cachedTokens
+      if (typeof res.usage.costUsd === 'number') costUsd = (costUsd ?? 0) + res.usage.costUsd
+      if (typeof res.usage.reasoningTokens === 'number') reasoningTokens = (reasoningTokens ?? 0) + res.usage.reasoningTokens
       trace.event({
         type: 'model_response', turn: turns, content: res.message.content, toolCalls: res.message.toolCalls,
         finishReason: res.finishReason, usage: res.usage, durationMs: res.durationMs,
         ...(res.reasoning !== undefined ? { reasoning: res.reasoning } : {}),
         ...(res.systemFingerprint !== undefined ? { systemFingerprint: res.systemFingerprint } : {}),
+        ...(res.provider !== undefined ? { provider: res.provider } : {}),
       })
 
       if (outputTokens > limits.maxOutputTokens) return { status: 'budget_exceeded' }
@@ -363,6 +370,8 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       source: responses > 0 && usageComplete ? 'provider_reported' : 'missing',
       inputTokens, outputTokens, turns, toolCalls, toolErrors,
       ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+      ...(costUsd !== undefined ? { costUsd } : {}),
+      ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
     },
     durationMs: now() - started,
     ...(snapshotHash ? { toolSnapshotHash: snapshotHash } : {}),

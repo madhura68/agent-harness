@@ -2,13 +2,49 @@ import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import { REASONING_EFFORTS } from './model-client.js'
 
+/**
+ * Request fields `extraBody` may not carry. The client sets model, messages, tools, stream and max_tokens itself;
+ * max_completion_tokens would clash with max_tokens, and n asks for more choices than the single choices[0] it reads.
+ */
+export const RESERVED_BODY_KEYS = ['model', 'messages', 'tools', 'stream', 'max_tokens', 'max_completion_tokens', 'n'] as const
+
+/**
+ * Throws a ManifestError for a reserved key, or for reasoning_effort next to reasoningEffort: the client's own value
+ * would silently win there, so the config would not say what is sent. The nested `reasoning` object (OpenRouter's
+ * form) is a different field and passes.
+ */
+export function assertExtraBody(extraBody: Record<string, unknown>, reasoningEffort?: string): void {
+  const reserved: readonly string[] = RESERVED_BODY_KEYS
+  const found = Object.keys(extraBody).filter((key) => reserved.includes(key))
+  if (found.length > 0) {
+    throw new ManifestError(
+      `extraBody mag geen gereserveerde sleutels bevatten: ${found.map((k) => `"${k}"`).join(', ')} (gereserveerd: ${RESERVED_BODY_KEYS.join(', ')})`,
+    )
+  }
+  if (reasoningEffort !== undefined && Object.hasOwn(extraBody, 'reasoning_effort')) {
+    throw new ManifestError('extraBody mag reasoning_effort niet bevatten naast reasoningEffort: zet het ene of het andere')
+  }
+}
+
 /** Model block shared by run manifests and the worker config. */
-export const ModelSpecSchema = z.object({
-  baseUrl: z.string().url(),
-  name: z.string().min(1),
-  apiKey: z.string().optional(),
-  reasoningEffort: z.enum(REASONING_EFFORTS).optional(),
-})
+export const ModelSpecSchema = z
+  .object({
+    baseUrl: z.string().url(),
+    name: z.string().min(1),
+    apiKey: z.string().optional(),
+    reasoningEffort: z.enum(REASONING_EFFORTS).optional(),
+    /** Extra fields merged into every chat-completions request: temperature, seed, a provider block, a reasoning object. */
+    extraBody: z.record(z.string(), z.unknown()).optional(),
+  })
+  .superRefine((model, ctx) => {
+    if (!model.extraBody) return
+    try {
+      assertExtraBody(model.extraBody, model.reasoningEffort)
+    } catch (err) {
+      if (!(err instanceof ManifestError)) throw err
+      ctx.addIssue({ code: 'custom', path: ['extraBody'], message: err.message })
+    }
+  })
 
 export const ManifestSchema = z
   .object({
@@ -16,6 +52,8 @@ export const ManifestSchema = z
     profile: z.enum(['answer', 'tools']),
     prompt: z.string().min(1),
     system: z.string().optional(),
+    /** Earlier visible turns of a conversation; run.ts places them between `system` and `prompt`. */
+    history: z.array(z.object({ role: z.enum(['user', 'assistant']), content: z.string() })).optional(),
     model: ModelSpecSchema,
     tools: z
       .object({
@@ -39,6 +77,14 @@ export const ManifestSchema = z
   .superRefine((m, ctx) => {
     if (m.profile === 'tools' && !m.tools) ctx.addIssue({ code: 'custom', path: ['tools'], message: 'tools is verplicht bij profile "tools"' })
     if (m.profile === 'answer' && m.tools) ctx.addIssue({ code: 'custom', path: ['tools'], message: 'tools is verboden bij profile "answer"' })
+
+    // The prompt is the next user message, so earlier turns must be whole exchanges: user, assistant, user, assistant, …
+    const history = m.history ?? []
+    const off = history.findIndex((h, i) => h.role !== (i % 2 === 0 ? 'user' : 'assistant'))
+    const historyIssue = (message: string) => ctx.addIssue({ code: 'custom', path: ['history'], message })
+    if (off === 0) historyIssue('history moet met een user-bericht beginnen')
+    else if (off > 0) historyIssue(`history moet afwisselen tussen user en assistant (bericht ${off + 1} is ${history[off].role})`)
+    else if (history.at(-1)?.role === 'user') historyIssue('history moet met een assistant-bericht eindigen')
   })
 
 export type Manifest = z.infer<typeof ManifestSchema>

@@ -14,16 +14,28 @@ export type ModelClientOptions = {
   name: string
   apiKey?: string
   reasoningEffort?: ReasoningEffort
+  /**
+   * Extra request fields (temperature, seed, a provider block, a reasoning object). They are merged underneath the
+   * client's own fields, so model, messages, max_tokens, stream, tools and reasoning_effort keep the client's value
+   * whenever the client sets one. Reserved keys are refused where the config is loaded (assertExtraBody in manifest.ts).
+   */
+  extraBody?: Record<string, unknown>
   headersTimeoutMs?: number
   now?: () => number // test seam for durationMs; defaults to Date.now
 }
 export type CompleteOptions = { signal: AbortSignal; maxTokens: number; tools?: ToolDef[] }
 export type ModelClient = { complete(messages: ChatMessage[], options: CompleteOptions): Promise<CompleteResult> }
 
+/**
+ * A ModelError holds its own message, which is masked, and nothing else. It takes no `cause` on purpose: the error a
+ * library throws can quote the response body (JSON.parse) or the URL (undici), so it can carry the API key, and
+ * util.inspect or console.error would print the whole chain. Masking a cause is no fix either: JSON.parse quotes only
+ * the start of the body, a part of the key that maskKey does not recognise.
+ */
 export class ModelError extends Error {
   readonly code = 'MODEL_ERROR' as const
-  constructor(message: string, options?: { cause?: unknown }) {
-    super(message, options)
+  constructor(message: string) {
+    super(message)
     this.name = 'ModelError'
   }
 }
@@ -36,22 +48,60 @@ export function transportTimeouts(opts: Pick<ModelClientOptions, 'headersTimeout
 
 const FINISH_REASONS = new Set(['stop', 'length', 'tool_calls'])
 
+// Same floor as worker/redact.ts: a shorter value is a placeholder (Ollama takes any string), and masking it would mangle ordinary text.
+const MIN_MASKED_KEY_LENGTH = 8
+
+/**
+ * Replaces every occurrence of the key with '<redacted>'. The key without surrounding whitespace counts too: undici
+ * trims a header value before sending it, so that is the form a server echoes. Each form needs 8 characters; without
+ * a key, or with one shorter than that, the text stays as it is.
+ */
+export function maskKey(text: string, apiKey: string | undefined): string {
+  if (!apiKey) return text
+  let masked = text
+  // The padded form goes first: it contains the trimmed one, so masking it first removes it in full.
+  for (const form of new Set([apiKey, apiKey.trim()])) {
+    if (form.length >= MIN_MASKED_KEY_LENGTH) masked = masked.replaceAll(form, '<redacted>')
+  }
+  return masked
+}
+
 function excerpt(text: string): string {
   return text.slice(0, 200)
 }
 
+// Only a finite number counts: a string ('0.01'), null or an object is ignored rather than coerced, and so is 1e999,
+// which JSON.parse reads as Infinity and JSON.stringify would write as null. 0 is a number.
+function finiteOrUndefined(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
 function parseUsage(raw: unknown): Usage {
-  const u = raw as { prompt_tokens?: unknown; completion_tokens?: unknown; prompt_tokens_details?: { cached_tokens?: unknown } } | undefined
+  const u = raw as {
+    prompt_tokens?: unknown
+    completion_tokens?: unknown
+    cost?: unknown // OpenRouter: what the request cost, in dollars
+    prompt_tokens_details?: { cached_tokens?: unknown }
+    completion_tokens_details?: { reasoning_tokens?: unknown }
+  } | undefined
+  // Read whether or not the token counts are there: a billed amount must not vanish because a count is missing. The
+  // fields are spread in only when present, so a response that gives neither leaves no undefined keys behind.
+  const costUsd = finiteOrUndefined(u?.cost)
+  const reasoningTokens = finiteOrUndefined(u?.completion_tokens_details?.reasoning_tokens)
+  const extras: Pick<Usage, 'costUsd' | 'reasoningTokens'> = {
+    ...(costUsd !== undefined ? { costUsd } : {}),
+    ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
+  }
   if (u && typeof u.prompt_tokens === 'number' && typeof u.completion_tokens === 'number') {
-    const cached = u.prompt_tokens_details?.cached_tokens
     return {
       source: 'provider_reported',
       inputTokens: u.prompt_tokens,
       outputTokens: u.completion_tokens,
-      cachedTokens: typeof cached === 'number' ? cached : undefined,
+      cachedTokens: finiteOrUndefined(u.prompt_tokens_details?.cached_tokens),
+      ...extras,
     }
   }
-  return { source: 'missing', inputTokens: 0, outputTokens: 0 }
+  return { source: 'missing', inputTokens: 0, outputTokens: 0, ...extras }
 }
 
 function nonEmptyString(v: unknown): string | undefined {
@@ -98,6 +148,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       const headers: Record<string, string> = { 'content-type': 'application/json' }
       if (opts.apiKey) headers.authorization = `Bearer ${opts.apiKey}`
       const body: Record<string, unknown> = {
+        ...opts.extraBody,
         model: opts.name,
         messages: toWire(messages),
         max_tokens: options.maxTokens,
@@ -115,27 +166,30 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         text = await res.text()
       } catch (err) {
         const reason = options.signal.aborted ? 'aborted (deadline)' : err instanceof Error ? err.message : String(err)
-        throw new ModelError(`model request failed: ${reason}`, { cause: err })
+        throw new ModelError(`model request failed: ${maskKey(reason, opts.apiKey)}`)
       }
       const durationMs = now() - requestStart
+      // Mask first, cut second: excerpt() keeps 200 characters, and a key that straddles the cut would leave a prefix
+      // maskKey can no longer match. Errors use this copy; a good answer is still parsed from the raw text.
+      const maskedText = maskKey(text, opts.apiKey)
       if (status < 200 || status >= 300) {
-        throw new ModelError(`model HTTP ${status}: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: ${excerpt(maskedText)}`)
       }
-      let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown }
+      let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown; provider?: unknown }
       try {
         json = JSON.parse(text)
-      } catch (err) {
-        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(text)}`, { cause: err })
+      } catch {
+        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(maskedText)}`)
       }
       if (json === null || typeof json !== 'object') {
-        throw new ModelError(`model HTTP ${status}: unexpected body: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: unexpected body: ${excerpt(maskedText)}`)
       }
       if (json.error) {
-        throw new ModelError(`model HTTP ${status}: error body: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: error body: ${excerpt(maskedText)}`)
       }
       const choice = Array.isArray(json.choices) ? json.choices[0] : undefined
       if (!choice || typeof choice !== 'object') {
-        throw new ModelError(`model HTTP ${status}: no choices: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: no choices: ${excerpt(maskedText)}`)
       }
       const message = (choice as { message?: { content?: unknown; tool_calls?: unknown; reasoning?: unknown; reasoning_content?: unknown } }).message ?? {}
       const finish = (choice as { finish_reason?: unknown }).finish_reason
@@ -150,6 +204,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         reasoning: parseReasoning(message),
         durationMs,
         systemFingerprint: nonEmptyString(json.system_fingerprint),
+        provider: nonEmptyString(json.provider),
       }
     },
   }

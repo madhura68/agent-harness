@@ -1,8 +1,11 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { inspect } from 'node:util'
+import { fetch as undiciFetch } from 'undici'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createModelClient, ModelError, transportTimeouts } from '../src/model-client.js'
+import { createModelClient, maskKey, ModelError, transportTimeouts } from '../src/model-client.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
+import { bodyWithKeyAt, DUMMY_KEY, leakedFragments } from './helpers.js'
 
 type Fake = Awaited<ReturnType<typeof startFakeModelServer>>
 let fake: Fake | undefined
@@ -131,6 +134,124 @@ describe('createModelClient', () => {
   })
 })
 
+describe('maskKey', () => {
+  it('replaces every occurrence of the key', () => {
+    expect(maskKey(`a ${DUMMY_KEY} b ${DUMMY_KEY}`, DUMMY_KEY)).toBe('a <redacted> b <redacted>')
+  })
+
+  it('leaves the text alone without a key or with a key shorter than 8 characters', () => {
+    const text = 'Bearer abcdefg and abc'
+    expect(maskKey(text, undefined)).toBe(text)
+    expect(maskKey(text, '')).toBe(text)
+    expect(maskKey(text, 'abcdefg')).toBe(text) // 7 characters
+    expect(maskKey(text, 'abcdefg \n')).toBe(text) // 7 once trimmed: padding does not lift it over the floor
+    expect(maskKey(text, ' \n ')).toBe(text) // whitespace only: trims to nothing, and an empty needle must never reach replaceAll
+  })
+
+  it('masks a key of exactly 8 characters', () => {
+    expect(maskKey('Bearer abcdefgh', 'abcdefgh')).toBe('Bearer <redacted>')
+    expect(maskKey('Bearer abcdefgh', 'abcdefgh \n')).toBe('Bearer <redacted>') // 8 once trimmed, the form a server echoes
+  })
+
+  it('matches the key literally, not as a pattern', () => {
+    // Read as a regular expression this key would also match 'aXbbcc'.
+    expect(maskKey('a.b*c+d? aXbbcc', 'a.b*c+d?')).toBe('<redacted> aXbbcc')
+  })
+})
+
+describe('the key in model errors', () => {
+  // One call against the current fake server; returns the message of the ModelError it must throw.
+  async function errorMessage(baseUrl: string, apiKey = DUMMY_KEY): Promise<string> {
+    const c = createModelClient({ baseUrl, name: 'm', apiKey })
+    const err = await c.complete(msgs, opts()).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ModelError)
+    return (err as ModelError).message
+  }
+
+  it('masks the key in the error of an HTTP 401 whose body echoes it', async () => {
+    fake = await startFakeModelServer([{ status: 401, body: { error: { message: `Invalid API key ${DUMMY_KEY}` } } }])
+    const message = await errorMessage(fake.baseUrl)
+    expect(message).toContain('<redacted>')
+    expect(message).not.toContain(DUMMY_KEY)
+  })
+
+  // One row per place in complete() that puts the response text in a ModelError.
+  const ECHOES: Array<[label: string, status: number, build: (payload: string) => string]> = [
+    ['an HTTP 401 error body', 401, (p) => JSON.stringify({ error: { message: p } })],
+    ['a 200 body that is not JSON', 200, (p) => p],
+    ['a 200 body that is JSON but no object', 200, (p) => JSON.stringify(p)],
+    ['a 200 with an error object', 200, (p) => JSON.stringify({ error: { message: p } })],
+    ['a 200 without choices', 200, (p) => JSON.stringify({ id: p })],
+  ]
+
+  // At 190 an excerpt cut before the mask would keep the first 10 characters of the key; no stretch of 6+ may survive.
+  describe.each([40, 190])('with the key starting at character %i of the body', (offset) => {
+    it.each(ECHOES)('masks it in the error for %s', async (_label, status, build) => {
+      fake = await startFakeModelServer([{ status, body: bodyWithKeyAt(offset, build) }])
+      const message = await errorMessage(fake.baseUrl)
+      expect(message).toContain('<redacted>')
+      expect(leakedFragments(message)).toEqual([])
+    })
+  })
+
+  it('masks the key in the reason of a transport failure', async () => {
+    // undici echoes the URL in its parse error, which makes a transport failure whose reason holds the key.
+    const message = await errorMessage(`http://not a url ${DUMMY_KEY}`)
+    expect(message).toMatch(/^model request failed: /)
+    expect(message).toContain('<redacted>')
+    expect(leakedFragments(message)).toEqual([])
+  })
+
+  // console.error(err) and util.inspect print the message, the stack and the whole cause chain. The chain is raw library
+  // text that maskKey never touches, so the key has to stay out of it altogether, not be masked inside it.
+  describe('in the whole error as util.inspect prints it', () => {
+    const shown = (err: unknown) => inspect(err, { depth: 10 })
+
+    it('holds no stretch of the key when the body is invalid JSON and begins with the key', async () => {
+      // JSON.parse quotes the start of the body in its SyntaxError: Unexpected token 'e', "test-key-Qx"... is not valid JSON.
+      // That is a part of the key, so masking the whole key inside the cause's message would not have removed it.
+      fake = await startFakeModelServer([{ body: DUMMY_KEY }])
+      const err = await createModelClient({ baseUrl: fake.baseUrl, name: 'm', apiKey: DUMMY_KEY }).complete(msgs, opts()).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ModelError)
+      expect((err as ModelError).message).toContain('invalid JSON') // the error under test is the one that was thrown
+      expect(leakedFragments(shown(err))).toEqual([])
+    })
+
+    it('holds no stretch of the key when the transport failure carries the key', async () => {
+      const baseUrl = `http://not a url ${DUMMY_KEY}`
+      // The premise: undici's own error for this URL holds the key, in its message and again further down its cause chain.
+      // That is the error the client used to hand on as the cause. (A stub of the global fetch would not reach the client,
+      // which calls the fetch it imports from undici.)
+      const raw = await undiciFetch(`${baseUrl}/chat/completions`).catch((e: unknown) => e)
+      expect((raw as Error).message).toContain(DUMMY_KEY)
+      expect(leakedFragments(shown(raw))).not.toEqual([])
+      const err = await createModelClient({ baseUrl, name: 'm', apiKey: DUMMY_KEY }).complete(msgs, opts()).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ModelError)
+      expect((err as ModelError).message).toMatch(/^model request failed: /) // the error under test is the one that was thrown
+      expect(leakedFragments(shown(err))).toEqual([])
+    })
+  })
+
+  // undici trims a header value before it goes out, so the server never sees the padding and echoes the key without it.
+  it('masks the key without surrounding whitespace when the configured key has some', async () => {
+    const echo = { status: 401, body: bodyWithKeyAt(190, (p) => JSON.stringify({ error: { message: p } })) }
+    fake = await startFakeModelServer([echo, echo])
+    for (const padding of [' ', '\n']) {
+      const message = await errorMessage(fake.baseUrl, DUMMY_KEY + padding)
+      expect(message, JSON.stringify(padding)).toContain('<redacted>')
+      expect(leakedFragments(message), JSON.stringify(padding)).toEqual([])
+    }
+    // The premise: what reached the server was the trimmed key, for both paddings.
+    expect(fake.requests.map((r) => r.headers.authorization)).toEqual([`Bearer ${DUMMY_KEY}`, `Bearer ${DUMMY_KEY}`])
+  })
+
+  it('leaves a good answer untouched: only error messages are masked', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: `the key is ${DUMMY_KEY}` }) }])
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm', apiKey: DUMMY_KEY }).complete(msgs, opts())
+    expect(r.message.content).toBe(`the key is ${DUMMY_KEY}`)
+  })
+})
+
 describe('reasoningEffort', () => {
   it('sends reasoning_effort when set', async () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
@@ -142,6 +263,62 @@ describe('reasoningEffort', () => {
     fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
     await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
     expect(fake.requests[0].body).not.toHaveProperty('reasoning_effort')
+  })
+})
+
+describe('extraBody', () => {
+  // The fields the comparison runner adds for an OpenRouter model; `reasoning` is the nested object, not reasoning_effort.
+  const fields = { temperature: 0.7, seed: 1, provider: { data_collection: 'deny', require_parameters: true }, reasoning: { effort: 'none' } }
+
+  it('merges temperature, seed, the provider block and the reasoning object into the request, next to the client fields', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: fields }).complete(msgs, opts())
+    expect(fake.requests[0].body).toEqual({ model: 'm', messages: msgs, max_tokens: 64, stream: false, ...fields })
+  })
+
+  it('sends them on every request, also one with tools', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }, { body: completion({ content: 'y' }) }])
+    const tools = [{ type: 'function' as const, function: { name: 'echo', parameters: { type: 'object' } } }]
+    const client = createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: fields })
+    await client.complete(msgs, opts())
+    await client.complete(msgs, { ...opts(), tools })
+    expect(fake.requests[1].body).toMatchObject({ ...fields, tools })
+    expect(fake.requests[0].body).toMatchObject(fields)
+  })
+
+  it('adds nothing to the request without extraBody', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }, { body: completion({ content: 'y' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: {} }).complete(msgs, opts())
+    for (const r of fake.requests) expect(Object.keys(r.body).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream'])
+  })
+
+  it('lets the client fields win when extraBody names one, since they are merged underneath', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    const tools = [{ type: 'function' as const, function: { name: 'echo', parameters: { type: 'object' } } }]
+    const extraBody = { model: 'other', messages: [], max_tokens: 1, stream: true, tools: [], reasoning_effort: 'high' }
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', reasoningEffort: 'none', extraBody }).complete(msgs, { ...opts(), tools })
+    expect(fake.requests[0].body).toEqual({ model: 'm', messages: msgs, max_tokens: 64, stream: false, tools, reasoning_effort: 'none' })
+  })
+
+  it('passes reasoning_effort from extraBody when reasoningEffort is not set', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: { reasoning_effort: 'low' } }).complete(msgs, opts())
+    expect(fake.requests[0].body.reasoning_effort).toBe('low')
+  })
+
+  it('does not change the extraBody object it was given', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    const extraBody = structuredClone(fields)
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody }).complete(msgs, opts())
+    expect(extraBody).toEqual(fields)
+  })
+
+  it('keeps the api key in the Authorization header and out of the request body', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', apiKey: DUMMY_KEY, extraBody: fields }).complete(msgs, opts())
+    expect(fake.requests[0].headers.authorization).toBe(`Bearer ${DUMMY_KEY}`)
+    expect(leakedFragments(JSON.stringify(fake.requests[0].body))).toEqual([])
   })
 })
 
@@ -212,5 +389,209 @@ describe('reasoning, cachedTokens, durationMs and systemFingerprint', () => {
     const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm', now }).complete(msgs, opts())
     expect(r.durationMs).toBe(450)
     expect(i).toBe(2)
+  })
+})
+
+describe('costUsd, reasoningTokens and provider', () => {
+  // The real OpenRouter response from the first contact (Task 2). Every call gives a fresh copy, so a test can bend it.
+  const real = () => JSON.parse(fixture('openrouter-chat-completion.json'))
+  const complete = async (body: unknown) => {
+    fake = await startFakeModelServer([{ body }])
+    return createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+  }
+
+  it('reads costUsd, reasoningTokens and provider from the real OpenRouter response', async () => {
+    const file = real()
+    // The premise: the file holds all three. Without it the asserts below would also hold for three undefineds.
+    expect(typeof file.usage.cost).toBe('number')
+    expect(typeof file.usage.completion_tokens_details.reasoning_tokens).toBe('number')
+    expect(file.provider).toMatch(/\S/)
+    const r = await complete(fixture('openrouter-chat-completion.json')) // the bytes as they are in the file
+    expect(r.usage).toEqual({
+      source: 'provider_reported',
+      inputTokens: file.usage.prompt_tokens,
+      outputTokens: file.usage.completion_tokens,
+      cachedTokens: file.usage.prompt_tokens_details.cached_tokens,
+      costUsd: file.usage.cost,
+      reasoningTokens: file.usage.completion_tokens_details.reasoning_tokens,
+    })
+    expect(r.provider).toBe(file.provider)
+  })
+
+  it('keeps a cost and a reasoning-token count of 0: a free model reports them, and 0 is not absence', async () => {
+    const free = real()
+    free.usage.cost = 0
+    free.usage.completion_tokens_details.reasoning_tokens = 0
+    const r = await complete(free)
+    expect(r.usage.costUsd).toBe(0)
+    expect(r.usage.reasoningTokens).toBe(0)
+  })
+
+  it.each([
+    ['a body with usage but no cost', () => completion({ content: 'x' })],
+    ['a real Ollama response with reasoning', () => fixture('ollama-v1-reasoning.json')],
+    ['a real Ollama response with cached tokens', () => fixture('ollama-v1-cached.json')],
+  ])('leaves costUsd, reasoningTokens and provider undefined, and throws nothing, for %s', async (_label, body) => {
+    const r = await complete(body())
+    expect(r.usage.source).toBe('provider_reported')
+    expect(r.usage.costUsd).toBeUndefined()
+    expect(r.usage.reasoningTokens).toBeUndefined()
+    // Absent, not present as undefined: a key with no value would still count as a property.
+    expect(r.usage).not.toHaveProperty('costUsd')
+    expect(r.usage).not.toHaveProperty('reasoningTokens')
+    expect(r.provider).toBeUndefined()
+  })
+
+  it('reads the provider also when the response has no usage', async () => {
+    const file = real()
+    delete file.usage
+    const r = await complete(file)
+    expect(r.usage).toEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
+    expect(r.provider).toBe(real().provider)
+  })
+
+  // The token counts are not both numbers, but the response still says what it cost. A billed amount must not vanish:
+  // the runner sums costUsd for its spending cap. source stays 'missing', since it is the counts that are missing.
+  // toStrictEqual: what the response does not give is absent from the usage, not present as undefined.
+  describe('when the token counts are missing', () => {
+    it.each([
+      ['only a cost', (cost: number) => ({ cost })],
+      ['only one of the two counts, and a cost', (cost: number) => ({ completion_tokens: 5, cost })],
+      ['counts that are strings, and a cost', (cost: number) => ({ prompt_tokens: '399', completion_tokens: '44', cost })],
+    ])('keeps the cost when usage has %s', async (_label, usageWith) => {
+      const file = real()
+      file.usage = usageWith(file.usage.cost)
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0, costUsd: real().usage.cost })
+      expect(r.provider).toBe(real().provider) // the rest of the response is read as usual
+    })
+
+    it('keeps a cost of 0: a free model reports it, and 0 is not absence', async () => {
+      const file = real()
+      file.usage = { cost: 0 }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0, costUsd: 0 })
+    })
+
+    it('keeps the reasoning tokens as well as the cost', async () => {
+      const file = real()
+      file.usage = { cost: file.usage.cost, completion_tokens_details: file.usage.completion_tokens_details }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({
+        source: 'missing', inputTokens: 0, outputTokens: 0,
+        costUsd: real().usage.cost,
+        reasoningTokens: real().usage.completion_tokens_details.reasoning_tokens,
+      })
+    })
+
+    it('keeps the reasoning tokens when there is no cost', async () => {
+      const file = real()
+      file.usage = { completion_tokens_details: file.usage.completion_tokens_details }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({
+        source: 'missing', inputTokens: 0, outputTokens: 0,
+        reasoningTokens: real().usage.completion_tokens_details.reasoning_tokens,
+      })
+    })
+
+    it('does not read a cost that is not a number, here either', async () => {
+      const file = real()
+      file.usage = { cost: '0.0000795', completion_tokens_details: { reasoning_tokens: null } }
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
+    })
+
+    // usage that is no object at all: reading a cost from it must not throw, and there is nothing to keep.
+    it.each([
+      ['a string', 'n/a'],
+      ['a number', 42],
+      ['an array', []],
+      ['null', null],
+      ['an empty object', {}],
+    ])('reads usage that is %s as missing, without a cost and without error', async (_label, usage) => {
+      const file = real()
+      file.usage = usage
+      const r = await complete(file)
+      expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
+    })
+  })
+
+  // One field at a time is bent into something that is not a usable value; the rest of the real response must survive.
+  const NOT_A_NUMBER: Array<[label: string, value: unknown]> = [
+    ['a numeric string', '0.0000795'],
+    ['null', null],
+    ['an object', { usd: 0.0000795 }],
+    ['a boolean', true],
+  ]
+
+  it.each(NOT_A_NUMBER)('ignores usage.cost when it is %s', async (_label, cost) => {
+    const body = real()
+    body.usage.cost = cost
+    const r = await complete(body)
+    expect(r.usage.costUsd).toBeUndefined()
+    expect(r.usage.reasoningTokens).toBe(real().usage.completion_tokens_details.reasoning_tokens)
+    expect(r.provider).toBe(real().provider)
+    expect(r.usage.source).toBe('provider_reported')
+  })
+
+  it.each(NOT_A_NUMBER)('ignores reasoning_tokens when it is %s', async (_label, tokens) => {
+    const body = real()
+    body.usage.completion_tokens_details.reasoning_tokens = tokens
+    const r = await complete(body)
+    expect(r.usage.reasoningTokens).toBeUndefined()
+    expect(r.usage.costUsd).toBe(real().usage.cost)
+    expect(r.usage.source).toBe('provider_reported')
+  })
+
+  it.each([
+    ['null', null],
+    ['a string', 'details'],
+    ['a number', 27],
+  ])('ignores completion_tokens_details when it is %s', async (_label, details) => {
+    const body = real()
+    body.usage.completion_tokens_details = details
+    const r = await complete(body)
+    expect(r.usage.reasoningTokens).toBeUndefined()
+    expect(r.usage.costUsd).toBe(real().usage.cost)
+    expect(r.usage.source).toBe('provider_reported')
+  })
+
+  it.each([
+    ['an empty string', ''],
+    ['null', null],
+    ['a number', 42],
+    ['an object', { name: 'AkashML' }],
+  ])('ignores a provider that is %s: only a non-empty string counts', async (_label, provider) => {
+    const body = real()
+    body.provider = provider
+    const r = await complete(body)
+    expect(r.provider).toBeUndefined()
+    expect(r.usage.costUsd).toBe(real().usage.cost)
+  })
+
+  // JSON.parse reads 1e999 as Infinity, and JSON.stringify writes Infinity as null. The body goes out as raw text on
+  // purpose: an Infinity put into a JS object would already be null when it was serialised, and the test would pass
+  // for nothing. The premise check below proves the text really parses to an infinite number.
+  const at = (body: unknown, path: string[]) => path.reduce<unknown>((o, k) => (o as Record<string, unknown>)[k], body)
+  it.each([
+    ['usage.cost of 1e999', ['usage', 'cost'], '"cost": 7.95e-05', '"cost": 1e999', 'costUsd'],
+    ['usage.cost of -1e999', ['usage', 'cost'], '"cost": 7.95e-05', '"cost": -1e999', 'costUsd'],
+    ['reasoning_tokens of 1e999', ['usage', 'completion_tokens_details', 'reasoning_tokens'], '"reasoning_tokens": 27', '"reasoning_tokens": 1e999', 'reasoningTokens'],
+    ['cached_tokens of 1e999', ['usage', 'prompt_tokens_details', 'cached_tokens'], '"cached_tokens": 0', '"cached_tokens": 1e999', 'cachedTokens'],
+  ] as const)('ignores a %s, which JSON reads as infinite', async (_label, path, from, to, field) => {
+    const text = fixture('openrouter-chat-completion.json').replace(from, to)
+    expect(Math.abs(at(JSON.parse(text), [...path]) as number)).toBe(Infinity) // the premise
+    const r = await complete(text)
+    expect(r.usage[field]).toBeUndefined()
+    expect(JSON.stringify(r.usage)).not.toContain('null') // the symptom: an infinite number written out as null
+    expect(r.usage.source).toBe('provider_reported') // the rest of the real response survives
+    expect(r.provider).toBe(real().provider)
+  })
+
+  it('ignores an infinite cost when the token counts are missing too', async () => {
+    const text = JSON.stringify({ ...real(), usage: { cost: 0 } }).replace('"cost":0', '"cost":1e999')
+    expect(at(JSON.parse(text), ['usage', 'cost'])).toBe(Infinity) // the premise
+    const r = await complete(text)
+    expect(r.usage).toStrictEqual({ source: 'missing', inputTokens: 0, outputTokens: 0 })
   })
 })
