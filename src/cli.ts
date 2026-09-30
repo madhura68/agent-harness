@@ -14,6 +14,7 @@ import type { ToolRegistry } from './types.js'
 import { checkRunLogs } from './worker/check-run-logs.js'
 import { loadWorkerConfig, workerMcpEnv } from './worker/config.js'
 import { createControlChannel } from './worker/control.js'
+import { capDocArgs } from './worker/doc-tools.js'
 import { collectSecretValues, workerSecretSources } from './worker/redact.js'
 import { openRunLog } from './worker/run-log.js'
 import { runWorker } from './worker/worker.js'
@@ -213,7 +214,7 @@ async function cmdWorker(values: Values): Promise<number> {
     const client = conn.client
     const { exitCode, jobs } = await runWorker({
       control: createControlChannel(client),
-      registryView: (signal) => createRegistryView(client, config.allow, signal),
+      registryView: async (signal) => capDocArgs(await createRegistryView(client, config.allow, signal)),
       modelClient: createModelClient(config.model),
       config,
       out,

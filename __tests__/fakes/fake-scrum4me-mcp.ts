@@ -116,7 +116,7 @@ export async function startFakeScrum4meMcp(
     calls.push({ name: 'search_product_docs', args })
     return toolText({ results: [{ doc_id: 'doc1', title: 'Worker-runbook', product_id: args.product_id }] })
   })
-  server.registerTool('get_product_doc', { description: 'Read one product doc', inputSchema: { doc_id: z.string() } }, async (args) => {
+  server.registerTool('get_product_doc', { description: 'Read one product doc', inputSchema: { doc_id: z.string(), max_chars: z.number().int().optional() } }, async (args) => {
     calls.push({ name: 'get_product_doc', args })
     return toolText({ doc_id: args.doc_id, content_md: '# Worker-runbook' })
   })
