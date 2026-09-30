@@ -36,6 +36,15 @@ export function transportTimeouts(opts: Pick<ModelClientOptions, 'headersTimeout
 
 const FINISH_REASONS = new Set(['stop', 'length', 'tool_calls'])
 
+// Same floor as worker/redact.ts: a shorter value is a placeholder (Ollama takes any string), and masking it would mangle ordinary text.
+const MIN_MASKED_KEY_LENGTH = 8
+
+/** Replaces every occurrence of the key with '<redacted>'. Without a key, or with one shorter than 8 characters, the text stays as it is. */
+export function maskKey(text: string, apiKey: string | undefined): string {
+  if (!apiKey || apiKey.length < MIN_MASKED_KEY_LENGTH) return text
+  return text.replaceAll(apiKey, '<redacted>')
+}
+
 function excerpt(text: string): string {
   return text.slice(0, 200)
 }
@@ -115,27 +124,30 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         text = await res.text()
       } catch (err) {
         const reason = options.signal.aborted ? 'aborted (deadline)' : err instanceof Error ? err.message : String(err)
-        throw new ModelError(`model request failed: ${reason}`, { cause: err })
+        throw new ModelError(`model request failed: ${maskKey(reason, opts.apiKey)}`, { cause: err })
       }
       const durationMs = now() - requestStart
+      // Mask first, cut second: excerpt() keeps 200 characters, and a key that straddles the cut would leave a prefix
+      // maskKey can no longer match. Errors use this copy; a good answer is still parsed from the raw text.
+      const maskedText = maskKey(text, opts.apiKey)
       if (status < 200 || status >= 300) {
-        throw new ModelError(`model HTTP ${status}: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: ${excerpt(maskedText)}`)
       }
       let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown }
       try {
         json = JSON.parse(text)
       } catch (err) {
-        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(text)}`, { cause: err })
+        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(maskedText)}`, { cause: err })
       }
       if (json === null || typeof json !== 'object') {
-        throw new ModelError(`model HTTP ${status}: unexpected body: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: unexpected body: ${excerpt(maskedText)}`)
       }
       if (json.error) {
-        throw new ModelError(`model HTTP ${status}: error body: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: error body: ${excerpt(maskedText)}`)
       }
       const choice = Array.isArray(json.choices) ? json.choices[0] : undefined
       if (!choice || typeof choice !== 'object') {
-        throw new ModelError(`model HTTP ${status}: no choices: ${excerpt(text)}`)
+        throw new ModelError(`model HTTP ${status}: no choices: ${excerpt(maskedText)}`)
       }
       const message = (choice as { message?: { content?: unknown; tool_calls?: unknown; reasoning?: unknown; reasoning_content?: unknown } }).message ?? {}
       const finish = (choice as { finish_reason?: unknown }).finish_reason

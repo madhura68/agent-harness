@@ -8,7 +8,7 @@ import { createModelClient } from '../src/model-client.js'
 import { runManifest, type AfterAnswerResult } from '../src/run.js'
 import { openTrace } from '../src/trace.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
-import { dirContains, readTrace, tmp } from './helpers.js'
+import { allFiles, bodyWithKeyAt, dirContains, DUMMY_KEY, leakedFragments, readTrace, tmp } from './helpers.js'
 
 type Fake = Awaited<ReturnType<typeof startFakeModelServer>>
 let fake: Fake | undefined
@@ -108,6 +108,22 @@ describe('runManifest — answer profile', () => {
     const { trace, requests } = await run([{ body: completion({ content: 'x' }) }], (b) => ({ model: { baseUrl: b, name: 'm', apiKey: 'sk-test-secret' } }))
     expect(requests[0].headers.authorization).toBe('Bearer sk-test-secret')
     expect(dirContains(trace.dir, 'sk-test-secret')).toBe(false)
+  })
+
+  it('keeps the apiKey out of the error message, run_end and result.json when the server echoes it', async () => {
+    const echo = { status: 401, body: bodyWithKeyAt(190, (p) => JSON.stringify({ error: { message: p } })) }
+    const { result, trace } = await run([echo], (b) => ({ model: { baseUrl: b, name: 'm', apiKey: DUMMY_KEY } }))
+    expect(result.status).toBe('failed')
+    expect(result.error?.code).toBe('MODEL_ERROR')
+    expect(result.error?.message).toContain('<redacted>')
+    expect(leakedFragments(result.error?.message ?? '')).toEqual([])
+    const runEnd = readTrace(trace.dir).at(-1)
+    expect(runEnd).toMatchObject({ type: 'run_end', status: 'failed', error: { code: 'MODEL_ERROR' } })
+    expect(JSON.stringify(runEnd)).toContain('<redacted>')
+    expect(leakedFragments(JSON.stringify(runEnd))).toEqual([])
+    // Every file of the run (trace.jsonl, result.json, …), not just the two places named above.
+    const written = allFiles(trace.dir).map((f) => readFileSync(f, 'utf8')).join('\n')
+    expect(leakedFragments(written)).toEqual([])
   })
 
   it('leaves usage.cachedTokens absent when no response reported it', async () => {

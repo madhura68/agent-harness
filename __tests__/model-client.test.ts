@@ -1,8 +1,9 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { createModelClient, ModelError, transportTimeouts } from '../src/model-client.js'
+import { createModelClient, maskKey, ModelError, transportTimeouts } from '../src/model-client.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
+import { bodyWithKeyAt, DUMMY_KEY, leakedFragments } from './helpers.js'
 
 type Fake = Awaited<ReturnType<typeof startFakeModelServer>>
 let fake: Fake | undefined
@@ -128,6 +129,78 @@ describe('createModelClient', () => {
     const err = await keyed.complete(msgs, opts()).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ModelError)
     expect((err as Error).message).not.toContain('sk-test-secret')
+  })
+})
+
+describe('maskKey', () => {
+  it('replaces every occurrence of the key', () => {
+    expect(maskKey(`a ${DUMMY_KEY} b ${DUMMY_KEY}`, DUMMY_KEY)).toBe('a <redacted> b <redacted>')
+  })
+
+  it('leaves the text alone without a key or with a key shorter than 8 characters', () => {
+    const text = 'Bearer abcdefg and abc'
+    expect(maskKey(text, undefined)).toBe(text)
+    expect(maskKey(text, '')).toBe(text)
+    expect(maskKey(text, 'abcdefg')).toBe(text) // 7 characters
+  })
+
+  it('masks a key of exactly 8 characters', () => {
+    expect(maskKey('Bearer abcdefgh', 'abcdefgh')).toBe('Bearer <redacted>')
+  })
+
+  it('matches the key literally, not as a pattern', () => {
+    // Read as a regular expression this key would also match 'aXbbcc'.
+    expect(maskKey('a.b*c+d? aXbbcc', 'a.b*c+d?')).toBe('<redacted> aXbbcc')
+  })
+})
+
+describe('the key in model errors', () => {
+  // One call against the current fake server; returns the message of the ModelError it must throw.
+  async function errorMessage(baseUrl: string): Promise<string> {
+    const c = createModelClient({ baseUrl, name: 'm', apiKey: DUMMY_KEY })
+    const err = await c.complete(msgs, opts()).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ModelError)
+    return (err as ModelError).message
+  }
+
+  it('masks the key in the error of an HTTP 401 whose body echoes it', async () => {
+    fake = await startFakeModelServer([{ status: 401, body: { error: { message: `Invalid API key ${DUMMY_KEY}` } } }])
+    const message = await errorMessage(fake.baseUrl)
+    expect(message).toContain('<redacted>')
+    expect(message).not.toContain(DUMMY_KEY)
+  })
+
+  // One row per place in complete() that puts the response text in a ModelError.
+  const ECHOES: Array<[label: string, status: number, build: (payload: string) => string]> = [
+    ['an HTTP 401 error body', 401, (p) => JSON.stringify({ error: { message: p } })],
+    ['a 200 body that is not JSON', 200, (p) => p],
+    ['a 200 body that is JSON but no object', 200, (p) => JSON.stringify(p)],
+    ['a 200 with an error object', 200, (p) => JSON.stringify({ error: { message: p } })],
+    ['a 200 without choices', 200, (p) => JSON.stringify({ id: p })],
+  ]
+
+  // At 190 an excerpt cut before the mask would keep the first 10 characters of the key; no stretch of 6+ may survive.
+  describe.each([40, 190])('with the key starting at character %i of the body', (offset) => {
+    it.each(ECHOES)('masks it in the error for %s', async (_label, status, build) => {
+      fake = await startFakeModelServer([{ status, body: bodyWithKeyAt(offset, build) }])
+      const message = await errorMessage(fake.baseUrl)
+      expect(message).toContain('<redacted>')
+      expect(leakedFragments(message)).toEqual([])
+    })
+  })
+
+  it('masks the key in the reason of a transport failure', async () => {
+    // undici echoes the URL in its parse error, which makes a transport failure whose reason holds the key.
+    const message = await errorMessage(`http://not a url ${DUMMY_KEY}`)
+    expect(message).toMatch(/^model request failed: /)
+    expect(message).toContain('<redacted>')
+    expect(leakedFragments(message)).toEqual([])
+  })
+
+  it('leaves a good answer untouched: only error messages are masked', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: `the key is ${DUMMY_KEY}` }) }])
+    const r = await createModelClient({ baseUrl: fake.baseUrl, name: 'm', apiKey: DUMMY_KEY }).complete(msgs, opts())
+    expect(r.message.content).toBe(`the key is ${DUMMY_KEY}`)
   })
 })
 

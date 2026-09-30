@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ServerSpec } from '../src/types.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 import { startFakeMcp } from './fakes/fake-mcp-server.js'
-import { dirContains, readTrace, tmp } from './helpers.js'
+import { bodyWithKeyAt, dirContains, DUMMY_KEY, leakedFragments, readTrace, tmp } from './helpers.js'
 
 const stdioCalls: Array<{ server: ServerSpec; allow: string[] }> = []
 const open: Array<{ close(): Promise<void> }> = []
@@ -134,6 +134,38 @@ describe('harness run — tools profile', () => {
     expect(code).toBe(1)
     expect(printed).toMatch(/SCRUM4ME_TOKEN/)
     expect(existsSync(join(out, 'cli-tools'))).toBe(false)
+  })
+})
+
+describe('harness probe — a server that echoes the api key', () => {
+  it('keeps the key out of probe.json, stdout and stderr', async () => {
+    const echo = { status: 401, body: bodyWithKeyAt(190, (p) => JSON.stringify({ error: { message: p } })) }
+    fake = await startFakeModelServer([echo, echo, echo, echo])
+    const out = join(tmp('cli-probe'), 'runs')
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    process.env.DUMMY_KEY = DUMMY_KEY
+    let code: number
+    let printedOut = ''
+    let printedErr = ''
+    try {
+      code = await main(['probe', '--base-url', fake.baseUrl, '--model', 'm', '--out', out, '--api-key-env', 'DUMMY_KEY', '--step-timeout', '5'])
+    } finally {
+      // Read the calls before mockRestore, which resets them.
+      printedOut = stdout.mock.calls.map((c) => String(c[0])).join('')
+      printedErr = stderr.mock.calls.map((c) => String(c[0])).join('')
+      stdout.mockRestore()
+      stderr.mockRestore()
+      delete process.env.DUMMY_KEY
+    }
+    expect(code).toBe(1) // every step failed
+    expect(fake.requests[0].headers.authorization).toBe(`Bearer ${DUMMY_KEY}`) // the CLI did send the key
+    const probeJson = readFileSync(join(probeDir(out, 'm'), 'probe.json'), 'utf8')
+    expect(probeJson).toContain('<redacted>')
+    expect(printedOut).toContain('<redacted>')
+    expect(leakedFragments(probeJson), 'probe.json').toEqual([])
+    expect(leakedFragments(printedOut), 'stdout').toEqual([])
+    expect(leakedFragments(printedErr), 'stderr').toEqual([])
   })
 })
 
