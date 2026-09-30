@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { expandEnv, loadManifest, ManifestError, resolveServerEnv } from '../src/manifest.js'
+import { assertExtraBody, expandEnv, loadManifest, ManifestError, RESERVED_BODY_KEYS, resolveServerEnv } from '../src/manifest.js'
 
 const limits = { maxTurns: 3, maxOutputTokens: 512, maxWallSeconds: 120, maxToolErrors: 0 }
 const answer = { id: 'answer-smoke', profile: 'answer', prompt: 'Hallo ${HOME}', model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'qwen3-coder:30b' }, limits }
@@ -108,6 +108,79 @@ describe('history in a manifest', () => {
     const file = write({ ...answer, history: [{ role: 'system', content: 'x' }, assistant('a1')] })
     expect(() => loadManifest(file)).toThrow(ManifestError)
     expect(() => loadManifest(file)).toThrow(/history\.0\.role/)
+  })
+})
+
+describe('model.extraBody in a manifest', () => {
+  // What the comparison runner writes for an OpenRouter model: sampling fields, the provider block and the nested reasoning object.
+  const fields = { temperature: 0.7, seed: 1, provider: { data_collection: 'deny', require_parameters: true }, reasoning: { effort: 'none' } }
+  const withModel = (model: Record<string, unknown>) => write({ ...answer, model: { ...answer.model, ...model } })
+
+  it('leaves extraBody undefined when the model block has none', () => {
+    expect(loadManifest(write(answer)).model.extraBody).toBeUndefined()
+  })
+
+  it('accepts temperature, seed, a provider block and a reasoning object, and keeps them as written', () => {
+    expect(loadManifest(withModel({ extraBody: fields })).model.extraBody).toEqual(fields)
+  })
+
+  it('accepts an empty extraBody', () => {
+    expect(loadManifest(withModel({ extraBody: {} })).model.extraBody).toEqual({})
+  })
+
+  it.each(RESERVED_BODY_KEYS)('rejects the reserved key %s, naming it and the path model.extraBody', (key) => {
+    const file = withModel({ extraBody: { temperature: 0.7, [key]: 'x' } })
+    expect(() => loadManifest(file)).toThrow(ManifestError)
+    // The found keys are quoted, the list of reserved keys is not: this only matches when `key` itself was reported.
+    expect(() => loadManifest(file)).toThrow(new RegExp(`: model\\.extraBody: extraBody mag geen gereserveerde sleutels bevatten: "${key}"`))
+  })
+
+  it('names every reserved key it finds, not just the first', () => {
+    const extraBody = Object.fromEntries(RESERVED_BODY_KEYS.map((k) => [k, 1]))
+    expect(() => loadManifest(withModel({ extraBody }))).toThrow(/bevatten: "model", "messages", "tools", "stream", "max_tokens", "max_completion_tokens", "n" \(/)
+  })
+
+  it('rejects reasoning_effort in extraBody next to reasoningEffort', () => {
+    const file = withModel({ reasoningEffort: 'none', extraBody: { reasoning_effort: 'low' } })
+    expect(() => loadManifest(file)).toThrow(ManifestError)
+    expect(() => loadManifest(file)).toThrow(/model\.extraBody: extraBody mag reasoning_effort niet bevatten naast reasoningEffort/)
+  })
+
+  it('lets reasoning_effort in extraBody through when reasoningEffort is not set', () => {
+    expect(loadManifest(withModel({ extraBody: { reasoning_effort: 'low' } })).model.extraBody).toEqual({ reasoning_effort: 'low' })
+  })
+
+  it('does not confuse the reasoning object with reasoning_effort: it is not reserved, with or without reasoningEffort', () => {
+    expect(loadManifest(withModel({ extraBody: { reasoning: { effort: 'none' } } })).model.extraBody).toEqual({ reasoning: { effort: 'none' } })
+    expect(loadManifest(withModel({ reasoningEffort: 'low', extraBody: { reasoning: { effort: 'none' } } })).model.reasoningEffort).toBe('low')
+  })
+
+  it.each([
+    ['a list', [{ temperature: 0.7 }]],
+    ['a string', 'temperature'],
+    ['null', null],
+  ])('rejects an extraBody that is %s', (_label, extraBody) => {
+    const file = withModel({ extraBody })
+    expect(() => loadManifest(file)).toThrow(ManifestError)
+    expect(() => loadManifest(file)).toThrow(/model\.extraBody/)
+  })
+})
+
+describe('assertExtraBody', () => {
+  it('passes the usual fields', () => {
+    expect(() => assertExtraBody({})).not.toThrow()
+    expect(() => assertExtraBody({ temperature: 0.7, seed: 1, provider: { data_collection: 'deny' }, reasoning: { effort: 'none' } }, 'low')).not.toThrow()
+  })
+
+  it.each(RESERVED_BODY_KEYS)('throws a ManifestError for the reserved key %s', (key) => {
+    expect(() => assertExtraBody({ [key]: 1 })).toThrow(ManifestError)
+    expect(() => assertExtraBody({ [key]: 1 }, 'low')).toThrow(ManifestError)
+  })
+
+  it('throws for reasoning_effort only when reasoningEffort is given', () => {
+    expect(() => assertExtraBody({ reasoning_effort: 'low' })).not.toThrow()
+    expect(() => assertExtraBody({ reasoning_effort: 'low' }, undefined)).not.toThrow()
+    expect(() => assertExtraBody({ reasoning_effort: 'low' }, 'none')).toThrow(ManifestError)
   })
 })
 

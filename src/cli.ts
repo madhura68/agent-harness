@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
-import { loadManifest, ManifestError, resolveServerEnv } from './manifest.js'
+import { assertExtraBody, loadManifest, ManifestError, resolveServerEnv } from './manifest.js'
 import { createModelClient } from './model-client.js'
 import { probeDir, runProbe } from './probe.js'
 import { runManifest } from './run.js'
@@ -20,8 +20,8 @@ import { runWorker } from './worker/worker.js'
 const USAGE = `harness — agent-harness v0
 
 Usage:
-  harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>]
-  harness run <manifest.json> --out <dir> [--skip-probe]
+  harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>] [--extra-body-file <json>]
+  harness run <manifest.json> --out <dir> [--skip-probe] [--api-key-env <VAR>]
   harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe]
   harness check-run-logs --config <worker.json> --dir <run-logs-dir>
 `
@@ -37,6 +37,7 @@ export const cliArgsConfig = {
     out: { type: 'string' },
     'api-key-env': { type: 'string' },
     'step-timeout': { type: 'string' },
+    'extra-body-file': { type: 'string' },
     'skip-probe': { type: 'boolean' },
     config: { type: 'string' },
     once: { type: 'boolean' },
@@ -55,14 +56,37 @@ function readApiKey(varName: string | undefined): string | undefined {
   return v
 }
 
+/** The JSON object in --extra-body-file, held to the same rules as `model.extraBody` in a manifest. */
+function readExtraBodyFile(path: string): Record<string, unknown> {
+  let raw: unknown
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'))
+  } catch (err) {
+    throw new ManifestError(`cannot read --extra-body-file ${path}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ManifestError(`invalid --extra-body-file ${path}: moet een JSON-object zijn`)
+  }
+  const extraBody = raw as Record<string, unknown>
+  try {
+    // The probe has no reasoningEffort, so a reasoning_effort in the file cannot clash with one.
+    assertExtraBody(extraBody)
+  } catch (err) {
+    throw new ManifestError(`invalid --extra-body-file ${path}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  return extraBody
+}
+
 async function cmdProbe(values: Values): Promise<number> {
   const baseUrl = values['base-url']
   const model = values.model
   if (!baseUrl || !model) throw new UsageError('probe needs --base-url and --model')
   const stepTimeoutSec = Number(values['step-timeout'] ?? '120')
   if (!Number.isFinite(stepTimeoutSec) || stepTimeoutSec <= 0) throw new UsageError('--step-timeout must be a positive number of seconds')
+  const extraBodyFile = values['extra-body-file']
+  const extraBody = extraBodyFile === undefined ? undefined : readExtraBodyFile(extraBodyFile)
   const apiKey = readApiKey(values['api-key-env'])
-  const client = createModelClient({ baseUrl, name: model, apiKey })
+  const client = createModelClient({ baseUrl, name: model, apiKey, extraBody })
   const result = await runProbe(client, { baseUrl, model, stepTimeoutMs: stepTimeoutSec * 1000 })
   const dir = probeDir(values.out ?? 'runs', model)
   mkdirSync(dir, { recursive: true })
@@ -106,6 +130,8 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
   const out = values.out ?? 'runs'
   const manifest = loadManifest(manifestPath)
   const skipProbe = values['skip-probe'] === true
+  // Read before anything else starts, so an unset variable fails with no run dir and no MCP process.
+  const apiKey = readApiKey(values['api-key-env'])
 
   let connectRegistry = async (_signal: AbortSignal): Promise<ToolRegistry> => {
     throw new Error('connectRegistry is only available for profile tools')
@@ -121,7 +147,9 @@ async function cmdRun(values: Values, manifestPath: string | undefined): Promise
   }
 
   const trace = openTrace(out, manifest.id)
-  const client = createModelClient(manifest.model)
+  // The key from --api-key-env beats a model.apiKey in the manifest, but only here: the manifest object that goes to
+  // runManifest (and from there into the trace) is never given it.
+  const client = createModelClient(apiKey ? { ...manifest.model, apiKey } : manifest.model)
   const result = await runManifest(manifest, { client, trace, connectRegistry, ...(skipProbe && manifest.profile === 'tools' ? { probeSkipped: true } : {}) })
   const u = result.usage
   process.stdout.write(

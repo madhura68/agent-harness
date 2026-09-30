@@ -22,7 +22,7 @@ Ollama op max2 luistert alleen op localhost. Open eerst een tunnel: `ssh -N -L 1
 harness probe --base-url http://127.0.0.1:11434/v1 --model qwen3-coder:30b --out runs
 ```
 
-Draait vier vaste stappen met een dummy-tool `echo` en schrijft `runs/probe-<model>/probe.json` met `tool_calling: reliable | unreliable | none`. Exit 0 alleen bij `reliable`. Opties: `--api-key-env <VAR>` leest een API-key uit de omgeving, `--step-timeout <sec>` (standaard 120).
+Draait vier vaste stappen met een dummy-tool `echo` en schrijft `runs/probe-<model>/probe.json` met `tool_calling: reliable | unreliable | none`. Exit 0 alleen bij `reliable`. Opties: `--api-key-env <VAR>` leest een API-key uit de omgeving, `--step-timeout <sec>` (standaard 120), `--extra-body-file <json>` leest een JSON-object met extra aanvraagvelden (dezelfde regels als `model.extraBody`, zie hieronder) en stuurt die met elke probe-aanvraag mee, zodat de probe bij dezelfde aanbieders uitkomt als de runs. Een bestand met een gereserveerde sleutel wordt geweigerd voordat er een aanvraag uitgaat.
 
 ## Een run uitvoeren
 
@@ -36,6 +36,10 @@ Elke run schrijft `runs/<id>/trace.jsonl`, `runs/<id>/tools/<callId>.txt` en `ru
 Het profiel `tools` weigert met `PROBE_REQUIRED` zolang er geen `probe.json` met `reliable` is voor hetzelfde `baseUrl` en model in de `--out`-map. `--skip-probe` omzeilt dat bewust en wordt in de trace vastgelegd.
 
 Secrets horen in de omgeving, niet in het manifest: `tools.server.env` gebruikt `${VAR}`-verwijzingen die pas op weg naar het MCP-kindproces worden ingevuld. Het kindproces krijgt alleen `HOME`, `LOGNAME`, `PATH`, `SHELL`, `TERM`, `USER` plus wat het manifest noemt. `model.apiKey` en de env-waarden komen nooit in trace of `result.json`.
+
+`harness run <manifest> --out <dir> --api-key-env <VAR>` leest de API-key voor het model uit die omgevingsvariabele, zoals `probe` dat al deed. De flag wint van een `model.apiKey` in het manifest, die dan ongemoeid blijft; de sleutel gaat alleen naar de model-client en komt niet in het manifest, de trace of `result.json`. Een niet-gezette variabele is een fout die de naam noemt, nog voordat de run-map bestaat.
+
+`model.extraBody` (optioneel object, ook in het `model`-blok van de worker-config) wordt in elke chat-completions-aanvraag gemerged, voor velden als `temperature`, `seed`, een `provider`-blok of een `reasoning`-object (de geneste vorm van OpenRouter), bijvoorbeeld `"extraBody": { "temperature": 0.7, "seed": 1, "provider": { "data_collection": "deny", "require_parameters": true } }`. De sleutels `model`, `messages`, `tools`, `stream`, `max_tokens`, `max_completion_tokens` en `n` zet de harness zelf en worden bij het laden geweigerd. `reasoning_effort` wordt alleen geweigerd als `reasoningEffort` ook gezet is, anders zou het veld dubbel uitgaan; het `reasoning`-object is een ander veld en mag wel. De velden staan, net als de rest van het manifest, in de `run_start`-regel van de trace.
 
 ## Worker-modus (IDEA_CHAT via een lokaal model)
 

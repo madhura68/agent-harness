@@ -141,6 +141,34 @@ describe('model.reasoningEffort', () => {
   })
 })
 
+// ModelSpecSchema is shared with the run manifest, so the model block of a worker config takes extraBody too, under the same rules.
+describe('model.extraBody', () => {
+  const extraBody = { temperature: 0.7, seed: 1, provider: { data_collection: 'deny', require_parameters: true }, reasoning: { effort: 'none' } }
+  const withModel = (model: Record<string, unknown>) => ({ ...base, model: { ...base.model, ...model } })
+
+  it('accepts extraBody in the model block and keeps it as written', () => {
+    expect(WorkerConfigSchema.parse(withModel({ extraBody })).model.extraBody).toEqual(extraBody)
+    expect(loadWorkerConfig(writeConfig(withModel({ extraBody }))).model.extraBody).toEqual(extraBody)
+  })
+
+  it('leaves it unset by default, in the example worker config too', () => {
+    expect(WorkerConfigSchema.parse(base).model.extraBody).toBeUndefined()
+    expect(loadWorkerConfig('examples/worker.json').model.extraBody).toBeUndefined()
+  })
+
+  it.each(['model', 'messages', 'tools', 'stream', 'max_tokens', 'max_completion_tokens', 'n'])('rejects the reserved key %s with a ManifestError naming model.extraBody', (key) => {
+    const p = writeConfig(withModel({ extraBody: { [key]: 1 } }))
+    expect(() => loadWorkerConfig(p)).toThrow(ManifestError)
+    expect(() => loadWorkerConfig(p)).toThrow(new RegExp(`model\\.extraBody: .*bevatten: "${key}"`))
+  })
+
+  it('rejects reasoning_effort in extraBody next to reasoningEffort, and lets it through alone', () => {
+    const clash = WorkerConfigSchema.safeParse(withModel({ reasoningEffort: 'none', extraBody: { reasoning_effort: 'low' } }))
+    expect(clash.success).toBe(false)
+    expect(WorkerConfigSchema.safeParse(withModel({ extraBody: { reasoning_effort: 'low' } })).success).toBe(true)
+  })
+})
+
 const taskLimits = { maxTurns: 40, maxOutputTokens: 8000, maxWallSeconds: 2400, maxToolErrors: 8 }
 const recipe = { repoUrl: 'https://git.jp-visser.nl/janpeter/Scrum4Me.git', prepare: ['npm ci'], verify: 'npm run verify' }
 const minimalTask = { limits: taskLimits, image: 'node:24-bookworm', uid: 1000, gid: 1000, npmCacheDir: '/var/cache/npm', recipes: [recipe] }

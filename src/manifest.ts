@@ -2,13 +2,45 @@ import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 import { REASONING_EFFORTS } from './model-client.js'
 
+/** Request fields the model client sets itself; `extraBody` may not carry them. */
+export const RESERVED_BODY_KEYS = ['model', 'messages', 'tools', 'stream', 'max_tokens', 'max_completion_tokens', 'n'] as const
+
+/**
+ * Throws a ManifestError for a reserved key, or for reasoning_effort next to reasoningEffort, which would set the same
+ * field twice. The nested `reasoning` object (OpenRouter's form) is a different field and passes.
+ */
+export function assertExtraBody(extraBody: Record<string, unknown>, reasoningEffort?: string): void {
+  const reserved: readonly string[] = RESERVED_BODY_KEYS
+  const found = Object.keys(extraBody).filter((key) => reserved.includes(key))
+  if (found.length > 0) {
+    throw new ManifestError(
+      `extraBody mag geen gereserveerde sleutels bevatten: ${found.map((k) => `"${k}"`).join(', ')} (gereserveerd: ${RESERVED_BODY_KEYS.join(', ')})`,
+    )
+  }
+  if (reasoningEffort !== undefined && Object.hasOwn(extraBody, 'reasoning_effort')) {
+    throw new ManifestError('extraBody mag reasoning_effort niet bevatten naast reasoningEffort: zet het ene of het andere')
+  }
+}
+
 /** Model block shared by run manifests and the worker config. */
-export const ModelSpecSchema = z.object({
-  baseUrl: z.string().url(),
-  name: z.string().min(1),
-  apiKey: z.string().optional(),
-  reasoningEffort: z.enum(REASONING_EFFORTS).optional(),
-})
+export const ModelSpecSchema = z
+  .object({
+    baseUrl: z.string().url(),
+    name: z.string().min(1),
+    apiKey: z.string().optional(),
+    reasoningEffort: z.enum(REASONING_EFFORTS).optional(),
+    /** Extra fields merged into every chat-completions request: temperature, seed, a provider block, a reasoning object. */
+    extraBody: z.record(z.string(), z.unknown()).optional(),
+  })
+  .superRefine((model, ctx) => {
+    if (!model.extraBody) return
+    try {
+      assertExtraBody(model.extraBody, model.reasoningEffort)
+    } catch (err) {
+      if (!(err instanceof ManifestError)) throw err
+      ctx.addIssue({ code: 'custom', path: ['extraBody'], message: err.message })
+    }
+  })
 
 export const ManifestSchema = z
   .object({

@@ -14,6 +14,12 @@ export type ModelClientOptions = {
   name: string
   apiKey?: string
   reasoningEffort?: ReasoningEffort
+  /**
+   * Extra request fields (temperature, seed, a provider block, a reasoning object). They are merged underneath the
+   * client's own fields, so model, messages, max_tokens, stream, tools and reasoning_effort keep the client's value
+   * whenever the client sets one. Reserved keys are refused where the config is loaded (assertExtraBody in manifest.ts).
+   */
+  extraBody?: Record<string, unknown>
   headersTimeoutMs?: number
   now?: () => number // test seam for durationMs; defaults to Date.now
 }
@@ -116,6 +122,7 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
       const headers: Record<string, string> = { 'content-type': 'application/json' }
       if (opts.apiKey) headers.authorization = `Bearer ${opts.apiKey}`
       const body: Record<string, unknown> = {
+        ...opts.extraBody,
         model: opts.name,
         messages: toWire(messages),
         max_tokens: options.maxTokens,

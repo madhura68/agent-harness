@@ -234,6 +234,62 @@ describe('reasoningEffort', () => {
   })
 })
 
+describe('extraBody', () => {
+  // The fields the comparison runner adds for an OpenRouter model; `reasoning` is the nested object, not reasoning_effort.
+  const fields = { temperature: 0.7, seed: 1, provider: { data_collection: 'deny', require_parameters: true }, reasoning: { effort: 'none' } }
+
+  it('merges temperature, seed, the provider block and the reasoning object into the request, next to the client fields', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: fields }).complete(msgs, opts())
+    expect(fake.requests[0].body).toEqual({ model: 'm', messages: msgs, max_tokens: 64, stream: false, ...fields })
+  })
+
+  it('sends them on every request, also one with tools', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }, { body: completion({ content: 'y' }) }])
+    const tools = [{ type: 'function' as const, function: { name: 'echo', parameters: { type: 'object' } } }]
+    const client = createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: fields })
+    await client.complete(msgs, opts())
+    await client.complete(msgs, { ...opts(), tools })
+    expect(fake.requests[1].body).toMatchObject({ ...fields, tools })
+    expect(fake.requests[0].body).toMatchObject(fields)
+  })
+
+  it('adds nothing to the request without extraBody', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }, { body: completion({ content: 'y' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm' }).complete(msgs, opts())
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: {} }).complete(msgs, opts())
+    for (const r of fake.requests) expect(Object.keys(r.body).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream'])
+  })
+
+  it('lets the client fields win when extraBody names one, since they are merged underneath', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    const tools = [{ type: 'function' as const, function: { name: 'echo', parameters: { type: 'object' } } }]
+    const extraBody = { model: 'other', messages: [], max_tokens: 1, stream: true, tools: [], reasoning_effort: 'high' }
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', reasoningEffort: 'none', extraBody }).complete(msgs, { ...opts(), tools })
+    expect(fake.requests[0].body).toEqual({ model: 'm', messages: msgs, max_tokens: 64, stream: false, tools, reasoning_effort: 'none' })
+  })
+
+  it('passes reasoning_effort from extraBody when reasoningEffort is not set', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody: { reasoning_effort: 'low' } }).complete(msgs, opts())
+    expect(fake.requests[0].body.reasoning_effort).toBe('low')
+  })
+
+  it('does not change the extraBody object it was given', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    const extraBody = structuredClone(fields)
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', extraBody }).complete(msgs, opts())
+    expect(extraBody).toEqual(fields)
+  })
+
+  it('keeps the api key in the Authorization header and out of the request body', async () => {
+    fake = await startFakeModelServer([{ body: completion({ content: 'x' }) }])
+    await createModelClient({ baseUrl: fake.baseUrl, name: 'm', apiKey: DUMMY_KEY, extraBody: fields }).complete(msgs, opts())
+    expect(fake.requests[0].headers.authorization).toBe(`Bearer ${DUMMY_KEY}`)
+    expect(leakedFragments(JSON.stringify(fake.requests[0].body))).toEqual([])
+  })
+})
+
 // Node's fetch (undici) has headersTimeout/bodyTimeout of 300 s. With stream:false the headers only arrive after the
 // whole generation, so a thinking model that takes > 5 min per turn failed with "fetch failed" (spike 2026-09-27).
 describe('transport timeouts', () => {
