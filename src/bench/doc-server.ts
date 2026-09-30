@@ -1,13 +1,15 @@
 // `harness doc-server`: a stdio MCP server over a frozen docset (M5, model comparison). It offers the four doc tools of
 // scrum4me-mcp, pinned at 285c98ae, with the same names, descriptions and input schemas, so a model reads here the interface
 // text it reads in Scrum4Me. Result keys and error texts follow that server too.
-// Unlike production on purpose: no authentication, and no Postgres full-text search (see parseQuery and searchDocs).
+// Unlike production on purpose: no authentication, no Postgres full-text search (see parseQuery and searchDocs), and a
+// get_product_doc answer that stays within the harness's tool-output limit (see fitChunk).
 import { readFileSync } from 'node:fs'
 import { join, posix } from 'node:path'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
+import { TOOL_OUTPUT_LIMIT } from '../tools/registry.js'
 
 // The doc folders of scrum4me-mcp in its order; `list_product_docs` sorts on this order.
 const FOLDERS = ['adr', 'architecture', 'grills', 'patterns', 'plans', 'runbooks', 'specs', 'manual', 'api'] as const
@@ -305,9 +307,38 @@ function toolError(message: string): CallToolResult {
   return { content: [{ type: 'text', text: message }], isError: true }
 }
 
+/** The text of a result: what the model reads, and what the harness's tool-output limit is measured on. */
+const jsonText = (value: Record<string, unknown>) => JSON.stringify(value, null, 2)
+
 /** The result as JSON text, plus the same object as structuredContent, like scrum4me-mcp's toolJson. */
 function toolJson(value: Record<string, unknown>): CallToolResult {
-  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }], structuredContent: value }
+  return { content: [{ type: 'text', text: jsonText(value) }], structuredContent: value }
+}
+
+/**
+ * `answer(chunk)` for the longest start of `source` of at most `max` characters whose JSON text stays within TOOL_OUTPUT_LIMIT
+ * bytes. The registry cuts longer output in the middle of the JSON, which drops the keys at the end (byte_size, truncated,
+ * next_offset) and leaves text that does not parse. The limit is in bytes of the serialized text, where one character costs
+ * one to six (multi-byte characters, JSON escapes), so the length is searched by measuring the answer, never estimated.
+ * `answer` sets `truncated` and `next_offset` from the chunk it is given, which is how a shortened chunk is flagged.
+ */
+function fitChunk(source: string, max: number, answer: (chunk: string) => Record<string, unknown>): Record<string, unknown> {
+  const tooBig = (length: number) => Buffer.byteLength(jsonText(answer(source.slice(0, length)))) > TOOL_OUTPUT_LIMIT
+  let length = Math.min(max, source.length)
+  if (tooBig(length)) {
+    // `fits` is a length whose answer fits (an empty chunk always does: the rest of the answer is a few hundred bytes), `length`
+    // one that does not. A character adds at least a byte, so the answer grows with the chunk and the search finds the longest one.
+    // Only a cut inside a surrogate pair breaks that (a lone half is escaped to six bytes, the whole pair costs four). The result
+    // can then be one such character short of the longest, but it never ends inside a pair: if the half fits, the whole pair does.
+    let fits = 0
+    while (length - fits > 1) {
+      const middle = Math.floor((fits + length) / 2)
+      if (tooBig(middle)) length = middle
+      else fits = middle
+    }
+    length = fits
+  }
+  return answer(source.slice(0, length))
 }
 
 type Indexed = Doc & { key: string; titleWords: Word[]; slugWords: Word[]; contentWords: Word[]; links: Link[] }
@@ -387,24 +418,7 @@ export function createDocServer(docset: Docset, productId: string): McpServer {
 
       // Sizes and offsets count characters of the text, as content_md.length does in scrum4me-mcp.
       const byteSize = doc.content.length
-      let body: string
-      let truncated = false
-      let nextOffset: number | null = null
-      if (input.heading) {
-        const section = extractHeadingSection(doc.content, input.heading)
-        if (section === null) return toolError(`Heading '${input.heading}' not found in doc '${input.folder}/${input.slug}'`)
-        // A section is cut at max_chars and flagged, but has no next_offset: offset does not apply to a section.
-        body = section.slice(0, input.max_chars)
-        truncated = section.length > input.max_chars
-      } else {
-        const startAt = Math.min(input.offset, byteSize)
-        body = doc.content.slice(startAt, startAt + input.max_chars)
-        if (startAt + body.length < byteSize) {
-          truncated = true
-          nextOffset = startAt + body.length
-        }
-      }
-      return toolJson({
+      const answer = (body: string, truncated: boolean, nextOffset: number | null) => ({
         uri: uriOf(doc),
         folder: doc.folder,
         slug: doc.slug,
@@ -417,6 +431,20 @@ export function createDocServer(docset: Docset, productId: string): McpServer {
         next_offset: nextOffset,
         updated_at: updatedAt,
       })
+      // The chunk is cut at max_chars, or shorter where the answer would pass the harness's tool-output limit (see fitChunk).
+      if (input.heading) {
+        const section = extractHeadingSection(doc.content, input.heading)
+        if (section === null) return toolError(`Heading '${input.heading}' not found in doc '${input.folder}/${input.slug}'`)
+        // A section that is cut is flagged, but has no next_offset: offset does not apply to a section.
+        return toolJson(fitChunk(section, input.max_chars, (chunk) => answer(chunk, chunk.length < section.length, null)))
+      }
+      const startAt = Math.min(input.offset, byteSize)
+      return toolJson(
+        fitChunk(doc.content.slice(startAt), input.max_chars, (chunk) => {
+          const end = startAt + chunk.length
+          return end < byteSize ? answer(chunk, true, end) : answer(chunk, false, null)
+        }),
+      )
     },
   )
 

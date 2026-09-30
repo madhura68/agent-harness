@@ -6,8 +6,9 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createDocServer, DocsetError, loadDocset } from '../src/bench/doc-server.js'
 import { main } from '../src/cli.js'
+import { TOOL_OUTPUT_LIMIT } from '../src/tools/registry.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
-import { tmp } from './helpers.js'
+import { readTrace, tmp } from './helpers.js'
 
 // The test docset: three small files in two folders (specs/probe-design, specs/alpha-notes, runbooks/probe-runbook) that
 // link to each other. Its words are chosen so the counts below are easy to check by hand: `toolcalling` twice in the spec and
@@ -53,6 +54,31 @@ const smallDocset = (docs: Record<string, string>) =>
     Object.fromEntries(Object.entries(docs).map(([key, text]) => [`${key}.md`, text])),
   )
 
+const bytes = (text: string) => Buffer.byteLength(text)
+/**
+ * A doc of at least `size` characters, heading "Groot". Its lines carry quotes, a backslash, a newline and multi-byte characters,
+ * which all cost more bytes in a JSON answer than the one character they are in the file.
+ */
+function heavyDoc(size: number): string {
+  let text = '# Groot\n\n'
+  for (let i = 1; text.length < size; i++) text += `Regel ${i}: de "waarde" staat in \`pad\\naam\` — één ëxtra regel.\n`
+  return text
+}
+const bigDocset = (text: string) => smallDocset({ 'runbooks/groot': text })
+
+/**
+ * Every page but the last is the longest chunk that fits: the same answer with one more character (UTF-16 unit) is over the limit.
+ * `pages` come from pageThrough; `text` is the whole doc.
+ */
+function expectLongestChunks(text: string, pages: Array<{ offset: number; json: Json }>) {
+  for (const { offset, json } of pages.slice(0, -1)) {
+    const end = offset + json.content_md.length
+    const more = end + 1 < text.length
+    const longer = { ...json, content_md: text.slice(offset, end + 1), truncated: more, next_offset: more ? end + 1 : null }
+    expect(bytes(JSON.stringify(longer, null, 2)), `one more character at offset ${offset}`).toBeGreaterThan(TOOL_OUTPUT_LIMIT)
+  }
+}
+
 /** An MCP client on an in-memory link to the doc server; returns a `call(tool, args)` with product_id defaulted. */
 async function start(dir = DOCSET) {
   const server = createDocServer(loadDocset(dir), PRODUCT)
@@ -75,6 +101,46 @@ async function start(dir = DOCSET) {
 
 const search = async (args: Record<string, unknown>) => (await start()).call('search_product_docs', args)
 const slugsOf = (json: Json): string[] => json.results.map((r: { slug: string }) => r.slug)
+
+/** Runs main() with stdout and stderr captured. */
+async function runMain(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
+  const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+  try {
+    const code = await main(args)
+    // Read the calls before mockRestore, which resets them.
+    return { code, stdout: out.mock.calls.map((c) => String(c[0])).join(''), stderr: err.mock.calls.map((c) => String(c[0])).join('') }
+  } finally {
+    out.mockRestore()
+    err.mockRestore()
+  }
+}
+
+/**
+ * `harness run --skip-probe` with profile tools and the real `harness doc-server` over `docsetDir` as the server, started the way
+ * the comparison runner starts it, against a fake model that makes one get_product_doc call (call id c1) and then answers.
+ * --skip-probe is the controller ruling for this task: without a probe.json a tools run is refused, and these tests are about the wiring.
+ */
+async function runWithDocServer(docsetDir: string, toolArgs: Record<string, unknown>) {
+  fake = await startFakeModelServer([
+    { body: completion({ toolCalls: [{ id: 'c1', name: 'get_product_doc', arguments: JSON.stringify({ product_id: PRODUCT, ...toolArgs }) }] }) },
+    { body: completion({ content: 'klaar' }) },
+  ])
+  const dir = tmp('doc-server-run')
+  const manifest = join(dir, 'run.json')
+  writeFileSync(manifest, JSON.stringify({
+    id: 'doc-server-run', profile: 'tools', prompt: 'Lees het document.',
+    model: { baseUrl: fake.baseUrl, name: 'm' },
+    tools: {
+      server: { command: process.execPath, args: ['--import', 'tsx', CLI, 'doc-server', '--dir', docsetDir, '--product-id', PRODUCT] },
+      allow: ['get_product_doc'],
+    },
+    limits: { maxTurns: 3, maxOutputTokens: 256, maxWallSeconds: 60, maxToolErrors: 1 },
+  }))
+  const out = join(dir, 'runs')
+  const { code, stdout } = await runMain(['run', manifest, '--out', out, '--skip-probe'])
+  return { code, stdout, runDir: join(out, 'doc-server-run'), requests: fake.requests }
+}
 
 describe('tools/list', () => {
   it('is pinned to scrum4me-mcp 285c98ae', () => {
@@ -334,6 +400,138 @@ describe('get_product_doc: paging and headings', () => {
   })
 })
 
+// The registry cuts tool output above TOOL_OUTPUT_LIMIT bytes in the middle of the JSON, so get_product_doc serves a shorter chunk
+// when the answer for the requested offset and max_chars would pass it, and flags that exactly as it flags a cut at max_chars.
+describe('get_product_doc: the harness tool-output limit', () => {
+  const groot = { folder: 'runbooks', slug: 'groot' }
+
+  /** Reads a doc page by page with next_offset, starting at 0; `size` is the byte length of each answer as the registry sees it. */
+  async function pageThrough(text: string, args: Record<string, unknown> = {}) {
+    const { call } = await start(bigDocset(text))
+    const pages: Array<{ offset: number; json: Json; size: number }> = []
+    let offset = 0
+    for (let n = 0; n < 20; n++) {
+      const r = await call('get_product_doc', { ...groot, ...args, offset })
+      pages.push({ offset, json: r.json, size: bytes(r.text) })
+      if (!r.json.truncated) break
+      offset = r.json.next_offset
+    }
+    return pages
+  }
+
+  it('cuts an answer that would pass the limit: max_chars 40000 on a big doc gives JSON within it, with truncated and next_offset', async () => {
+    const text = heavyDoc(40_000)
+    // The premise: uncut, this answer is far over the limit.
+    expect(bytes(JSON.stringify({ content_md: text }, null, 2))).toBeGreaterThan(TOOL_OUTPUT_LIMIT)
+    const { call } = await start(bigDocset(text))
+
+    const r = await call('get_product_doc', { ...groot, max_chars: 40_000 })
+
+    expect(r.isError).toBe(false)
+    expect(bytes(r.text)).toBeLessThanOrEqual(TOOL_OUTPUT_LIMIT)
+    expect(r.json).toMatchObject({ slug: 'groot', byte_size: text.length, truncated: true, updated_at: FROZEN_AT })
+    expect(r.json.next_offset).toBe(r.json.content_md.length)
+    expect(text.startsWith(r.json.content_md)).toBe(true)
+    expect(r.json.content_md.length).toBeGreaterThan(10_000) // most of what fits, not a token gesture
+  })
+
+  it('paging from offset 0 with max_chars 40000 keeps every answer within the limit, and the pieces are the whole file', async () => {
+    const text = heavyDoc(40_000)
+    const pages = await pageThrough(text, { max_chars: 40_000 })
+
+    for (const { offset, json, size } of pages) {
+      expect(size, `answer at offset ${offset}`).toBeLessThanOrEqual(TOOL_OUTPUT_LIMIT)
+      expect(json.byte_size).toBe(text.length)
+    }
+    expect(pages.length).toBeGreaterThanOrEqual(3)
+    for (const { offset, json } of pages.slice(0, -1)) {
+      expect(json.truncated).toBe(true)
+      expect(json.next_offset).toBe(offset + json.content_md.length)
+    }
+    const last = pages[pages.length - 1].json
+    expect(last).toMatchObject({ truncated: false, next_offset: null })
+    expect(pages.map((p) => p.json.content_md).join('')).toBe(text)
+  })
+
+  it('serves the largest chunk that fits: one more character would pass the limit', async () => {
+    const text = heavyDoc(40_000)
+    const pages = await pageThrough(text, { max_chars: 40_000 })
+
+    for (const { offset, size } of pages) expect(size, `answer at offset ${offset}`).toBeLessThanOrEqual(TOOL_OUTPUT_LIMIT)
+    expect(pages.length).toBeGreaterThanOrEqual(3)
+    expectLongestChunks(text, pages)
+  })
+
+  // Every prefix moves the pages by one character, so the byte budget ends at every possible place in a multi-byte character.
+  it.each([
+    ['em dashes (3 bytes in UTF-8)', '—'],
+    ['ë (2 bytes)', 'ë'],
+    ['quotes (1 character, 2 bytes once escaped)', '"'],
+    ['emoji (4 bytes, 2 UTF-16 units)', '😀'],
+  ])('a doc of %s stays within the limit at the default max_chars, and the pieces are the whole file', async (_label, unit) => {
+    for (const prefix of ['', 'x', 'xx', 'xxx']) {
+      const text = `# Tekens\n\n${prefix}${unit.repeat(12_000)}\n`
+      // The premise: the first 12000 characters, the default chunk, are over the limit on their own.
+      expect(bytes(JSON.stringify({ content_md: text.slice(0, 12_000) }, null, 2))).toBeGreaterThan(TOOL_OUTPUT_LIMIT)
+
+      const pages = await pageThrough(text)
+
+      for (const { offset, json, size } of pages) {
+        expect(size, `answer at offset ${offset}, prefix '${prefix}'`).toBeLessThanOrEqual(TOOL_OUTPUT_LIMIT)
+        expect(Buffer.from(json.content_md).toString(), `no character cut in half at offset ${offset}`).toBe(json.content_md)
+      }
+      expect(pages.length).toBeGreaterThanOrEqual(2)
+      expect(pages[0].json.content_md.length).toBeLessThan(12_000) // cut short of max_chars, for the bytes
+      expectLongestChunks(text, pages)
+      expect(pages.map((p) => p.json.content_md).join('')).toBe(text)
+    }
+  })
+
+  it('cuts a long section to what fits too: truncated, and no next_offset, as when a section is cut at max_chars', async () => {
+    const text = heavyDoc(40_000)
+    const { call } = await start(bigDocset(text))
+
+    const r = await call('get_product_doc', { ...groot, heading: 'Groot', max_chars: 40_000 })
+
+    expect(bytes(r.text)).toBeLessThanOrEqual(TOOL_OUTPUT_LIMIT)
+    expect(r.json).toMatchObject({ truncated: true, next_offset: null, byte_size: text.length })
+    expect(text.startsWith(r.json.content_md)).toBe(true)
+    expect(r.json.content_md.length).toBeGreaterThan(10_000)
+    const longer = { ...r.json, content_md: text.slice(0, r.json.content_md.length + 1) }
+    expect(bytes(JSON.stringify(longer, null, 2))).toBeGreaterThan(TOOL_OUTPUT_LIMIT) // the largest that fits
+  })
+
+  it('leaves an answer that fits exactly as it was: the same text, byte for byte', async () => {
+    const { call } = await start()
+    const file = fileText('specs', 'probe-design')
+    const asBefore = (content: string, truncated: boolean, nextOffset: number | null) =>
+      JSON.stringify(
+        {
+          uri: uri('specs', 'probe-design'), folder: 'specs', slug: 'probe-design', title: 'Ontwerp van de probe', status: 'active',
+          folder_enabled: true, content_md: content, byte_size: file.length, truncated, next_offset: nextOffset, updated_at: FROZEN_AT,
+        },
+        null,
+        2,
+      )
+
+    expect((await call('get_product_doc', { folder: 'specs', slug: 'probe-design' })).text).toBe(asBefore(file, false, null))
+    expect((await call('get_product_doc', { folder: 'specs', slug: 'probe-design', offset: 100, max_chars: 500 })).text).toBe(
+      asBefore(file.slice(100, 600), true, 600),
+    )
+  })
+
+  it('still pages ordinary prose at the default max_chars of 12000', async () => {
+    const prose = `# Proza\n\n${'Dit is een gewone zin over de harness en de probe, met een komma en een punt.\n'.repeat(300)}`
+    const { call } = await start(bigDocset(prose))
+
+    const r = await call('get_product_doc', groot)
+
+    expect(bytes(r.text)).toBeLessThanOrEqual(TOOL_OUTPUT_LIMIT)
+    expect(r.json.content_md).toBe(prose.slice(0, 12_000))
+    expect(r.json).toMatchObject({ truncated: true, next_offset: 12_000 })
+  })
+})
+
 describe('search_product_docs', () => {
   it('counts hits in title, slug and content; the higher score first, and equal scores by slug', async () => {
     const { json } = await search({ query: 'toolcalling' })
@@ -487,19 +685,6 @@ describe('loadDocset', () => {
 })
 
 describe('harness doc-server', () => {
-  async function runMain(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-    const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
-    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
-    try {
-      const code = await main(args)
-      // Read the calls before mockRestore, which resets them.
-      return { code, stdout: out.mock.calls.map((c) => String(c[0])).join(''), stderr: err.mock.calls.map((c) => String(c[0])).join('') }
-    } finally {
-      out.mockRestore()
-      err.mockRestore()
-    }
-  }
-
   it('is in the usage text', async () => {
     const { code, stdout } = await runMain(['--help'])
     expect(code).toBe(0)
@@ -526,32 +711,11 @@ describe('harness doc-server', () => {
     expect(stdout).toBe('')
   })
 
-  // The controller ruling for this task: --skip-probe, because without a probe.json a tools run is refused and this test is
-  // about the wiring. The server is the real `harness doc-server`, started the way the comparison runner starts it.
   it('serves a harness run with profile tools: one get_product_doc call, and the tool output holds the file', async () => {
-    const args = { product_id: PRODUCT, folder: 'runbooks', slug: 'probe-runbook' }
-    fake = await startFakeModelServer([
-      { body: completion({ toolCalls: [{ id: 'c1', name: 'get_product_doc', arguments: JSON.stringify(args) }] }) },
-      { body: completion({ content: 'klaar' }) },
-    ])
-    const dir = tmp('doc-server-run')
-    const manifest = join(dir, 'run.json')
-    writeFileSync(manifest, JSON.stringify({
-      id: 'doc-server-run', profile: 'tools', prompt: 'Lees het runbook.',
-      model: { baseUrl: fake.baseUrl, name: 'm' },
-      tools: {
-        server: { command: process.execPath, args: ['--import', 'tsx', CLI, 'doc-server', '--dir', DOCSET, '--product-id', PRODUCT] },
-        allow: ['get_product_doc'],
-      },
-      limits: { maxTurns: 3, maxOutputTokens: 256, maxWallSeconds: 60, maxToolErrors: 1 },
-    }))
-    const out = join(dir, 'runs')
-
-    const { code, stdout } = await runMain(['run', manifest, '--out', out, '--skip-probe'])
+    const { code, stdout, runDir, requests } = await runWithDocServer(DOCSET, { folder: 'runbooks', slug: 'probe-runbook' })
 
     expect(stdout).toMatch(/^completed /)
     expect(code).toBe(0)
-    const runDir = join(out, 'doc-server-run')
     const result = JSON.parse(readFileSync(join(runDir, 'result.json'), 'utf8'))
     expect(result).toMatchObject({ status: 'completed', answer: 'klaar', usage: { toolCalls: 1, toolErrors: 0 } })
     const toolOutput = JSON.parse(readFileSync(join(runDir, 'tools', 'c1.txt'), 'utf8'))
@@ -559,9 +723,26 @@ describe('harness doc-server', () => {
     expect(toolOutput.content_md).toBe(fileText('runbooks', 'probe-runbook'))
     // The model was offered the tool as scrum4me-mcp defines it: the captured name, description and input schema.
     const want = CAPTURED.tools.find((t) => t.name === 'get_product_doc')!
-    expect(fake.requests[0].body.tools).toEqual([{ type: 'function', function: { name: want.name, description: want.description, parameters: want.inputSchema } }])
+    expect(requests[0].body.tools).toEqual([{ type: 'function', function: { name: want.name, description: want.description, parameters: want.inputSchema } }])
     // And it read the file through the tool message of the second request.
-    const toolMessage = fake.requests[1].body.messages.find((m: { role: string }) => m.role === 'tool')
+    const toolMessage = requests[1].body.messages.find((m: { role: string }) => m.role === 'tool')
     expect(JSON.parse(JSON.parse(toolMessage.content).content).content_md).toBe(fileText('runbooks', 'probe-runbook'))
+  }, 30_000)
+
+  // The registry cuts tool output above TOOL_OUTPUT_LIMIT in the middle of the JSON, which drops the keys at the end (byte_size,
+  // truncated, next_offset, updated_at) and leaves text that does not parse. With max_chars 40000 that is what a big doc gave.
+  it('with a big doc the model still gets a whole JSON answer: the harness has nothing to cut', async () => {
+    const text = heavyDoc(40_000)
+    const { code, runDir, requests } = await runWithDocServer(bigDocset(text), { folder: 'runbooks', slug: 'groot', max_chars: 40_000 })
+
+    expect(code).toBe(0)
+    const toolMessage = requests[1].body.messages.find((m: { role: string }) => m.role === 'tool')
+    const seen = JSON.parse(toolMessage.content) // what the harness put in front of the model: { ok, content, truncated }
+    expect(seen).toMatchObject({ ok: true, truncated: false })
+    const answer = JSON.parse(seen.content) // so it parses, and has its last keys
+    expect(answer).toMatchObject({ slug: 'groot', byte_size: text.length, truncated: true, updated_at: FROZEN_AT })
+    expect(answer.next_offset).toBe(answer.content_md.length)
+    expect(text.startsWith(answer.content_md)).toBe(true)
+    expect(readTrace(runDir).find((e) => e.type === 'tool_result')).toMatchObject({ callId: 'c1', ok: true, truncated: false })
   }, 30_000)
 })
