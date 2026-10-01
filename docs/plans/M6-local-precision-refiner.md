@@ -1,6 +1,6 @@
 # M6 — qwen3.8-27b lokaal op hogere precisie: implementatieplan
 
-_Status: draft, revisie 1 (2026-10-01). Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
+_Status: draft, revisie 2 (2026-10-01). Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -16,7 +16,10 @@ _Status: draft, revisie 1 (2026-10-01). Een technisch GO autoriseert geen ceremo
 
 - **Route, ongewijzigd uit M5** (spec §2 #4): `run.py --backend harness`, variant `docs`, systeemprompt v3 (`llm-bench/prompts/promptverfijner-systeem.txt`) met `promptverfijner-docs-addendum.txt`, de bevroren docset `llm-bench/refiner/docset/`, de cases D01–D05 uit `cases.jsonl`, en de checks en de zeef van `score.py`. Geen wijziging aan `run.py`, `score.py`, `cases.jsonl`, de prompts, de docset of de harness.
 - **Harness:** `node /home/janpeter/Development/agent-harness/dist/cli.js` op max2, op main `15c1e26`. `harness run`, `probe` en `doc-server` zijn daar gelijk aan de M5-build `aaae1a0`: sindsdien veranderde alleen het workerpad (`cmdWorker` in `src/cli.ts` en `src/worker/doc-tools.ts`, ISS-1). Staat de checkout op een andere commit of is hij niet schoon, dan eerst JP.
-- **Waar het draait:** anders dan M5 Taak 13 (vanaf de Mac via een tunnel) draait `run.py` op max2 zelf, in tmux. Een run van uren mag niet afhangen van een laptop en een tunnel: een verbroken verbinding zou als niet-afgerond gesprek tellen. De route zelf is gelijk: `run.py` → `harness run` → Ollama `/v1` op `127.0.0.1:11434`. De code komt uit een worktree `~/Development/max2-m6` op max2, op de gepushte branch `feat/m6-precisie`. De uitvoer gaat naar `~/m6-runs/refiner-precisie-<datum>/` op max2, buiten elke repo, en daarna met `rsync` naar de Mac.
+- **Waar het draait:** anders dan M5 Taak 13 (vanaf de Mac via een tunnel) draait `run.py` op max2 zelf, in tmux. Een run van uren mag niet afhangen van een laptop en een tunnel: een verbroken verbinding zou als niet-afgerond gesprek tellen. De route zelf is gelijk: `run.py` → `harness run` → Ollama `/v1` op `127.0.0.1:11434`.
+  - **Code:** uit een worktree `~/Development/max2-m6` op max2, op de gepushte branch `feat/m6-precisie`.
+  - **Uitvoer:** naar `~/m6-runs/refiner-precisie-<datum>/` op max2, buiten elke repo.
+  - **Kopie:** met `rsync` naar `~/Development/m6-runs/refiner-precisie-<datum>/` op de Mac, ook buiten de repo. Alleen de bestanden die M5 ook bewaarde, gaan de repo in (Taak 4).
 - **Modellen:** officiële Ollama-tags, geen hf.co-pull, geen afgeleide Modelfile, geen Q6 (spec §2 #2).
 
   | Model | `<label>` | `<tag>` | Grootte | `<kort>` |
@@ -30,20 +33,103 @@ _Status: draft, revisie 1 (2026-10-01). Een technisch GO autoriseert geen ceremo
   - Een regel met een percentage (afgerond, en elke check die meetelt: `SIEVE_CHECKS` met minstens vijf gesprekken) ligt _op de grens_ als zijn telling de kleinste is die slaagt (`meets()`: `n*100 >= totaal*procent`). Hij ligt _één eronder_ als één gesprek meer hem laat slagen.
   - Door, met een regel op de grens: onbeslist. Gezakt, alleen op regels één eronder: onbeslist. Gezakt, maar een `timed_out` bepaalt de uitkomst (tegenproef in Taak 4): onbeslist.
   - Een bevestigde vlag laat het model zakken; voor vlaggen is er geen grens.
-- **Geen OpenRouter:** geen OpenRouter-label in een aanroep, geen uitgave. `check_key.py --env OPENROUTER_API_KEY` over de run-mappen geeft nul treffers.
-- **max2:** downloads en serveracties alleen op JP's go, binnen het venster dat JP noemt. Elk venster loopt zo: dienststand vastleggen, worker stoppen met de M4-procedure, TEI, `open-webui` en `dsh` stoppen als ze draaien, meten, en precies herstellen, ook na een afbreking. Niet wijzigen: de Ollama-config, de productieconfig en het model van de worker.
+- **Alleen een geldige run-map telt** (Vensterprocedure, "Geldige run"). Uit een afgebroken of ongeldige map komt geen oordeel; hij gaat niet de repo in.
+- **Geen OpenRouter:** geen OpenRouter-label in een aanroep, geen uitgave. `check_key.py --env OPENROUTER_API_KEY` draait op de Mac, waar die variabele in `~/.zshenv` staat, en geeft nul treffers (spec §5 criterium 6). Is de variabele daar leeg (exit 2), dan stoppen en JP; nooit een andere waarde invullen.
+- **max2:** downloads en serveracties alleen op JP's go, binnen het venster dat JP noemt. Elk venster volgt de Vensterprocedure hieronder. Niet wijzigen: de Ollama-config, de productieconfig en het model van de worker.
 - **`<datum>`** is de datum (UTC, JJJJ-MM-DD) van de Q8-rooktest. Alle bestanden van M6 gebruiken die ene datum.
 - **Geheimen** nooit printen of loggen; een controle zet alleen namen en tellingen in de uitvoer. `FORGEJO_TOKEN` alleen via `GIT_ASKPASS` of `curl --config`.
-- Forgejo is de forge; nooit `gh`. Geen merge zonder JP. Nooit `git branch -D`, nooit een kale `git stash`.
-- **Gate vóór elke commit in max2:** `python3 -m unittest llm-bench/refiner/test_refiner.py` vanuit de repo-root, groen.
+- Forgejo is de forge; nooit `gh`. Geen merge zonder JP. Nooit `git branch -D`, nooit een kale `git stash`, geen `--force` bij `git worktree remove`.
+- **Gate vóór elke commit in max2:** `python3 -m unittest llm-bench/refiner/test_refiner.py` vanuit de repo-root, op de Mac, groen.
+
+## Vensterprocedure
+
+Geldt voor elk venster op max2: Taak 2, 3, 5 en 6. Bij de ceremonie gaat dit blok mee in elke taak die het gebruikt. De paden staan in shellvariabelen; zet ze in elke shell eerst: op max2 `R=/home/janpeter/m6-runs/refiner-precisie-<datum>`, op de Mac `M=~/Development/m6-runs/refiner-precisie-<datum>` en `D=~/Development/max2-m6/llm-bench/results/refiner-precisie-<datum>`.
+
+**Dienststand.** Op max2, naar `$R/dienststand-<venster>-voor.txt` en na het herstel naar `$R/dienststand-<venster>-na.txt`:
+- `systemctl is-active agent-harness-worker`;
+- van `docker ps --format '{{.Names}}'` alleen `tei-gpu`, `open-webui` en `dsh`;
+- `nvidia-smi --query-gpu=memory.used,memory.total --format=csv`;
+- `curl -s 127.0.0.1:11434/api/ps`.
+
+De dienstregels (de eerste twee) zijn na het herstel gelijk aan vooraf.
+
+**Stoppen.** Op de Mac. Dit is de M4-procedure (`docs/plans/M4-harness-run-logging.md:30-33`) als script dat bij de eerste fout stopt:
+
+```bash
+#!/bin/bash
+d=$(mktemp -d)
+q="select id, kind, status, retry_count from claude_jobs where required_capability = 'local_llm' order by id"
+opname() {   # $1 = voor | na; een opname telt alleen bij exitcode 0 van psql
+  ssh scrum4me-srv "docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc \"$q\"" > "$d/$1.tmp" &&
+    mv "$d/$1.tmp" "$d/$1.txt"
+}
+opname voor || { echo "opname voor mislukt: niet stoppen"; exit 1; }
+if grep -qE '\|(CLAIMED|RUNNING)\|' "$d/voor.txt"; then echo "local_llm-job geclaimd of bezig: niet stoppen"; exit 1; fi
+ssh max2 'sudo -n systemctl stop agent-harness-worker' || { echo "stop mislukt: JP"; exit 1; }
+toestand=$(ssh max2 'systemctl is-active agent-harness-worker')
+case "$toestand" in inactive|failed) ;; *) echo "worker is $toestand na de stop: JP"; exit 1 ;; esac
+opname na || { echo "opname na mislukt: worker blijft gestopt, JP"; exit 1; }
+diff "$d/voor.txt" "$d/na.txt"
+case $? in
+  0) echo "schone stop" ;;
+  1) echo "verschil: worker blijft gestopt, de ID's uit de diff naar JP (M4 stap 2)"; exit 1 ;;
+  *) echo "diff mislukt: worker blijft gestopt, JP"; exit 1 ;;
+esac
+```
+
+Na een schone stop stop je op max2 wat volgens de dienststand draait: TEI met `docker compose -f /srv/apps/tei/docker-compose.yml stop`, `open-webui` en `dsh` met `docker stop`. Bij elk ander einde van het script volgt de rest van de M4-procedure, en er wordt niet gemeten.
+
+**Herstellen.** Ook na een afbreking. Op max2, precies naar de dienststand vooraf:
+- `docker start` voor de containers die draaiden;
+- `docker compose -f /srv/apps/tei/docker-compose.yml start`, alleen als `tei-gpu` draaide;
+- `sudo -n systemctl start agent-harness-worker`, als de worker `active` was, en daarna `systemctl is-active agent-harness-worker` geeft `active`.
+
+Leg daarna de dienststand na vast.
+
+**Afbreken.** Dreigt een run over het einde van het venster te lopen?
+1. `tmux send-keys -t <sessie> C-c`.
+2. Wacht tot `tmux has-session -t <sessie>` faalt.
+3. Wacht tot `pgrep -af 'refiner/run.py|agent-harness/dist/cli.js (run|probe|doc-server)'` niets meer vindt.
+4. Herstel pas daarna.
+
+De afgebroken map geeft geen oordeel. JP kiest een nieuw venster, en de run begint dan in een nieuwe map met het volgnummer erachter (`-2`, `-3`).
+
+**Geldige run.** Een run-map is geldig als het log eindigt op `exit=0` en deze controle (op de Mac, na de kopie) `geldig` print. `<n>` is het aantal geplande gesprekken: 1 voor een rooktest, 15 voor een run.
+
+```bash
+python3 - <map>/raw.jsonl <n> <<'EOF'
+import json, sys
+path, n = sys.argv[1], int(sys.argv[2])
+rows = [json.loads(line) for line in open(path, encoding="utf-8").read().split("\n") if line.strip()]
+plans = [r for r in rows if r.get("turn") == "plan"]
+planned = {tuple(p) for p in plans[-1]["conversations"]} if plans else set()
+last_end = {}
+for r in rows:
+    if r.get("turn") == "end":
+        last_end[(r["case"], r["seed"])] = r["status"]
+problems = []
+if len(plans) != 1 or len(planned) != n:
+    problems.append(f"plan: {len(plans)} rij(en) met {len(planned)} gesprekken, verwacht 1 met {n}")
+if any(r.get("turn") == "stop" for r in rows):
+    problems.append("stop-rij")
+for case, seed in sorted(planned):
+    status = last_end.get((case, seed))
+    if status in (None, "invocation_error"):
+        problems.append(f"{case}/{seed}: {status or 'geen eindrij'}")
+print("geldig" if not problems else "ongeldig: " + "; ".join(problems))
+sys.exit(1 if problems else 0)
+EOF
+```
+
+Een ongeldige map geeft geen oordeel. Herstellen, aan JP melden, en opnieuw draaien in een nieuwe map, net als na een afbreking.
 
 ## Review Focus
 
-1. **Een run die over JP's venster loopt.** Verwacht: afbreken, precies herstellen, en geen oordeel uit die map. Een gepland gesprek zonder rijen zou als niet afgerond tellen, en dan zou het venster de uitkomst bepalen. → Taak 3, stap "Venster".
-2. **Een verbroken ssh-verbinding tijdens een run van uren.** Verwacht: de run loopt door, want hij draait in tmux op max2 zelf, zonder tunnel. → Taak 2 en 3: start in tmux, en na het opnieuw verbinden toont `tmux has-session` of de run leeft.
-3. **Een officiële tag met een andere renderer of parser dan gsq, of een probe die niet `reliable` is.** Verwacht: stop vóór de lange run, en JP beslist. Met docs draait `run.py` een model alleen na `reliable`. → Taak 2.
+1. **Een run die over JP's venster loopt, of een run die met `exit≠0`, een stop-rij of een `invocation_error` eindigt.** Verwacht: afbreken of stoppen, precies herstellen, en geen oordeel uit die map. Een gepland gesprek zonder rijen zou als niet afgerond tellen, en dan zou het venster of een crash de uitkomst bepalen. → Vensterprocedure, "Afbreken" en "Geldige run"; Taak 3.
+2. **Een verbroken ssh-verbinding tijdens een run van uren.** Verwacht: de run loopt door, want hij draait in tmux op max2 zelf, zonder tunnel. De metingen na afloop lopen in hetzelfde script mee, zodat ze niet van een wakkere operator afhangen. → Taak 2 en 3.
+3. **Een officiële tag met een andere renderer of parser dan gsq, of een probe die niet `reliable` is.** Verwacht: stop vóór de lange run, en JP beslist. Een ander `PARAMETER` gaat naar het rapport en naar JP, maar is geen stop. → Taak 2.
 4. **Handwerk in het oordeel.** Verwacht: elke telling komt uit de score-uitvoer, met teller en noemer in het rapport. Zo zijn de grens, de tegenproef en de optelling over seeds 1–6 na te rekenen. → Taak 4 en Taak 6.
-5. **Een ander model dat Ollama laadt tijdens de meting.** Verwacht: geen, want worker, `open-webui` en `dsh` staan stil. `/api/ps` direct na een run toont alleen het gemeten model. → Taak 2 en 3.
+5. **Een ander model dat Ollama laadt tijdens de meting.** Verwacht: geen, want worker, `open-webui` en `dsh` staan stil. Het script legt `/api/ps` direct na de run vast. → Taak 2 en 3.
 
 ## Bouwvolgorde
 
@@ -60,13 +146,15 @@ Spec §4. Spec en plan gaan vooraf als docs-PR (branch `docs/m6-local-precision-
 
 ## Bestandsstructuur
 
-| Repo | Bestand | Verantwoordelijkheid | Taak |
+| Waar | Bestand | Verantwoordelijkheid | Taak |
 |---|---|---|---|
-| max2 | `llm-bench/refiner/models.json` | twee labels | 1 |
-| max2 | `llm-bench/refiner/test_refiner.py` | `LOCAL_MODELS` en `ModelsFileTest` | 1 |
-| max2 | `llm-bench/README.md` | het aantal labels | 1 |
-| max2 | `llm-bench/results/refiner-precisie-<datum>/` (nieuw) | run-mappen, logs, score-uitvoer, metingen, dienststand, `vlaggen-besluiten.json` | 2–6 |
-| max2 | `llm-bench/results/refiner-precisie-<datum>.md` (nieuw) | het rapport | 4–7 |
+| max2-repo | `llm-bench/refiner/models.json` | twee labels | 1 |
+| max2-repo | `llm-bench/refiner/test_refiner.py` | `LOCAL_MODELS` en `ModelsFileTest` | 1 |
+| max2-repo | `llm-bench/README.md` | het aantal labels | 1 |
+| host max2, buiten de repo | `~/m6-runs/refiner-precisie-<datum>/` | volledige run-mappen, scripts, logs, metingen, dienststand | 2, 3, 5, 6 |
+| Mac, buiten de repo | `~/Development/m6-runs/refiner-precisie-<datum>/` | de kopie daarvan, plus `summary.csv` en de score-uitvoer | 2–6 |
+| max2-repo | `llm-bench/results/refiner-precisie-<datum>/` (nieuw) | per geldige run-map de bestanden die M5 bewaarde, met de logs, scripts, metingen, dienststand, score-uitvoer en `vlaggen-besluiten.json` | 4, 6 |
+| max2-repo | `llm-bench/results/refiner-precisie-<datum>.md` (nieuw) | het rapport | 4–7 |
 
 ## Increment 1 — de labels
 
@@ -107,63 +195,63 @@ Spec §4. Spec en plan gaan vooraf als docs-PR (branch `docs/m6-local-precision-
 
 ## Increment 2 — de metingen, per model
 
-Taak 2, 3 en 4 gelden per model uit de tabel in Global Constraints, eerst voor Q8. Voor Q4 alleen via Taak 5. `<label>`, `<tag>` en `<kort>` komen uit die tabel. `<W>` komt uit de rooktest van hetzelfde model. Alle commando's met `~/m6-runs` of `~/Development/max2-m6` draaien op max2 (`ssh max2`), tenzij er "op de Mac" staat.
+Taak 2, 3 en 4 gelden per model uit de tabel in Global Constraints, eerst voor Q8. Voor Q4 alleen via Taak 5. `<label>`, `<tag>` en `<kort>` komen uit die tabel. `<W>` komt uit de rooktest van hetzelfde model. `$R`, `$M` en `$D` zijn de paden uit de Vensterprocedure.
 
 ### Taak 2: downloaden en de rooktest (op JP's go; download en serveractie op max2)
 
 Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duur van de lange run, zodat JP het venster van Taak 3 kan kiezen.
 
-**Files:** op max2, in `~/m6-runs/refiner-precisie-<datum>/`:
-- `rooktest-<kort>/` (de run-map) en `rooktest-<kort>.log`;
-- `rooktest-<kort>-metingen.txt`;
-- `dienststand-rooktest-<kort>-voor.txt` en `dienststand-rooktest-<kort>-na.txt`.
+**Files:**
+- Op max2, in `$R`: `rooktest-<kort>.sh`, de run-map `rooktest-<kort>/` met zijn log, `rooktest-<kort>-metingen.txt`, en `dienststand-rooktest-<kort>-voor.txt` en `-na.txt`.
+- Op de Mac: de kopie in `$M`, plus `rooktest-<kort>/summary.csv` en `rooktest-<kort>.score.txt`.
 
 **Interfaces:**
-- Consumes: branch `feat/m6-precisie` (Taak 1).
+- Consumes: branch `feat/m6-precisie` (Taak 1); de Vensterprocedure.
 - Produces: `<W>` en de geschatte duur, in `rooktest-<kort>-metingen.txt`, voor Taak 3.
 
-- [ ] **Worktree op max2**, alleen de eerste keer: `git -C ~/Development/max2 fetch origin feat/m6-precisie && git -C ~/Development/max2 worktree add --detach ~/Development/max2-m6 FETCH_HEAD`. Leg `git -C ~/Development/max2-m6 rev-parse HEAD` vast; die commit is gelijk aan die van Taak 1. Draai daar de unittest: groen. Dat bewijst ook Python op max2.
-- [ ] **Harness:** `git -C ~/Development/agent-harness rev-parse --short HEAD` geeft `15c1e26` en `git -C ~/Development/agent-harness status --porcelain` is leeg. Anders stoppen en JP.
-- [ ] **Download.** Die kan terwijl de worker draait: `ollama pull <tag>`. Daarna toont `ollama list` de tag.
-- [ ] **Renderer en parser:** `ollama show --modelfile <tag> | grep -E '^(RENDERER|PARSER) '` geeft dezelfde twee regels als `ollama show --modelfile qwen3.8-gsq-rco:27b-iq3_s-text | grep -E '^(RENDERER|PARSER) '`. Anders stoppen en JP: dan is de route niet die van M5.
-- [ ] **Dienststand vooraf**, naar `dienststand-rooktest-<kort>-voor.txt`:
-  - `systemctl is-active agent-harness-worker`;
-  - van `docker ps --format '{{.Names}}'` alleen `tei-gpu`, `open-webui` en `dsh`;
-  - `nvidia-smi --query-gpu=memory.used,memory.total --format=csv`;
-  - `curl -s 127.0.0.1:11434/api/ps`.
-- [ ] **Stoppen**, met de M4-procedure (`docs/plans/M4-harness-run-logging.md:30-33`, Global Constraints), op de Mac:
+- [ ] **Voorbereiden op max2:**
+  - De eerste keer: `git -C ~/Development/max2 fetch origin feat/m6-precisie && git -C ~/Development/max2 worktree add --detach ~/Development/max2-m6 FETCH_HEAD`. `git -C ~/Development/max2-m6 rev-parse HEAD` is de commit van Taak 1; leg hem vast.
+  - `mkdir -p "$R"`.
+  - Harness: `git -C ~/Development/agent-harness rev-parse --short HEAD` geeft `15c1e26`, en `git -C ~/Development/agent-harness status --porcelain` is leeg. Anders stoppen en JP.
+- [ ] **Download.** Die kan terwijl de worker draait: `ollama pull <tag>`. Leg `ollama --version` en de regel van `<tag>` uit `ollama list` (met de ID) vast in `$R/rooktest-<kort>-metingen.txt`.
+- [ ] **Modelfile:**
+  - `ollama show --modelfile <tag> | grep -E '^(RENDERER|PARSER|PARAMETER) '` en hetzelfde voor `qwen3.8-gsq-rco:27b-iq3_s-text`, beide naar de metingen.
+  - Wijken `RENDERER` of `PARSER` af, dan stoppen en JP: dan is de route niet die van M5.
+  - Een ander of ontbrekend `PARAMETER` (gsq zet onder meer `top_k`, `top_p`, `min_p` en `repeat_penalty`; `run.py` zet alleen `temperature` en `seed`) is geen stop. Het gaat wel naar JP en in het rapport, als deel van "geen zuivere proef" (spec §1).
+- [ ] **Venster openen:** de dienststand vooraf (`rooktest-<kort>`), daarna Stoppen, volgens de Vensterprocedure.
+- [ ] **Het rooktestgesprek** (D03, seed 1) in een script, zodat de metingen na afloop niet van een wakkere operator afhangen. Ollama houdt het model vijf minuten geladen, dus het script meet direct na het gesprek. Op max2:
   ```bash
-  d=$(mktemp -d)
-  q="select id, kind, status, retry_count from claude_jobs where required_capability = 'local_llm' order by id"
-  ssh scrum4me-srv "docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc \"$q\"" > "$d/voor.tmp" && mv "$d/voor.tmp" "$d/voor.txt"
-  grep -cE '\|(CLAIMED|RUNNING)\|' "$d/voor.txt"      # 0; anders niet stoppen
-  ssh max2 'sudo -n systemctl stop agent-harness-worker && systemctl is-active agent-harness-worker'   # inactive of failed
-  ssh scrum4me-srv "docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -Atc \"$q\"" > "$d/na.tmp" && mv "$d/na.tmp" "$d/na.txt"
-  diff "$d/voor.txt" "$d/na.txt"                        # exit 0 = schoon
-  ```
-  Een opname telt alleen als `psql` met exitcode 0 eindigt; een mislukte opname is nooit schoon. Is de diff niet leeg, dan blijft de worker gestopt en volgt de rest van de M4-procedure (de ID's naar JP). Stop daarna wat draait: TEI met `docker compose -f /srv/apps/tei/docker-compose.yml stop`, `open-webui` en `dsh` met `docker stop`.
-- [ ] **Geheugen vooraf**, naar `rooktest-<kort>-metingen.txt`: `grep -E '^(pswpin|pswpout) ' /proc/vmstat` en `grep MemAvailable /proc/meminfo`.
-- [ ] **Het rooktestgesprek** (D03, seed 1), in tmux:
-  ```bash
-  mkdir -p ~/m6-runs/refiner-precisie-<datum>
-  cd ~/Development/max2-m6/llm-bench
-  tmux new-session -d -s m6-rooktest-<kort> "./refiner/run.py --backend harness \
-    --harness 'node /home/janpeter/Development/agent-harness/dist/cli.js' --variant docs \
+  cat > "$R/rooktest-<kort>.sh" <<'EOF'
+  #!/bin/sh
+  r=/home/janpeter/m6-runs/refiner-precisie-<datum>; map=rooktest-<kort>; m=$r/rooktest-<kort>-metingen.txt
+  cd /home/janpeter/Development/max2-m6/llm-bench || exit 1
+  { echo "## voor het gesprek"; grep -E '^(pswpin|pswpout) ' /proc/vmstat; grep MemAvailable /proc/meminfo; } >> "$m"
+  PYTHONDONTWRITEBYTECODE=1 ./refiner/run.py --backend harness \
+    --harness "node /home/janpeter/Development/agent-harness/dist/cli.js" --variant docs \
     --models <label> --cases D03 --seeds 1 --max-output-tokens 16384 --max-wall-seconds 3600 \
-    --out /home/janpeter/m6-runs/refiner-precisie-<datum>/rooktest-<kort> \
-    > /home/janpeter/m6-runs/refiner-precisie-<datum>/rooktest-<kort>.log 2>&1; \
-    echo exit=\$? >> /home/janpeter/m6-runs/refiner-precisie-<datum>/rooktest-<kort>.log"
+    --out "$r/$map" > "$r/$map.log" 2>&1
+  echo "exit=$?" >> "$r/$map.log"
+  { echo "## na het gesprek"; ollama ps; curl -s 127.0.0.1:11434/api/ps; echo
+    grep -E '^(pswpin|pswpout) ' /proc/vmstat; grep MemAvailable /proc/meminfo; } >> "$m"
+  EOF
+  tmux new-session -d -s m6-rooktest-<kort> "sh $R/rooktest-<kort>.sh"
   ```
-  `run.py` doet eerst de probe. Met docs draait het model alleen na `reliable`. De grens van 3600 s per beurt is ruim voor een eerste gesprek van onbekende snelheid.
-- [ ] **Direct na afloop**, terwijl het model nog vijf minuten geladen is (standaard `keep_alive`), naar `rooktest-<kort>-metingen.txt`:
-  - `ollama ps` en `curl -s 127.0.0.1:11434/api/ps`: grootte, `size_vram` en de verdeling over CPU en GPU. Alleen `<tag>` is geladen.
-  - De swaptellers en `MemAvailable` opnieuw.
-- [ ] **Controle:** de proberij in `raw.jsonl` heeft het oordeel `reliable`, en het log eindigt op `exit=0`. Het gesprek mag `final` of `error` zijn, want dit is een snelheidsmeting. Een `invocation_error` of een ontbrekende eindrij is een fout in de route: stoppen en JP.
-- [ ] **Snelheid, grens en duur**, ook naar `rooktest-<kort>-metingen.txt`:
+  - `run.py` doet eerst de probe. Met docs draait het model alleen na `reliable`.
+  - De grens van 3600 s per beurt is ruim voor een eerste gesprek van onbekende snelheid.
+  - Na een afbreking draait het script opnieuw met `map=rooktest-<kort>-2`.
+- [ ] **Venster sluiten:** Herstellen en de dienststand na, volgens de Vensterprocedure.
+- [ ] **Kopie en controle op de Mac:**
+  - `rsync -a max2:m6-runs/refiner-precisie-<datum>/ "$M/"`.
+  - "Geldige run" met `<n>` 1.
+  - In `~/Development/max2-m6/llm-bench`: `./refiner/score.py "$M/rooktest-<kort>" > "$M/rooktest-<kort>.score.txt"`, ter informatie.
+  - De proberij heeft het oordeel `reliable`.
+  - Het gesprek eindigt `final`, `no_final` of `error`; voor een snelheidsmeting zijn alle drie goed.
+  - In de metingen staat na het gesprek alleen `<tag>` in `/api/ps`.
+- [ ] **Snelheid, grens en duur**, ook naar `$M/rooktest-<kort>-metingen.txt`:
   ```bash
-  python3 - ~/m6-runs/refiner-precisie-<datum>/rooktest-<kort>/raw.jsonl <<'EOF'
+  python3 - "$M/rooktest-<kort>/raw.jsonl" <<'EOF'
   import json, math, sys
-  rows = [json.loads(line) for line in open(sys.argv[1])]
+  rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8").read().split("\n") if line.strip()]
   turns = [r for r in rows if isinstance(r.get("turn"), int)]
   out = sum(r.get("output_tokens") or 0 for r in turns)
   wall = sum(r.get("wall_s") or 0 for r in turns)
@@ -173,62 +261,80 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
   conversation = sum(r.get("conversation_wall_s") or 0 for r in rows if r.get("turn") == "end")
   print(f"uitvoertokens={out} wall_s={wall:.1f} snelheid={speed:.2f} tok/s")
   print(f"W={math.ceil(16384 / speed * 1.5 / 60) * 60}")
-  print(f"duur_s={max(54000 / speed, 15 * conversation):.0f}")
+  print(f"duur_s={max(60556 / speed, 15 * conversation):.0f}")
   EOF
   ```
-  De geschatte duur is het grootste van twee getallen. Het eerste is 54.000 uitvoertokens (gsq in M5, alle pogingen) gedeeld door de snelheid. Het tweede is 15 keer de duur van het rooktestgesprek. Tweede pogingen komen daar nog bij.
-- [ ] **Herstel**, ook na een afbreking, precies naar `dienststand-rooktest-<kort>-voor.txt`:
-  - `docker start` voor de containers die draaiden;
-  - `docker compose -f /srv/apps/tei/docker-compose.yml start`, alleen als TEI draaide;
-  - `sudo -n systemctl start agent-harness-worker`, als de worker `active` was, en daarna de controle dat hij `active` is.
+  De geschatte duur is het grootste van twee getallen:
+  - 60.556 uitvoertokens (gsq in M5, alle pogingen: 53.973 in de eerste en 6.583 in de tweede) gedeeld door de snelheid;
+  - 15 keer de duur van het rooktestgesprek.
+- [ ] **Melden aan JP:**
+  - de Modelfile-vergelijking en het probe-oordeel;
+  - de status van het gesprek;
+  - grootte en verdeling uit `ollama ps`;
+  - `MemAvailable` en de swaptellers;
+  - de snelheid, `<W>` en de geschatte duur.
 
-  Leg de dienststand daarna vast in `dienststand-rooktest-<kort>-na.txt`. De dienstregels zijn gelijk aan vooraf.
-- [ ] **Melden aan JP:** renderer en parser, het probe-oordeel, de status van het gesprek, grootte en verdeling, `MemAvailable` en de swaptellers, de snelheid, `<W>` en de geschatte duur. JP kiest het venster voor Taak 3. Laadt het model niet, is de probe niet `reliable`, of is de snelheid niet te berekenen? Dan stoppen, herstellen, en JP beslist (spec §6).
+  JP kiest het venster voor Taak 3. Laadt het model niet, is de probe niet `reliable`, is de map ongeldig, of is de snelheid niet te berekenen? Dan beslist JP (spec §6).
 
 ### Taak 3: de run (op JP's go, in het venster dat JP koos)
 
 **Files:**
-- Op max2, in `~/m6-runs/refiner-precisie-<datum>/`: `<kort>-docs/`, `<kort>-docs.log`, `dienststand-<kort>-voor.txt` en `dienststand-<kort>-na.txt`.
-- Op de Mac, de kopie in `llm-bench/results/refiner-precisie-<datum>/`, plus `<kort>-docs.score.txt`.
+- Op max2, in `$R`: `<run-map>.sh`, de run-map `<run-map>/` met zijn log en `<run-map>-api-ps-na.json`, en `dienststand-<run-map>-voor.txt` en `-na.txt`.
+- Op de Mac, in `$M`: de kopie, plus `<run-map>/summary.csv` en `<run-map>.score.txt`.
+
+`<run-map>` is `<kort>-docs`, of na een afbreking of een ongeldige run `<kort>-docs-2`, `-3`, enzovoort.
 
 **Interfaces:**
-- Consumes: `<W>` uit Taak 2; de worktree `~/Development/max2-m6` op max2.
-- Produces: de run-map `<kort>-docs/` met `summary.csv`, en `<kort>-docs.score.txt`, voor Taak 4.
+- Consumes: `<W>` uit Taak 2; de worktree `~/Development/max2-m6` op max2; de Vensterprocedure.
+- Produces: een geldige `<run-map>` met `summary.csv`, en `<run-map>.score.txt`, voor Taak 4.
 
-- [ ] Harness-controle zoals in Taak 2: `15c1e26`, schone status.
-- [ ] Dienststand vooraf en stoppen, precies zoals in Taak 2: de M4-procedure, dan TEI, `open-webui` en `dsh`. De dienststand gaat naar `dienststand-<kort>-voor.txt`.
-- [ ] **De run**, in tmux:
+- [ ] **Controle:**
+  - De harness staat op `15c1e26` en is schoon.
+  - `ollama --version` en de ID van `<tag>` in `ollama list` zijn gelijk aan de metingen van de rooktest.
+  - Anders stoppen en JP.
+- [ ] **Venster openen:** de dienststand vooraf, daarna Stoppen, volgens de Vensterprocedure.
+- [ ] **De run**, in een script, op max2:
   ```bash
-  cd ~/Development/max2-m6/llm-bench
-  tmux new-session -d -s m6-<kort> "./refiner/run.py --backend harness \
-    --harness 'node /home/janpeter/Development/agent-harness/dist/cli.js' --variant docs \
+  cat > "$R/<run-map>.sh" <<'EOF'
+  #!/bin/sh
+  r=/home/janpeter/m6-runs/refiner-precisie-<datum>; map=<run-map>
+  cd /home/janpeter/Development/max2-m6/llm-bench || exit 1
+  PYTHONDONTWRITEBYTECODE=1 ./refiner/run.py --backend harness \
+    --harness "node /home/janpeter/Development/agent-harness/dist/cli.js" --variant docs \
     --models <label> --seeds 1 2 3 --max-output-tokens 16384 --max-wall-seconds <W> \
-    --out /home/janpeter/m6-runs/refiner-precisie-<datum>/<kort>-docs \
-    > /home/janpeter/m6-runs/refiner-precisie-<datum>/<kort>-docs.log 2>&1; \
-    echo exit=\$? >> /home/janpeter/m6-runs/refiner-precisie-<datum>/<kort>-docs.log"
+    --out "$r/$map" > "$r/$map.log" 2>&1
+  echo "exit=$?" >> "$r/$map.log"
+  curl -s 127.0.0.1:11434/api/ps > "$r/$map-api-ps-na.json"
+  EOF
+  tmux new-session -d -s m6-<run-map> "sh $R/<run-map>.sh"
   ```
-  Volg de voortgang met `tail` op het log. Na het opnieuw verbinden toont `tmux has-session -t m6-<kort>` of de run nog loopt.
-- [ ] **Venster.** Dreigt de run over het einde van het venster te lopen? Breek af met `tmux send-keys -t m6-<kort> C-c` en herstel. Een afgebroken map geeft geen oordeel. JP kiest een nieuw venster, en de run begint dan opnieuw in een nieuwe map (`<kort>-docs-2`).
-- [ ] Direct na afloop toont `curl -s 127.0.0.1:11434/api/ps` alleen `<tag>`. Het log eindigt op `exit=0`.
-- [ ] Herstel zoals in Taak 2. De dienststand na gaat naar `dienststand-<kort>-na.txt` en is gelijk aan vooraf.
-- [ ] **Kopie naar de Mac:** `rsync -a max2:m6-runs/refiner-precisie-<datum>/ ~/Development/max2-m6/llm-bench/results/refiner-precisie-<datum>/`.
-- [ ] **Op de Mac**, in `~/Development/max2-m6/llm-bench`:
-  - `./refiner/score.py results/refiner-precisie-<datum>/<kort>-docs > results/refiner-precisie-<datum>/<kort>-docs.score.txt`;
-  - `./refiner/check_key.py --env OPENROUTER_API_KEY results/refiner-precisie-<datum>` geeft `with_key=0`.
+  Volg de voortgang met `tail` op het log. Na het opnieuw verbinden toont `tmux has-session -t m6-<run-map>` of de run nog loopt. Dreigt de run over het einde van het venster te lopen, volg dan "Afbreken" uit de Vensterprocedure.
+- [ ] **Venster sluiten:** Herstellen en de dienststand na, volgens de Vensterprocedure.
+- [ ] **Kopie en controle op de Mac:**
+  - `rsync -a max2:m6-runs/refiner-precisie-<datum>/ "$M/"`.
+  - "Geldige run" met `<n>` 15.
+  - `$M/<run-map>-api-ps-na.json` toont alleen `<tag>`.
+  - Is de map ongeldig, dan geen oordeel: melden aan JP en een nieuw venster voor `<kort>-docs-2`.
+- [ ] **Scoren op de Mac:**
+  - In `~/Development/max2-m6/llm-bench`: `./refiner/score.py "$M/<run-map>" > "$M/<run-map>.score.txt"`. Dat schrijft ook `$M/<run-map>/summary.csv`.
+  - `./refiner/check_key.py --env OPENROUTER_API_KEY "$M"` geeft `with_key=0` en exit 0. Exit 2, of een lege variabele: stoppen en JP.
 
 ### Taak 4: het oordeel en het rapport
 
 **Files:**
 - Create of modify: `llm-bench/results/refiner-precisie-<datum>.md`
+- Create of modify: `llm-bench/results/refiner-precisie-<datum>/`, de bestanden die M5 bewaarde
 - Create of modify, alleen bij vlaggen: `llm-bench/results/refiner-precisie-<datum>/vlaggen-besluiten.json`
 
 **Interfaces:**
-- Consumes:
-  - `<kort>-docs.score.txt`, `<kort>-docs/summary.csv` en `<kort>-docs/raw.jsonl` (Taak 3);
-  - `rooktest-<kort>-metingen.txt` (Taak 2).
+- Consumes: `$M/<run-map>/` met `summary.csv` en `raw.jsonl`, `$M/<run-map>.score.txt` (Taak 3), en `$M/rooktest-<kort>-metingen.txt` (Taak 2).
 - Produces: het oordeel door, gezakt of onbeslist. Dat bepaalt de volgende taak.
 
-- [ ] **Vlaggen.** D5 geldt alleen voor D02, dus er zijn per model hooguit drie nieuwe vlaggen. JP beoordeelt elke D5-vlag op een reviewpagina zoals in M5 (spec §2 #5). Dat is een privé artifact met de `db`-capability, dat alleen de eigenaar beschrijft. Per vlag staan er het transcript met de treffer gemarkeerd, het patroon, en knoppen voor bevestigen, verwerpen en twijfel. Lees de besluiten uit met `ArtifactData list`. Leg ze vast in `vlaggen-besluiten.json`, in de vorm van M5: `{"bron": …, "besluiten": [{"blind_id", "besluit", "check", "model", "variant", "case", "seed", "notitie", "bijgewerkt"}]}`. Zonder vlaggen is er geen pagina en geen bestand.
+- [ ] **Vlaggen.** D5 geldt alleen voor D02, dus er zijn per model hooguit drie nieuwe vlaggen. JP beoordeelt elke D5-vlag op een reviewpagina, zoals in M5 (spec §2 #5):
+  - Een privé artifact met de `db`-capability, dat alleen de eigenaar beschrijft.
+  - Per vlag het transcript met de treffer gemarkeerd, het patroon, en knoppen voor bevestigen, verwerpen en twijfel.
+  - Lees de besluiten uit met `ArtifactData list`, en leg ze vast in `vlaggen-besluiten.json` in de vorm van M5: `{"bron": …, "besluiten": [{"blind_id", "besluit", "check", "model", "variant", "case", "seed", "notitie", "bijgewerkt"}]}`.
+  - Zonder vlaggen is er geen pagina en geen bestand.
 - [ ] **Zeef met de besluiten.** Neem de zeef van `score.py` en laat verworpen vlaggen weg. Een bevestigde vlag laat het model zakken.
 - [ ] **Grens per regel.** Schrijf voor afgerond en voor elke check die meetelt de teller en de noemer op, met de kleinste telling die slaagt (afgerond 90%, checks 80%, `meets()`). Markeer _op de grens_ en _één eronder_. Bij 15 gesprekken:
   - afgerond: 14 en 13;
@@ -236,15 +342,23 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
   - D2, over 12 gesprekken: 10 en 9.
 - [ ] **Timeout-tegenproef.** Alleen nodig als een gesprek na beide pogingen eindigde met een beurtrij met harness-status `timed_out` in `raw.jsonl`. Tel zulke gesprekken als afgerond, en als geslaagd op elke check die voor hun case geldt (`n.v.t.` en een bevestigde vlag blijven zoals ze zijn). Slaat de zeef dan om, dan is het oordeel onbeslist.
 - [ ] **Oordeel:** door, gezakt of onbeslist, volgens Global Constraints.
+- [ ] **De repo in.** Kopieer uit `$M` naar `$D` alleen wat M5 ook bewaarde.
+  - Per geldige run-map en per rooktestmap:
+    ```bash
+    mkdir -p "$D/<map>" && cp "$M/<map>"/{raw.jsonl,summary.csv,blind-key.json} "$D/<map>/" && cp -R "$M/<map>/transcripts" "$D/<map>/"
+    for p in "$M/<map>"/harness/probe-*; do mkdir -p "$D/<map>/harness/${p##*/}" && cp "$p/probe.json" "$D/<map>/harness/${p##*/}/"; done
+    ```
+  - Daarnaast de bestanden direct in `$M`: `*.sh`, `*.log`, `*.txt` (metingen, dienststand, score-uitvoer) en `*-api-ps-na.json`.
+  - Afgebroken en ongeldige mappen gaan niet mee. Het rapport noemt ze met de reden.
 - [ ] **Rapport** `llm-bench/results/refiner-precisie-<datum>.md`. Voor Q4 komen de rij en het oordeel erbij. Het rapport bevat:
   - de docs-tabel van `score.py`, naast de M5-rijen van `gsq-lokaal` en `qwen3.8-openrouter` (uit `refiner-vergelijking-2026-10-01.md`, tabel "Met docs");
   - de zeef met de besluiten over de vlaggen, de regels op of één onder de grens met teller en noemer, en het oordeel;
   - per niet-afgerond gesprek de status, met elke `timed_out` apart, en zo nodig de tegenproef;
-  - snelheid, grootte, verdeling en swaptellers uit de rooktest, ter informatie;
+  - snelheid, grootte, verdeling, swaptellers en de Modelfile-vergelijking (met elk afwijkend `PARAMETER`) uit de rooktest, ter informatie;
   - de conclusie volgens de tabel in spec §1, met de kandidaten als schatting voor een proef op een Mac;
-  - per venster de dienststand vooraf en achteraf;
-  - de commits: de max2-worktree (Taak 2) en de harness (`15c1e26`).
-- [ ] Commit de run-mappen, metingen, dienststand, score-uitvoer en het rapport in `feat/m6-precisie`, met de unittest groen.
+  - per venster de dienststand vooraf en achteraf, en elke afgebroken of ongeldige map met de reden;
+  - de commits: de max2-worktree (Taak 2) en de harness (`15c1e26`), plus `ollama --version`.
+- [ ] Commit in `feat/m6-precisie`, met de unittest groen.
 - [ ] **Volgende stap:**
 
   | Oordeel | Q8 | Q4 |
@@ -257,7 +371,7 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
 
 ### Taak 5: Q4 (alleen als Q8 door is; op JP's go, in eigen vensters)
 
-- [ ] Taak 2, 3 en 4 met de Q4-rij uit de tabel in Global Constraints: label `qwen3.8-q4-lokaal`, tag `qwen3.8:27b-q4_K_M` (18 GB), kort `q4`. De download valt pas hier. Q4 krijgt een eigen rooktest en een eigen `<W>`.
+- [ ] Taak 2, 3 en 4 met de Q4-rij uit de tabel in Global Constraints: label `qwen3.8-q4-lokaal`, tag `qwen3.8:27b-q4_K_M` (18 GB), kort `q4`. De download valt pas hier. Q4 krijgt een eigen rooktest, een eigen `<W>` en een eigen run-map `q4-docs`.
 - [ ] Het rapport krijgt de conclusie voor de aankoop, volgens spec §1:
   - Q4 door: kandidaat Q4_K_M, een Mac van ongeveer 32–36 GB, krap bij 32 GB;
   - Q4 gezakt, of onbeslist en daarna gestopt: kandidaat Q8_0, ongeveer 48 GB.
@@ -266,8 +380,10 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
 
 ### Taak 6: seeds 4–6 (alleen bij een onbeslist oordeel en op JP's keuze)
 
-- [ ] **Venster en run**, zoals Taak 3, met `--seeds 4 5 6`, de map `<kort>-docs-s456`, de tmux-sessie `m6-<kort>-s456` en dezelfde `<W>`. Spec §4 zegt "dezelfde stappen 2–5". Een nieuwe rooktest (stap 3) levert hier niets op: model, host en instellingen zijn gelijk, dus `<W>` en de verdeling zijn bekend, en de probe draait in `run.py` vanzelf mee.
-- [ ] Score de nieuwe map apart, naar `<kort>-docs-s456.score.txt`. Nieuwe D5-vlaggen beoordeelt JP zoals in Taak 4.
+- [ ] **Venster en run**, zoals Taak 3, met `--seeds 4 5 6`, de run-map `<kort>-docs-s456` en dezelfde `<W>`.
+  - Spec §4 zegt "dezelfde stappen 2–5". Een nieuwe rooktest (stap 3) levert hier niets op: model, host en instellingen zijn gelijk, dus `<W>` en de verdeling zijn bekend. De probe draait in `run.py` vanzelf mee.
+  - De controle uit Taak 3 (harness, `ollama --version`, de ID van `<tag>`) laat zien dat de route gelijk bleef.
+- [ ] Score de nieuwe map apart, naar `$M/<kort>-docs-s456.score.txt`. Nieuwe D5-vlaggen beoordeelt JP zoals in Taak 4.
 - [ ] **Optellen** (spec §4). Tel per regel de tellers en noemers van beide score-uitvoeren op: afgerond over de 30 geplande gesprekken, en elke check over de gesprekken waarvoor hij geldt. Daarop gelden dezelfde drempels, de ondergrens van vijf gesprekken, en de grens. Bij 30 gesprekken:
 
   | Regel | Op de grens | Eén eronder |
@@ -281,14 +397,17 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
 - [ ] **Oordeel over seeds 1–6:**
   - door: verder zoals bij door (Q8: Taak 5; Q4: kandidaat Q4_K_M);
   - gezakt, of nog onbeslist: verder als gezakt.
-- [ ] Het rapport krijgt beide score-uitvoeren, de opgetelde tellingen en het oordeel. Commit.
+- [ ] Het rapport krijgt beide score-uitvoeren, de opgetelde tellingen en het oordeel. De nieuwe map gaat de repo in zoals in Taak 4. Commit.
 
 ### Taak 7: afronden en de PR
 
 - [ ] Loop de zes acceptatiecriteria uit spec §5 na, en zet per criterium het bewijs in het rapport.
-- [ ] De unittest is groen, en `./refiner/check_key.py --env OPENROUTER_API_KEY results/refiner-precisie-<datum>` geeft `with_key=0`.
+- [ ] De unittest is groen, en in `~/Development/max2-m6/llm-bench` geeft `./refiner/check_key.py --env OPENROUTER_API_KEY "$M" "$D"` `with_key=0` en exit 0.
 - [ ] Push `feat/m6-precisie` en open de PR op Forgejo via de API: `curl --config` met de header uit `$FORGEJO_TOKEN`, dus de token niet in argv. JP merget.
-- [ ] Op max2: `git -C ~/Development/max2 worktree remove ~/Development/max2-m6`. Dat kan zonder `--force`, want de uitvoer staat in `~/m6-runs`. `~/m6-runs` en de gedownloade modellen blijven staan; ze verwijderen is aan JP.
+- [ ] Op max2: `git -C ~/Development/max2 worktree remove ~/Development/max2-m6`, zonder `--force`.
+  - De worktree hoort schoon te zijn: de uitvoer staat in `~/m6-runs`, en `PYTHONDONTWRITEBYTECODE=1` voorkomt `__pycache__`.
+  - Weigert git, dan JP.
+- [ ] `~/m6-runs` op max2, `~/Development/m6-runs` op de Mac en de gedownloade modellen blijven staan. Ze verwijderen is aan JP.
 
 ## Buiten dit plan
 
@@ -296,4 +415,16 @@ Snelheid of geheugen op een Mac, een ander model voor de productieworker, de var
 
 ## Review record
 
-Nog niet gereviewd.
+### Ronde 1 (2026-10-01, rev 1 `5bb59c6` → rev 2)
+
+- **Reviewers:** mac:codex (0 BLOCKER, 3 MAJOR, 0 MINOR; NO-GO) en mac:claude (0 BLOCKER, 0 MAJOR, 7 MINOR; GO). mac:claude las bij het versturen als "weg", maar claimde wel. Het deed één `git fetch -q origin` in agent-harness-m6; dat raakt alleen refs (`origin/main` bleef `15c1e26`).
+- **Workerstop niet fail-closed** (codex MAJOR). `grep -c` was een uitvoerregel en geen voorwaarde, een mislukte eerste opname hield de stop niet tegen, en `systemctl is-active` eindigt niet met 0 bij `inactive`. → Aanvaard. De M4-procedure is nu een script in de Vensterprocedure dat bij de eerste fout stopt, met een aparte tak voor diffstatus 0, 1 en fout.
+- **Afgebroken run kon toch gescoord worden** (codex MAJOR, claude MINOR 2). De stappen na een afbreking wezen nog naar `<kort>-docs`, en `exit≠0`, een stop-rij of een `invocation_error` had geen route. → Aanvaard. `<run-map>` met volgnummer, de controle "Geldige run" (één planrij, 15 paren met een eindrij, geen stop-rij, geen `invocation_error`), en "Afbreken": wachten tot de tmux-sessie en de benchprocessen weg zijn vóór het herstel. Ongeldige mappen gaan niet de repo in.
+- **Sleutelcontrole zonder sleutel** (codex MAJOR). → Verworpen, met bewijs. De controle draait op de Mac, en daar staat `OPENROUTER_API_KEY` in `~/.zshenv` (nagegaan: gezet). `check_key.py` geeft alleen exit 2 als de variabele leeg is. Spec §5 criterium 6 vraagt de controle uitdrukkelijk ("de controle is goedkoop"). Wel toegevoegd: een lege variabele betekent stoppen en JP, nooit een andere waarde. Gaat met dit bewijs naar ronde 2.
+- **Metingen na afloop vragen een venster van vijf minuten** (claude MINOR 1). → Aanvaard. Het script meet direct na het gesprek (`ollama ps`, `/api/ps`, swaptellers); de run legt `/api/ps` vast in `<run-map>-api-ps-na.json`.
+- **Welke bestanden de repo in gaan** (claude MINOR 3). → Aanvaard. Volledige kopie buiten de repo (`M`); de repo krijgt per map alleen wat M5 bewaarde: `raw.jsonl`, `summary.csv`, `blind-key.json`, `transcripts/` en `harness/probe-*/probe.json`, plus logs, scripts, metingen en dienststand.
+- **Unittest op max2 laat `__pycache__` achter** (claude MINOR 4). → Aanvaard: SCHRAP de unittest op max2. Het script zet `PYTHONDONTWRITEBYTECODE=1`, en `worktree remove` gaat zonder `--force`.
+- **54.000 tokens waren alleen de eerste pogingen** (claude MINOR 5). → Aanvaard: 60.556 over alle pogingen (53.973 + 6.583, nagegaan in `baseline-docs/raw.jsonl`).
+- **Modelfile-controle negeerde `PARAMETER`** (claude MINOR 6). → Aanvaard. `PARAMETER` gaat mee in de vergelijking en het rapport; alleen `RENDERER` en `PARSER` zijn een stop.
+- **Kleinigheden** (claude MINOR 7). → (a) `mkdir` vooraan: aanvaard. (b) `no_final` is ook een goede rooktestuitkomst: aanvaard. (c) Een latere harness-commit toestaan: verworpen. De strenge pin blijft, want een valse stop kost één vraag aan JP. Daarnaast zijn `ollama --version` en de ID van de tag toegevoegd, als bewijs dat de route tussen vensters gelijk bleef (observatie claude).
+- **Scope-delta:** geen bouw toegevoegd. De bestaande M4-procedure is uitvoerbaar gemaakt. De controle "Geldige run" en de scripts per venster komen erbij; de unittest op max2 is geschrapt. Het eerste resultaat en de rooktest blijven gelijk.
