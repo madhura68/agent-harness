@@ -2,7 +2,7 @@
 title: "Agent-harness M6 — qwen3.8-27b lokaal op hogere precisie"
 status: reviewed
 last_updated: 2026-10-01
-revision: 3
+revision: 4
 ---
 
 # Agent-harness M6 — qwen3.8-27b lokaal op hogere precisie
@@ -56,6 +56,7 @@ Door en gezakt betekenen in de tabel: niet onbeslist. De kandidaten zijn schatti
 | 3 | Variant en omvang | Alleen met docs, waar gsq zakte: dezelfde 15 gesprekken als in M5, zodat de cijfers vergelijkbaar blijven. |
 | 4 | Route, prompt en zeef | Ongewijzigd uit M5: `run.py --backend harness`, systeemprompt v3 met het docs-addendum, de bevroren docset, de cases, de checks en de zeef. |
 | 5 | Vlaggen | JP beoordeelt nieuwe D5-vlaggen op een reviewpagina, zoals in M5. A5 geldt niet in de docs-variant. |
+| 6 | Seeds | Drie (1–3), gelijk aan M5. Seeds 4–6 alleen bij een onbesliste uitslag, op JP's keuze (JP, 2026-10-01). |
 
 ## 3. Uitgangssituatie
 
@@ -140,7 +141,7 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
 ## 6. Risico's en open punten
 
 - **Kleine aantallen.** Het verschil tussen gsq en gehost is in M5 één gesprek op twee regels. Daarom de grens uit §1: een uitslag vlak bij de grens is onbeslist, geen bewijs.
-  - **Open punt voor JP:** meteen zes seeds in plaats van drie, dus 30 gesprekken. Een uitslag gelijk aan gehost is onbeslist, en dat is een waarschijnlijke uitkomst. Zes seeds maken die kans kleiner, maar verdubbelen het Q8-venster. Mijn advies: drie, gelijk aan M5. De rooktest geeft dan eerst de echte duur, en seeds 4–6 volgen alleen bij een onbesliste uitslag, op jouw keuze.
+  - **Besloten (JP, 2026-10-01): drie seeds**, gelijk aan M5 (§2 #6). Een uitslag gelijk aan gehost is onbeslist, en dat is een waarschijnlijke uitkomst. Seeds 4–6 volgen dan alleen op JP's keuze (§4).
 - **Duur en stilstand.** Tijdens de runs ligt de worker stil. Q8 en Q4 krijgen daarom elk een eigen venster. Tussen de vensters draait de worker gewoon.
 - **Geheugen op max2.** Q8 met cache en buffers is ongeveer 33 GB: ongeveer 15 GB op de GPU en 18 GB in het RAM. max2 heeft 30 GB RAM, waarvan ongeveer 25 GB beschikbaar. Dat past, met een kleine marge. Laadt Q8 niet, dan stopt de rooktest en beslist JP. Swappen verandert de antwoorden niet, alleen de snelheid. De grens en de duur volgen uit de gemeten snelheid (§4), en de swaptellers verklaren die.
 - **Officiële tag tegenover gsq.**
@@ -183,3 +184,7 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
 - Beide bevestigden de vier fixes van ronde 2 tegen de bron. Tellers en noemers van twee run-mappen met verschillende seeds optellen geeft hetzelfde als `sieve()` over één map met 30 gesprekken. Elk pad eindigt in één vervolg en één betekenis voor de aankoop. Geen regressie op de fixes van ronde 1.
 - **Observatie claude, geen bevinding:** meteen zes seeds (het open punt in §6) laat D4 ook meetellen, en dan geeft één run-map met seeds 1–6 het oordeel direct via `score.py`, zonder handwerk. Voorgelegd aan JP bij het open punt; de spec is daarvoor niet gewijzigd.
 - **Scope-delta:** geen. De spec telt drie rondes; het eerste resultaat en de rooktest zijn sinds revisie 1 gelijk gebleven.
+
+### Na dubbel GO — JP-besluit (revisie 4, 2026-10-01)
+
+JP koos drie seeds ("schrijf het M6-plan met drie seeds"), het advies uit §6. §2 #6 en §6 leggen dat vast. Ontwerp, scope en acceptatie zijn ongewijzigd; niet opnieuw gereviewd.
