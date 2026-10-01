@@ -1,6 +1,6 @@
 # M6 — qwen3.8-27b lokaal op hogere precisie: implementatieplan
 
-_Status: draft, revisie 2 (2026-10-01). Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
+_Status: draft, revisie 3 (2026-10-01). Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -64,7 +64,12 @@ opname() {   # $1 = voor | na; een opname telt alleen bij exitcode 0 van psql
     mv "$d/$1.tmp" "$d/$1.txt"
 }
 opname voor || { echo "opname voor mislukt: niet stoppen"; exit 1; }
-if grep -qE '\|(CLAIMED|RUNNING)\|' "$d/voor.txt"; then echo "local_llm-job geclaimd of bezig: niet stoppen"; exit 1; fi
+grep -qE '\|(CLAIMED|RUNNING)\|' "$d/voor.txt"
+case $? in
+  0) echo "local_llm-job geclaimd of bezig: niet stoppen"; exit 1 ;;
+  1) ;;
+  *) echo "controle op claims mislukt: niet stoppen, JP"; exit 1 ;;
+esac
 ssh max2 'sudo -n systemctl stop agent-harness-worker' || { echo "stop mislukt: JP"; exit 1; }
 toestand=$(ssh max2 'systemctl is-active agent-harness-worker')
 case "$toestand" in inactive|failed) ;; *) echo "worker is $toestand na de stop: JP"; exit 1 ;; esac
@@ -86,11 +91,13 @@ Na een schone stop stop je op max2 wat volgens de dienststand draait: TEI met `d
 
 Leg daarna de dienststand na vast.
 
+**Starten en wachten.** Op max2. Direct na `tmux new-session -d -s <sessie> …` legt `sid=$(tmux display -p -t <sessie> '#{pane_pid}') && echo "$sid" > "$R/<map>.sid"` het sessie-ID van de run vast. Het paneel is de leider van een eigen sessie, dus `run.py`, de harness en de doc-server delen dat ID; vreemde processen niet, ook niet een shell die op een woord als `refiner/run.py` zoekt. De run is afgelopen als `tmux has-session -t <sessie>` faalt én `pgrep -s "$sid"` niets vindt. Pas daarna volgen herstel en kopie. Het log eindigt dan op `exit=<code>`; of de map telt, beslist "Geldige run".
+
 **Afbreken.** Dreigt een run over het einde van het venster te lopen?
 1. `tmux send-keys -t <sessie> C-c`.
-2. Wacht tot `tmux has-session -t <sessie>` faalt.
-3. Wacht tot `pgrep -af 'refiner/run.py|agent-harness/dist/cli.js (run|probe|doc-server)'` niets meer vindt.
-4. Herstel pas daarna.
+2. Wacht zoals hierboven, hooguit twee minuten.
+3. Leeft er dan nog een proces in sessie `$sid`: `pkill -TERM -s "$sid"` en nog een minuut wachten. Leeft er daarna nog iets, dan JP; de worker blijft gestopt.
+4. Herstel pas als niets in sessie `$sid` meer leeft.
 
 De afgebroken map geeft geen oordeel. JP kiest een nieuw venster, en de run begint dan in een nieuwe map met het volgnummer erachter (`-2`, `-3`).
 
@@ -103,19 +110,23 @@ path, n = sys.argv[1], int(sys.argv[2])
 rows = [json.loads(line) for line in open(path, encoding="utf-8").read().split("\n") if line.strip()]
 plans = [r for r in rows if r.get("turn") == "plan"]
 planned = {tuple(p) for p in plans[-1]["conversations"]} if plans else set()
-last_end = {}
+last_end = {}   # per gesprek de eindrij van de hoogste poging
 for r in rows:
     if r.get("turn") == "end":
-        last_end[(r["case"], r["seed"])] = r["status"]
+        key, poging = (r["case"], r["seed"]), r.get("poging", 1)
+        if key not in last_end or poging >= last_end[key][0]:
+            last_end[key] = (poging, r["status"])
 problems = []
 if len(plans) != 1 or len(planned) != n:
     problems.append(f"plan: {len(plans)} rij(en) met {len(planned)} gesprekken, verwacht 1 met {n}")
 if any(r.get("turn") == "stop" for r in rows):
     problems.append("stop-rij")
 for case, seed in sorted(planned):
-    status = last_end.get((case, seed))
+    poging, status = last_end.get((case, seed), (None, None))
     if status in (None, "invocation_error"):
         problems.append(f"{case}/{seed}: {status or 'geen eindrij'}")
+    elif status == "error" and poging == 1:   # na error volgt altijd een tweede poging (run.py, conversation())
+        problems.append(f"{case}/{seed}: tweede poging ontbreekt")
 print("geldig" if not problems else "ongeldig: " + "; ".join(problems))
 sys.exit(1 if problems else 0)
 EOF
@@ -235,10 +246,12 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
     grep -E '^(pswpin|pswpout) ' /proc/vmstat; grep MemAvailable /proc/meminfo; } >> "$m"
   EOF
   tmux new-session -d -s m6-rooktest-<kort> "sh $R/rooktest-<kort>.sh"
+  sid=$(tmux display -p -t m6-rooktest-<kort> '#{pane_pid}') && echo "$sid" > "$R/rooktest-<kort>.sid"
   ```
   - `run.py` doet eerst de probe. Met docs draait het model alleen na `reliable`.
   - De grens van 3600 s per beurt is ruim voor een eerste gesprek van onbekende snelheid.
   - Na een afbreking draait het script opnieuw met `map=rooktest-<kort>-2`.
+- [ ] **Wachten** tot de run is afgelopen: "Starten en wachten" uit de Vensterprocedure.
 - [ ] **Venster sluiten:** Herstellen en de dienststand na, volgens de Vensterprocedure.
 - [ ] **Kopie en controle op de Mac:**
   - `rsync -a max2:m6-runs/refiner-precisie-<datum>/ "$M/"`.
@@ -247,9 +260,9 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
   - De proberij heeft het oordeel `reliable`.
   - Het gesprek eindigt `final`, `no_final` of `error`; voor een snelheidsmeting zijn alle drie goed.
   - In de metingen staat na het gesprek alleen `<tag>` in `/api/ps`.
-- [ ] **Snelheid, grens en duur**, ook naar `$M/rooktest-<kort>-metingen.txt`:
+- [ ] **Snelheid, grens en duur**, naar `$M/rooktest-<kort>-snelheid.txt`. Dat bestand bestaat alleen op de Mac, dus een volgende `rsync` laat het staan:
   ```bash
-  python3 - "$M/rooktest-<kort>/raw.jsonl" <<'EOF'
+  python3 - "$M/rooktest-<kort>/raw.jsonl" > "$M/rooktest-<kort>-snelheid.txt" <<'EOF'
   import json, math, sys
   rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8").read().split("\n") if line.strip()]
   turns = [r for r in rows if isinstance(r.get("turn"), int)]
@@ -307,8 +320,10 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
   curl -s 127.0.0.1:11434/api/ps > "$r/$map-api-ps-na.json"
   EOF
   tmux new-session -d -s m6-<run-map> "sh $R/<run-map>.sh"
+  sid=$(tmux display -p -t m6-<run-map> '#{pane_pid}') && echo "$sid" > "$R/<run-map>.sid"
   ```
-  Volg de voortgang met `tail` op het log. Na het opnieuw verbinden toont `tmux has-session -t m6-<run-map>` of de run nog loopt. Dreigt de run over het einde van het venster te lopen, volg dan "Afbreken" uit de Vensterprocedure.
+  Volg de voortgang met `tail` op het log. Dreigt de run over het einde van het venster te lopen, volg dan "Afbreken" uit de Vensterprocedure.
+- [ ] **Wachten** tot de run is afgelopen: "Starten en wachten" uit de Vensterprocedure.
 - [ ] **Venster sluiten:** Herstellen en de dienststand na, volgens de Vensterprocedure.
 - [ ] **Kopie en controle op de Mac:**
   - `rsync -a max2:m6-runs/refiner-precisie-<datum>/ "$M/"`.
@@ -348,8 +363,8 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
     mkdir -p "$D/<map>" && cp "$M/<map>"/{raw.jsonl,summary.csv,blind-key.json} "$D/<map>/" && cp -R "$M/<map>/transcripts" "$D/<map>/"
     for p in "$M/<map>"/harness/probe-*; do mkdir -p "$D/<map>/harness/${p##*/}" && cp "$p/probe.json" "$D/<map>/harness/${p##*/}/"; done
     ```
-  - Daarnaast de bestanden direct in `$M`: `*.sh`, `*.log`, `*.txt` (metingen, dienststand, score-uitvoer) en `*-api-ps-na.json`.
-  - Afgebroken en ongeldige mappen gaan niet mee. Het rapport noemt ze met de reden.
+  - Daarnaast de bestanden direct in `$M`: `*.sh`, `*.sid`, `*.log`, `*.txt` (metingen, snelheid, dienststand, score-uitvoer) en `*-api-ps-na.json`.
+  - Afgebroken en ongeldige run-mappen gaan niet mee. Hun script, log en `.sid` staan wel direct in `$M` en gaan als bewijs mee; het rapport noemt die mappen met de reden.
 - [ ] **Rapport** `llm-bench/results/refiner-precisie-<datum>.md`. Voor Q4 komen de rij en het oordeel erbij. Het rapport bevat:
   - de docs-tabel van `score.py`, naast de M5-rijen van `gsq-lokaal` en `qwen3.8-openrouter` (uit `refiner-vergelijking-2026-10-01.md`, tabel "Met docs");
   - de zeef met de besluiten over de vlaggen, de regels op of één onder de grens met teller en noemer, en het oordeel;
@@ -428,3 +443,15 @@ Snelheid of geheugen op een Mac, een ander model voor de productieworker, de var
 - **Modelfile-controle negeerde `PARAMETER`** (claude MINOR 6). → Aanvaard. `PARAMETER` gaat mee in de vergelijking en het rapport; alleen `RENDERER` en `PARSER` zijn een stop.
 - **Kleinigheden** (claude MINOR 7). → (a) `mkdir` vooraan: aanvaard. (b) `no_final` is ook een goede rooktestuitkomst: aanvaard. (c) Een latere harness-commit toestaan: verworpen. De strenge pin blijft, want een valse stop kost één vraag aan JP. Daarnaast zijn `ollama --version` en de ID van de tag toegevoegd, als bewijs dat de route tussen vensters gelijk bleef (observatie claude).
 - **Scope-delta:** geen bouw toegevoegd. De bestaande M4-procedure is uitvoerbaar gemaakt. De controle "Geldige run" en de scripts per venster komen erbij; de unittest op max2 is geschrapt. Het eerste resultaat en de rooktest blijven gelijk.
+
+### Ronde 2 (2026-10-01, rev 2 `6a0fdac` → rev 3)
+
+- **Reviewers:** mac:codex (0 BLOCKER, 2 MAJOR, 0 MINOR; NO-GO) en mac:claude (0 BLOCKER, 1 MAJOR, 2 MINOR; NO-GO). Beide bevestigden de fixes van ronde 1 en de twee verwerpingen: de sleutelcontrole (codex trekt zijn MAJOR in, want de variabele is op de Mac gezet) en de strenge harness-pin.
+- **Bepalend, beide: de wachtstap in "Afbreken" matchte vreemde processen.** `pgrep -af 'refiner/run.py|…'` vond de zoekende shell zelf, en op max2 draait sinds 29 september een verweesde lus (`bash -c while pgrep -f refiner/run.py …`, pid 2608864, eigen sessie). De voorwaarde "niets gevonden" werd dus nooit waar, en het herstel bleef geblokkeerd. → Aanvaard. "Starten en wachten" legt direct na de start het sessie-ID van het tmux-paneel vast (`#{pane_pid}`, de sessieleider) en wacht op `pgrep -s "$sid"`. Dat raakt alleen de eigen processen. "Afbreken" is begrensd: twee minuten, dan `pkill -TERM -s`, en daarna JP. Nagegaan op max2: `pgrep -s` bestaat, en de verweesde lus heeft een eigen sessie. Die lus opruimen is aan JP.
+- **Normaal einde zonder wachtstap** (codex MAJOR, claude MINOR 1). Taak 2 ging na de tmux-start direct naar het herstel. → Aanvaard. Taak 2 en 3 hebben nu een stap "Wachten" vóór "Venster sluiten".
+- **Leesfout in de claimcontrole liet de stop door** (codex MAJOR). `grep` exit 2 viel in de tak "geen claim". → Aanvaard. Een `case` op de exitstatus: 0 is niet stoppen, 1 is door, de rest is niet stoppen en JP. Getest met een ontbrekend, een vrij en een geclaimd bestand.
+- **Snelheidsregels op de Mac werden door de volgende `rsync` overschreven** (claude MINOR 2). → Aanvaard. Ze gaan naar `$M/rooktest-<kort>-snelheid.txt`, dat alleen op de Mac bestaat.
+- **Observaties claude:**
+  - "Geldige run" neemt nu de eindrij van de hoogste poging, en meldt een `error` in poging 1 zonder poging 2. Getest op de gsq-rijen van `baseline-docs`: heel is `geldig`; zonder de eindrij van poging 2 van D02/1 is het `ongeldig: D02/1: tweede poging ontbreekt`; met een stop-rij is het `ongeldig`.
+  - Script, log en `.sid` van een afgebroken map gaan als bewijs mee.
+- **Scope-delta:** niets nieuws. Bestaande stappen zijn gerepareerd (wachten, afbreken, de claimgate). Het eerste resultaat en de rooktest blijven gelijk. De trend: ronde 1 had 3 MAJOR en 7 MINOR, ronde 2 had 3 MAJOR (2 verschillend) en 2 MINOR, allemaal in de vensterprocedure die ronde 1 toevoegde.
