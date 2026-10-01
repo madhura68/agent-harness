@@ -1,6 +1,6 @@
 # M6 — qwen3.8-27b lokaal op hogere precisie: implementatieplan
 
-_Status: draft, revisie 3 (2026-10-01). Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
+_Status: draft, revisie 4 (2026-10-01). Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -91,12 +91,20 @@ Na een schone stop stop je op max2 wat volgens de dienststand draait: TEI met `d
 
 Leg daarna de dienststand na vast.
 
-**Starten en wachten.** Op max2. Direct na `tmux new-session -d -s <sessie> …` legt `sid=$(tmux display -p -t <sessie> '#{pane_pid}') && echo "$sid" > "$R/<map>.sid"` het sessie-ID van de run vast. Het paneel is de leider van een eigen sessie, dus `run.py`, de harness en de doc-server delen dat ID; vreemde processen niet, ook niet een shell die op een woord als `refiner/run.py` zoekt. De run is afgelopen als `tmux has-session -t <sessie>` faalt én `pgrep -s "$sid"` niets vindt. Pas daarna volgen herstel en kopie. Het log eindigt dan op `exit=<code>`; of de map telt, beslist "Geldige run".
+**Starten en wachten.** Op max2. Start de run met
+
+```bash
+sid=$(tmux new-session -d -P -F '#{pane_pid}' -s m6-<map> "sh $R/<map>.sh") && [ -n "$sid" ] && echo "$sid" > "$R/<map>.sid"
+```
+
+`-P -F '#{pane_pid}'` geeft het sessie-ID van het paneel in dezelfde aanroep terug, ook als het script meteen eindigt. Het paneel is de leider van een eigen sessie, dus `run.py`, de harness en de doc-server delen dat ID; vreemde processen niet, ook niet een shell die op een woord als `refiner/run.py` zoekt. Mislukt deze regel, of is `$sid` leeg: niet meten, geen `pgrep` of `pkill` op goed geluk, en JP.
+
+In een nieuwe shell eerst `sid=$(cat "$R/<map>.sid")`. De run is afgelopen als `tmux has-session -t "=m6-<map>"` faalt (de `=` vraagt de exacte naam) én `pgrep -s "$sid"` met exit 1 eindigt. Exit 0 betekent dat er nog iets leeft. Elke andere exit, of een lege `$sid`, is een fout: JP. Pas daarna volgen herstel en kopie. Het log eindigt dan op `exit=<code>`; of de map telt, beslist "Geldige run".
 
 **Afbreken.** Dreigt een run over het einde van het venster te lopen?
-1. `tmux send-keys -t <sessie> C-c`.
+1. `pkill -INT -s "$sid"`: een Ctrl-C voor alles in de sessie van de run.
 2. Wacht zoals hierboven, hooguit twee minuten.
-3. Leeft er dan nog een proces in sessie `$sid`: `pkill -TERM -s "$sid"` en nog een minuut wachten. Leeft er daarna nog iets, dan JP; de worker blijft gestopt.
+3. Leeft er dan nog iets in sessie `$sid`: `pkill -TERM -s "$sid"` en nog een minuut wachten. Leeft er daarna nog iets, dan JP; de worker blijft gestopt.
 4. Herstel pas als niets in sessie `$sid` meer leeft.
 
 De afgebroken map geeft geen oordeel. JP kiest een nieuw venster, en de run begint dan in een nieuwe map met het volgnummer erachter (`-2`, `-3`).
@@ -212,29 +220,37 @@ Taak 2, 3 en 4 gelden per model uit de tabel in Global Constraints, eerst voor Q
 
 Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duur van de lange run, zodat JP het venster van Taak 3 kan kiezen.
 
+`<rooktest-map>` is `rooktest-<kort>`, of na een afbreking of een ongeldige rooktest `rooktest-<kort>-2`, `-3`, enzovoort. Elke poging heeft zo een eigen map, script, log, `.sid` en metingenbestand. Alles hieronder na de start gaat over de poging die "Geldige run" doorstaat.
+
 **Files:**
-- Op max2, in `$R`: `rooktest-<kort>.sh`, de run-map `rooktest-<kort>/` met zijn log, `rooktest-<kort>-metingen.txt`, en `dienststand-rooktest-<kort>-voor.txt` en `-na.txt`.
-- Op de Mac: de kopie in `$M`, plus `rooktest-<kort>/summary.csv` en `rooktest-<kort>.score.txt`.
+- Op max2, in `$R`:
+  - per model `<kort>-model.txt`;
+  - per poging `<rooktest-map>.sh`, `<rooktest-map>.sid`, de run-map `<rooktest-map>/` met zijn log, en `<rooktest-map>-metingen.txt`;
+  - per venster `dienststand-<rooktest-map>-voor.txt` en `-na.txt`.
+- Op de Mac: de kopie in `$M`, plus `<rooktest-map>/summary.csv`, `<rooktest-map>.score.txt` en `<rooktest-map>-snelheid.txt`.
 
 **Interfaces:**
 - Consumes: branch `feat/m6-precisie` (Taak 1); de Vensterprocedure.
-- Produces: `<W>` en de geschatte duur, in `rooktest-<kort>-metingen.txt`, voor Taak 3.
+- Produces, voor Taak 3 en 4:
+  - `<W>` en de geschatte duur, in `$M/<rooktest-map>-snelheid.txt` van de geldige rooktest;
+  - grootte, verdeling en geheugen, in `$M/<rooktest-map>-metingen.txt`;
+  - versie, tag-ID en Modelfile-vergelijking, in `$M/<kort>-model.txt`.
 
 - [ ] **Voorbereiden op max2:**
   - De eerste keer: `git -C ~/Development/max2 fetch origin feat/m6-precisie && git -C ~/Development/max2 worktree add --detach ~/Development/max2-m6 FETCH_HEAD`. `git -C ~/Development/max2-m6 rev-parse HEAD` is de commit van Taak 1; leg hem vast.
   - `mkdir -p "$R"`.
   - Harness: `git -C ~/Development/agent-harness rev-parse --short HEAD` geeft `15c1e26`, en `git -C ~/Development/agent-harness status --porcelain` is leeg. Anders stoppen en JP.
-- [ ] **Download.** Die kan terwijl de worker draait: `ollama pull <tag>`. Leg `ollama --version` en de regel van `<tag>` uit `ollama list` (met de ID) vast in `$R/rooktest-<kort>-metingen.txt`.
+- [ ] **Download.** Die kan terwijl de worker draait: `ollama pull <tag>`. Leg `ollama --version` en de regel van `<tag>` uit `ollama list` (met de ID) vast in `$R/<kort>-model.txt`.
 - [ ] **Modelfile:**
-  - `ollama show --modelfile <tag> | grep -E '^(RENDERER|PARSER|PARAMETER) '` en hetzelfde voor `qwen3.8-gsq-rco:27b-iq3_s-text`, beide naar de metingen.
+  - `ollama show --modelfile <tag> | grep -E '^(RENDERER|PARSER|PARAMETER) '` en hetzelfde voor `qwen3.8-gsq-rco:27b-iq3_s-text`, beide naar `$R/<kort>-model.txt`.
   - Wijken `RENDERER` of `PARSER` af, dan stoppen en JP: dan is de route niet die van M5.
   - Een ander of ontbrekend `PARAMETER` (gsq zet onder meer `top_k`, `top_p`, `min_p` en `repeat_penalty`; `run.py` zet alleen `temperature` en `seed`) is geen stop. Het gaat wel naar JP en in het rapport, als deel van "geen zuivere proef" (spec §1).
-- [ ] **Venster openen:** de dienststand vooraf (`rooktest-<kort>`), daarna Stoppen, volgens de Vensterprocedure.
+- [ ] **Venster openen:** de dienststand vooraf (`<rooktest-map>`), daarna Stoppen, volgens de Vensterprocedure.
 - [ ] **Het rooktestgesprek** (D03, seed 1) in een script, zodat de metingen na afloop niet van een wakkere operator afhangen. Ollama houdt het model vijf minuten geladen, dus het script meet direct na het gesprek. Op max2:
   ```bash
-  cat > "$R/rooktest-<kort>.sh" <<'EOF'
+  cat > "$R/<rooktest-map>.sh" <<'EOF'
   #!/bin/sh
-  r=/home/janpeter/m6-runs/refiner-precisie-<datum>; map=rooktest-<kort>; m=$r/rooktest-<kort>-metingen.txt
+  r=/home/janpeter/m6-runs/refiner-precisie-<datum>; map=<rooktest-map>; m=$r/$map-metingen.txt
   cd /home/janpeter/Development/max2-m6/llm-bench || exit 1
   { echo "## voor het gesprek"; grep -E '^(pswpin|pswpout) ' /proc/vmstat; grep MemAvailable /proc/meminfo; } >> "$m"
   PYTHONDONTWRITEBYTECODE=1 ./refiner/run.py --backend harness \
@@ -245,24 +261,22 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
   { echo "## na het gesprek"; ollama ps; curl -s 127.0.0.1:11434/api/ps; echo
     grep -E '^(pswpin|pswpout) ' /proc/vmstat; grep MemAvailable /proc/meminfo; } >> "$m"
   EOF
-  tmux new-session -d -s m6-rooktest-<kort> "sh $R/rooktest-<kort>.sh"
-  sid=$(tmux display -p -t m6-rooktest-<kort> '#{pane_pid}') && echo "$sid" > "$R/rooktest-<kort>.sid"
+  sid=$(tmux new-session -d -P -F '#{pane_pid}' -s m6-<rooktest-map> "sh $R/<rooktest-map>.sh") && [ -n "$sid" ] && echo "$sid" > "$R/<rooktest-map>.sid"
   ```
   - `run.py` doet eerst de probe. Met docs draait het model alleen na `reliable`.
   - De grens van 3600 s per beurt is ruim voor een eerste gesprek van onbekende snelheid.
-  - Na een afbreking draait het script opnieuw met `map=rooktest-<kort>-2`.
 - [ ] **Wachten** tot de run is afgelopen: "Starten en wachten" uit de Vensterprocedure.
 - [ ] **Venster sluiten:** Herstellen en de dienststand na, volgens de Vensterprocedure.
 - [ ] **Kopie en controle op de Mac:**
   - `rsync -a max2:m6-runs/refiner-precisie-<datum>/ "$M/"`.
-  - "Geldige run" met `<n>` 1.
-  - In `~/Development/max2-m6/llm-bench`: `./refiner/score.py "$M/rooktest-<kort>" > "$M/rooktest-<kort>.score.txt"`, ter informatie.
+  - "Geldige run" op `$M/<rooktest-map>/raw.jsonl` met `<n>` 1. Ongeldig: geen snelheid uit deze poging, en JP kiest een nieuw venster voor de volgende `<rooktest-map>`.
+  - In `~/Development/max2-m6/llm-bench`: `./refiner/score.py "$M/<rooktest-map>" > "$M/<rooktest-map>.score.txt"`, ter informatie.
   - De proberij heeft het oordeel `reliable`.
   - Het gesprek eindigt `final`, `no_final` of `error`; voor een snelheidsmeting zijn alle drie goed.
-  - In de metingen staat na het gesprek alleen `<tag>` in `/api/ps`.
-- [ ] **Snelheid, grens en duur**, naar `$M/rooktest-<kort>-snelheid.txt`. Dat bestand bestaat alleen op de Mac, dus een volgende `rsync` laat het staan:
+  - In `$M/<rooktest-map>-metingen.txt` staat na het gesprek alleen `<tag>` in `/api/ps`.
+- [ ] **Snelheid, grens en duur**, naar `$M/<rooktest-map>-snelheid.txt`. Dat bestand bestaat alleen op de Mac, dus een volgende `rsync` laat het staan:
   ```bash
-  python3 - "$M/rooktest-<kort>/raw.jsonl" > "$M/rooktest-<kort>-snelheid.txt" <<'EOF'
+  python3 - "$M/<rooktest-map>/raw.jsonl" > "$M/<rooktest-map>-snelheid.txt" <<'EOF'
   import json, math, sys
   rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8").read().split("\n") if line.strip()]
   turns = [r for r in rows if isinstance(r.get("turn"), int)]
@@ -298,12 +312,12 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
 `<run-map>` is `<kort>-docs`, of na een afbreking of een ongeldige run `<kort>-docs-2`, `-3`, enzovoort.
 
 **Interfaces:**
-- Consumes: `<W>` uit Taak 2; de worktree `~/Development/max2-m6` op max2; de Vensterprocedure.
+- Consumes: `<W>` uit `$M/<rooktest-map>-snelheid.txt` en de versie en tag-ID uit `$M/<kort>-model.txt` (Taak 2); de worktree `~/Development/max2-m6` op max2; de Vensterprocedure.
 - Produces: een geldige `<run-map>` met `summary.csv`, en `<run-map>.score.txt`, voor Taak 4.
 
 - [ ] **Controle:**
   - De harness staat op `15c1e26` en is schoon.
-  - `ollama --version` en de ID van `<tag>` in `ollama list` zijn gelijk aan de metingen van de rooktest.
+  - `ollama --version` en de ID van `<tag>` in `ollama list` zijn gelijk aan `$R/<kort>-model.txt`.
   - Anders stoppen en JP.
 - [ ] **Venster openen:** de dienststand vooraf, daarna Stoppen, volgens de Vensterprocedure.
 - [ ] **De run**, in een script, op max2:
@@ -319,8 +333,7 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
   echo "exit=$?" >> "$r/$map.log"
   curl -s 127.0.0.1:11434/api/ps > "$r/$map-api-ps-na.json"
   EOF
-  tmux new-session -d -s m6-<run-map> "sh $R/<run-map>.sh"
-  sid=$(tmux display -p -t m6-<run-map> '#{pane_pid}') && echo "$sid" > "$R/<run-map>.sid"
+  sid=$(tmux new-session -d -P -F '#{pane_pid}' -s m6-<run-map> "sh $R/<run-map>.sh") && [ -n "$sid" ] && echo "$sid" > "$R/<run-map>.sid"
   ```
   Volg de voortgang met `tail` op het log. Dreigt de run over het einde van het venster te lopen, volg dan "Afbreken" uit de Vensterprocedure.
 - [ ] **Wachten** tot de run is afgelopen: "Starten en wachten" uit de Vensterprocedure.
@@ -342,7 +355,7 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
 - Create of modify, alleen bij vlaggen: `llm-bench/results/refiner-precisie-<datum>/vlaggen-besluiten.json`
 
 **Interfaces:**
-- Consumes: `$M/<run-map>/` met `summary.csv` en `raw.jsonl`, `$M/<run-map>.score.txt` (Taak 3), en `$M/rooktest-<kort>-metingen.txt` (Taak 2).
+- Consumes: `$M/<run-map>/` met `summary.csv` en `raw.jsonl`, `$M/<run-map>.score.txt` (Taak 3); `$M/<rooktest-map>-metingen.txt`, `$M/<rooktest-map>-snelheid.txt` en `$M/<kort>-model.txt` (Taak 2).
 - Produces: het oordeel door, gezakt of onbeslist. Dat bepaalt de volgende taak.
 
 - [ ] **Vlaggen.** D5 geldt alleen voor D02, dus er zijn per model hooguit drie nieuwe vlaggen. JP beoordeelt elke D5-vlag op een reviewpagina, zoals in M5 (spec §2 #5):
@@ -358,7 +371,7 @@ Het eerste praktijkbewijs. De uitkomst is de snelheid, `<W>` en de geschatte duu
 - [ ] **Timeout-tegenproef.** Alleen nodig als een gesprek na beide pogingen eindigde met een beurtrij met harness-status `timed_out` in `raw.jsonl`. Tel zulke gesprekken als afgerond, en als geslaagd op elke check die voor hun case geldt (`n.v.t.` en een bevestigde vlag blijven zoals ze zijn). Slaat de zeef dan om, dan is het oordeel onbeslist.
 - [ ] **Oordeel:** door, gezakt of onbeslist, volgens Global Constraints.
 - [ ] **De repo in.** Kopieer uit `$M` naar `$D` alleen wat M5 ook bewaarde.
-  - Per geldige run-map en per rooktestmap:
+  - Per geldige run-map en voor de geldige rooktestmap:
     ```bash
     mkdir -p "$D/<map>" && cp "$M/<map>"/{raw.jsonl,summary.csv,blind-key.json} "$D/<map>/" && cp -R "$M/<map>/transcripts" "$D/<map>/"
     for p in "$M/<map>"/harness/probe-*; do mkdir -p "$D/<map>/harness/${p##*/}" && cp "$p/probe.json" "$D/<map>/harness/${p##*/}/"; done
@@ -455,3 +468,13 @@ Snelheid of geheugen op een Mac, een ander model voor de productieworker, de var
   - "Geldige run" neemt nu de eindrij van de hoogste poging, en meldt een `error` in poging 1 zonder poging 2. Getest op de gsq-rijen van `baseline-docs`: heel is `geldig`; zonder de eindrij van poging 2 van D02/1 is het `ongeldig: D02/1: tweede poging ontbreekt`; met een stop-rij is het `ongeldig`.
   - Script, log en `.sid` van een afgebroken map gaan als bewijs mee.
 - **Scope-delta:** niets nieuws. Bestaande stappen zijn gerepareerd (wachten, afbreken, de claimgate). Het eerste resultaat en de rooktest blijven gelijk. De trend: ronde 1 had 3 MAJOR en 7 MINOR, ronde 2 had 3 MAJOR (2 verschillend) en 2 MINOR, allemaal in de vensterprocedure die ronde 1 toevoegde.
+
+### Ronde 3 (2026-10-01, rev 3 `0cca681` → rev 4)
+
+- **Reviewers:** mac:claude (0 BLOCKER, 0 MAJOR, 2 MINOR; GO) en mac:codex (0 BLOCKER, 2 MAJOR, 0 MINOR; NO-GO). Beide bevestigden: het wachten op het sessie-ID (ook dat de MCP-SDK en `run.py` niets in een eigen sessie starten), de claimgate, het snelheidsbestand en "Geldige run".
+- **Een herhaalde rooktest wees nog naar de eerste map** (codex MAJOR). Score, snelheid en metingen gebruikten `rooktest-<kort>`, ook na een afgebroken eerste poging. → Aanvaard. `<rooktest-map>` heeft een volgnummer, net als `<run-map>`. Elke poging heeft een eigen script, log, `.sid` en metingenbestand. Versie, tag-ID en de Modelfile-vergelijking staan per model in `<kort>-model.txt`.
+- **Het sessie-ID kon verdwijnen tussen de start en `tmux display`** (codex MAJOR). → Aanvaard. `tmux new-session -d -P -F '#{pane_pid}'` geeft het ID in dezelfde aanroep terug. Mislukt dat, of is het leeg, dan wordt er niet gemeten en niet gegokt met `pgrep`/`pkill`, en beslist JP. Nagegaan op max2: `new-session` kent `-P` en `-F`.
+- **`$sid` in een nieuwe shell** (claude MINOR 1). → Aanvaard. Eerst `sid=$(cat "$R/<map>.sid")`. Alleen exit 1 van `pgrep -s` betekent leeg; exit 2 of een lege sid is een fout. Nagegaan op max2: een onbekende sid geeft 1, een lege sid geeft 2. `has-session` gebruikt de exacte naam (`=m6-<map>`). "Afbreken" stuurt `pkill -INT -s "$sid"` in plaats van `send-keys`, zodat ook dat via het vastgelegde ID loopt.
+- **Interfaces wezen nog naar `metingen.txt` voor `<W>`** (claude MINOR 2). → Aanvaard. Taak 2 Produces, Taak 3 en Taak 4 Consumes noemen nu `<rooktest-map>-snelheid.txt` en `<kort>-model.txt`.
+- **Scope-afweging vóór ronde 4.** Alle MAJOR-bevindingen uit ronde 2 en 3 zitten in het procesbeheer van de vensterprocedure (wachten en afbreken). Er is een kleiner alternatief: niet afbreken en het venster ruim kiezen. Dat schrapt de afbreekroute, maar wijkt af van M5 Taak 13 ("loopt de meting daarover heen, dan afbreken en herstellen"), en het wachten op het einde blijft hoe dan ook nodig. De huidige vorm is één startregel die het ID vastlegt, plus één eindvoorwaarde. Dat is het kleinste dat de M5-bescherming houdt. Geen nieuw onderdeel, en het eerste resultaat en de rooktest blijven gelijk.
+- **Scope-delta:** niets nieuws; reparaties in Taak 2 en in de vensterprocedure.
