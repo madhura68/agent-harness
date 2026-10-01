@@ -1,6 +1,6 @@
 ---
 title: "Agent-harness M6 — qwen3.8-27b lokaal op hogere precisie"
-status: draft
+status: reviewed
 last_updated: 2026-10-01
 revision: 3
 ---
@@ -176,3 +176,10 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
 - **De timeout-tegenproef telde ook niet-toepasselijke checks** (codex MINOR; D2 geldt niet voor D04). → Aanvaard. Alleen checks die voor de case gelden; `n.v.t.` en bevestigde vlaggen blijven.
 - **Observatie claude:** Q6_K nog met de oude rekenwijze. → Bijgewerkt: met cache en buffers ongeveer 25 GB, op een Mac van 36 GB op de grens.
 - **Scope-delta:** niets aan de bouw. De route bij onbeslist kreeg een rekenregel van een paar zinnen, zonder code. Het eerste resultaat en de rooktest blijven gelijk.
+
+### Ronde 3 (2026-10-01, rev 3, `dbb9f62`)
+
+- **Reviewers:** mac:claude (0 BLOCKER, 0 MAJOR, 0 MINOR; GO) en mac:codex (0 BLOCKER, 0 MAJOR, 0 MINOR; GO). **Dubbel GO.**
+- Beide bevestigden de vier fixes van ronde 2 tegen de bron. Tellers en noemers van twee run-mappen met verschillende seeds optellen geeft hetzelfde als `sieve()` over één map met 30 gesprekken. Elk pad eindigt in één vervolg en één betekenis voor de aankoop. Geen regressie op de fixes van ronde 1.
+- **Observatie claude, geen bevinding:** meteen zes seeds (het open punt in §6) laat D4 ook meetellen, en dan geeft één run-map met seeds 1–6 het oordeel direct via `score.py`, zonder handwerk. Voorgelegd aan JP bij het open punt; de spec is daarvoor niet gewijzigd.
+- **Scope-delta:** geen. De spec telt drie rondes; het eerste resultaat en de rooktest zijn sinds revisie 1 gelijk gebleven.
