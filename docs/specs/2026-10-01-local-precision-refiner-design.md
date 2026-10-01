@@ -2,7 +2,7 @@
 title: "Agent-harness M6 — qwen3.8-27b lokaal op hogere precisie"
 status: draft
 last_updated: 2026-10-01
-revision: 2
+revision: 3
 ---
 
 # Agent-harness M6 — qwen3.8-27b lokaal op hogere precisie
@@ -33,7 +33,7 @@ M6 meet of hetzelfde model lokaal, op een hogere precisie, met docs wel door de 
 | Q8 door | Q4 meten, in een eigen venster. | Volgt uit Q4. |
 | Q4 door | M6 eindigt. | Kandidaat: Q4_K_M op een Mac van ongeveer 32–36 GB, bij 32 GB krap (§6). |
 | Q4 gezakt | M6 eindigt. | Kandidaat: Q8_0 op een Mac van ongeveer 48 GB (§6). |
-| Onbeslist | M6 stopt voor JP: seeds 4–6 voor dat model, via dezelfde route, of stoppen. Geen Q4 vóór die keuze. | Nog geen. Blijft het na seeds 4–6 onbeslist, dan is er geen meerwaarde aangetoond. |
+| Onbeslist | M6 stopt voor JP: seeds 4–6 voor dat model (§4), of stoppen. Geen Q4 vóór die keuze. Kiest JP stoppen, of is het oordeel over seeds 1–6 nog onbeslist, dan gaat M6 verder als bij gezakt. | Q8: geen meerwaarde aangetoond. Q4: kandidaat Q8_0, ongeveer 48 GB. |
 
 Door en gezakt betekenen in de tabel: niet onbeslist. De kandidaten zijn schattingen voor een proef op echte Mac-hardware, geen koopadvies. Extra seeds gelden alleen het lokale model. De M5-rijen van gsq en gehost blijven op 15 gesprekken; dat kan, omdat de zeef een vaste drempel is en geen vergelijking met gehost.
 
@@ -95,7 +95,7 @@ Beide krijgen dezelfde blokken als `gsq-lokaal`: zonder docs `reasoningEffort: n
 - `maxWallSeconds` wordt ⌈16384 / snelheid × 1,5⌉, naar boven afgerond op een minuut;
 - de tweede poging verdubbelt de grens en het tokenbudget, zoals in M5.
 
-De snelheid telt de verwerking van de invoer mee en ligt dus onder de pure generatie; dat maakt de grens ruimer. Een zwaardere beurt kan de grens toch halen. Elk gesprek dat na beide pogingen op `timed_out` eindigt, staat daarom apart in het rapport. Slaat de zeef om wanneer zulke gesprekken als afgerond en op elke check geslaagd tellen, dan bepaalt de `timed_out` de uitkomst, en is de uitslag onbeslist (§1).
+De snelheid telt de verwerking van de invoer mee en ligt dus onder de pure generatie; dat maakt de grens ruimer. Een zwaardere beurt kan de grens toch halen. Elk gesprek dat na beide pogingen op `timed_out` eindigt, staat daarom apart in het rapport. Slaat de zeef om wanneer zulke gesprekken als afgerond tellen, en als geslaagd op elke check die voor hun case geldt, dan bepaalt de `timed_out` de uitkomst, en is de uitslag onbeslist (§1). Een check met `n.v.t.` en een bevestigde vlag blijven daarbij zoals ze zijn.
 
 **Volgorde.** Serveracties en downloads gebeuren alleen op JP's go.
 1. Download `qwen3.8:27b-q8_0` op max2 (30 GB).
@@ -114,7 +114,7 @@ De snelheid telt de verwerking van de invoer mee en ligt dus onder de pure gener
 5. Herstel de stand precies, zoals in M5 criterium 9: alleen wat vooraf draaide, start weer. JP beoordeelt de nieuwe vlaggen.
 6. Is Q8 door: download `qwen3.8:27b-q4_K_M` (18 GB) en doe de stappen 2–5 voor Q4, in een eigen venster.
 
-Kiest JP bij een onbesliste uitslag voor seeds 4–6, dan gelden dezelfde stappen 2–5 met die seeds.
+**Seeds 4–6.** Kiest JP bij een onbesliste uitslag voor seeds 4–6, dan gelden dezelfde stappen 2–5 met die seeds, in een nieuwe run-map. Het oordeel gaat dan over seeds 1–6 samen. `score.py` scoort één run-map, dus het rapport telt per regel de tellers en noemers van beide uitvoeren met de hand op: afgerond over de 30 geplande gesprekken, en elke check over de gesprekken waarvoor hij geldt. Daarop gelden dezelfde drempels, dezelfde ondergrens van vijf gesprekken en dezelfde grens uit §1. D4 telt dan voor het eerst mee: zes gesprekken in plaats van drie. In M5 telde D4 voor geen enkel model. Vlaggen tellen uit beide runs, en beide originele score-uitvoeren gaan mee in het rapport.
 
 **Duur (schatting).** In M5 duurde de docs-run van gsq, volledig op de GPU bij ongeveer 40 tokens per seconde, zo'n 25 minuten. Q8 draait op max2 naar schatting met 4–8 tokens per seconde, dus de run kost enkele uren. Q4 draait ook deels op de CPU en kost naar schatting een à twee uur. De rooktest geeft de echte schatting vóór de lange run, zodat JP het venster kan kiezen.
 
@@ -132,7 +132,7 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
 
 1. `qwen3.8:27b-q8_0` heeft de docs-variant gedraaid: 15 gesprekken, met een probe-oordeel en een `summary.csv` met A- en D-checks. Dat gebeurde via dezelfde route en instellingen als M5, met de `maxWallSeconds` uit de rooktest.
 2. Is Q8 door, dan geldt criterium 1 ook voor `qwen3.8:27b-q4_K_M`. Is Q8 gezakt, dan staat in het rapport dat Q8 in deze opzet niet voldoet, en is er geen Q4-run. Is een uitslag onbeslist, dan stopt M6 voor de keuze van JP (§1).
-3. Het rapport zet de nieuwe rijen naast gsq en gehost uit M5, met de besluiten van JP over nieuwe vlaggen. Het noemt de regels op of één onder de grens, en geeft het oordeel en de conclusie volgens §1.
+3. Het rapport zet de nieuwe rijen naast gsq en gehost uit M5, met de besluiten van JP over nieuwe vlaggen. Het noemt de regels op of één onder de grens, en geeft het oordeel en de conclusie volgens §1. Na seeds 4–6 rekent het oordeel over seeds 1–6 samen (§4).
 4. Elke `timed_out` staat apart in het rapport. Bepaalt een `timed_out` de uitkomst, dan is de uitslag onbeslist.
 5. Na elke meting draaien op max2 precies de diensten van vooraf.
 6. De unittests in max2 zijn groen, en `check_key.py` vindt nul treffers in de run-mappen. Hier komt geen sleutel aan te pas, maar de controle is goedkoop.
@@ -147,7 +147,7 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
   - De officiële tags laden een beeldprojector (ongeveer 0,9 GB) en gebruiken de template van Ollama. gsq liep op een afgeleide Modelfile zonder beeld, met dezelfde renderer en parser.
   - De rooktest controleert renderer en parser. Het verschil in geheugen beïnvloedt de snelheid, niet de kwaliteit.
 - **Seeds.** Lokaal is een gesprek met dezelfde seed herhaalbaar: in M5 gaven herhalingen identieke tokens. Bij gehost is dat niet zo. Vergelijk daarom uitkomsten, niet transcripten.
-- **Geen Q6.** Komt Q8 door en zakt Q4, dan ligt Q6_K ertussen (ongeveer 22 GB, een Mac van 36 GB). Ollama heeft geen officiële Q6-tag. Een Q6_K van Hugging Face, met een afgeleide Modelfile zoals bij gsq, kan een vervolg zijn, maar valt buiten deze spec.
+- **Geen Q6.** Komt Q8 door en zakt Q4, dan ligt Q6_K ertussen: ongeveer 22 GB, met cache en buffers ongeveer 25 GB, dus op een Mac van 36 GB op de grens. Ollama heeft geen officiële Q6-tag. Een Q6_K van Hugging Face, met een afgeleide Modelfile zoals bij gsq, kan een vervolg zijn, maar valt buiten deze spec.
 - **Mac-geheugen is een schatting.**
   - macOS geeft de GPU standaard ongeveer twee derde tot drie kwart van het geheugen; dat is te verhogen met `iogpu.wired_limit_mb`. Q4 met cache en buffers (ongeveer 21 GB) zit op een Mac van 32 GB daardoor op de grens. Q8 (ongeveer 33 GB) past in 48 GB.
   - Op een Mac kan Ollama dezelfde GGUF-tag draaien. De mlx-tags zijn een alternatief met eigen kwantisatie en zijn niet gemeten.
@@ -167,3 +167,12 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
 - **Q4-download te vroeg; TEI** (beide MINOR). → Aanvaard. De Q4-download staat nu in stap 6, en TEI stopt als hij draait, zoals in M5 Taak 13.
 - **Observaties claude.** De testwijziging raakt `ModelsFileTest` en `LOCAL_MODELS` (§4 aangepast). A5 geldt niet met docs (§2 #5 aangepast).
 - **Scope-delta:** niets toegevoegd aan de bouw. Eén uitslag erbij (onbeslist), die stopt voor JP. De swapstop is geschrapt en de Q4-download uitgesteld tot na Q8. Het eerste resultaat en de rooktest blijven gelijk.
+
+### Ronde 2 (2026-10-01, rev 2 → rev 3)
+
+- **Reviewers:** mac:claude (0 BLOCKER, 0 MAJOR, 1 MINOR; GO) en mac:codex (0 BLOCKER, 1 MAJOR, 1 MINOR; NO-GO). Beide bevestigden de zeven fixes van ronde 1 tegen de bron, ook de SCHRAP van de swapstop.
+- **Bepalend: seeds 4–6 hadden geen samenvoegregel** (codex MAJOR, claude MINOR). `run.py` weigert een gevulde run-map (`run.py:856-857`), en `score.py` scoort één map en neemt de laatste planrij als noemer (`load_meta`). Twee runs van 15 gaven dus geen oordeel over 30. Ook gaat D4 bij zes seeds meetellen (D01 alleen, 6 ≥ 5). → Aanvaard. §4 "Seeds 4–6" telt per regel tellers en noemers van beide uitvoeren met de hand op, met dezelfde drempels en grens, en noemt D4. §5 crit. 3 volgt.
+- **Wat "blijft onbeslist" betekent** (claude, in dezelfde MINOR). → Aanvaard. Stoppen, of na seeds 1–6 nog onbeslist, gaat verder als gezakt: bij Q8 geen meerwaarde aangetoond, bij Q4 kandidaat Q8_0.
+- **De timeout-tegenproef telde ook niet-toepasselijke checks** (codex MINOR; D2 geldt niet voor D04). → Aanvaard. Alleen checks die voor de case gelden; `n.v.t.` en bevestigde vlaggen blijven.
+- **Observatie claude:** Q6_K nog met de oude rekenwijze. → Bijgewerkt: met cache en buffers ongeveer 25 GB, op een Mac van 36 GB op de grens.
+- **Scope-delta:** niets aan de bouw. De route bij onbeslist kreeg een rekenregel van een paar zinnen, zonder code. Het eerste resultaat en de rooktest blijven gelijk.
