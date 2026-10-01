@@ -1,6 +1,6 @@
 # M6 — qwen3.8-27b lokaal op hogere precisie: implementatieplan
 
-_Status: draft, revisie 4 (2026-10-01). Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
+_Status: reviewed, revisie 4 (2026-10-01); dubbel GO in ronde 4. Een technisch GO autoriseert geen ceremonie, download, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -478,3 +478,15 @@ Snelheid of geheugen op een Mac, een ander model voor de productieworker, de var
 - **Interfaces wezen nog naar `metingen.txt` voor `<W>`** (claude MINOR 2). → Aanvaard. Taak 2 Produces, Taak 3 en Taak 4 Consumes noemen nu `<rooktest-map>-snelheid.txt` en `<kort>-model.txt`.
 - **Scope-afweging vóór ronde 4.** Alle MAJOR-bevindingen uit ronde 2 en 3 zitten in het procesbeheer van de vensterprocedure (wachten en afbreken). Er is een kleiner alternatief: niet afbreken en het venster ruim kiezen. Dat schrapt de afbreekroute, maar wijkt af van M5 Taak 13 ("loopt de meting daarover heen, dan afbreken en herstellen"), en het wachten op het einde blijft hoe dan ook nodig. De huidige vorm is één startregel die het ID vastlegt, plus één eindvoorwaarde. Dat is het kleinste dat de M5-bescherming houdt. Geen nieuw onderdeel, en het eerste resultaat en de rooktest blijven gelijk.
 - **Scope-delta:** niets nieuws; reparaties in Taak 2 en in de vensterprocedure.
+
+### Ronde 4 (2026-10-01, rev 4 `023cb46`)
+
+- **Reviewers:** mac:claude (0 BLOCKER, 0 MAJOR, 0 MINOR; GO) en mac:codex (0 BLOCKER, 0 MAJOR, 0 MINOR; GO). **Dubbel GO.**
+- Beide bevestigden de vier fixes van ronde 3 tegen de bron en op max2:
+  - `<rooktest-map>` loopt consistent door Taak 2, 3 en 4.
+  - `tmux new-session -d -P -F '#{pane_pid}'` geeft het sessie-ID in de startaanroep, ook bij een script dat meteen eindigt.
+  - De eindvoorwaarde (exacte sessienaam, `pgrep -s` exit 1) is juist en eindigt altijd.
+  - `pkill -INT/-TERM -s` raakt alleen de eigen sessie.
+- Beide steunen de scope-afweging uit ronde 3: de afbreekroute volgt M5 Taak 13, en één startregel met één eindvoorwaarde is het kleinste dat die bescherming houdt.
+- **Kanttekening van beide:** `-P -F` met een script dat meteen eindigt is niet live gezien. De Mac heeft geen tmux, en een sessie starten op max2 viel buiten de review. Het oordeel rust op de tmux-handleiding, en de tak voor een lege `$sid` is fail-closed.
+- **Scope-delta:** geen. In vier rondes kwam er geen bouw bij. Het eerste resultaat (Q8, docs, seeds 1–3) en de rooktest zijn sinds revisie 1 gelijk.
