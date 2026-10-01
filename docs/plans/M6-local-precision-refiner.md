@@ -43,7 +43,7 @@ _Status: reviewed, revisie 4 (2026-10-01); dubbel GO in ronde 4. Een technisch G
 
 ## Vensterprocedure
 
-Geldt voor elk venster op max2: Taak 2, 3, 5 en 6. Bij de ceremonie gaat dit blok mee in elke taak die het gebruikt. De paden staan in shellvariabelen; zet ze in elke shell eerst: op max2 `R=/home/janpeter/m6-runs/refiner-precisie-<datum>`, op de Mac `M=~/Development/m6-runs/refiner-precisie-<datum>` en `D=~/Development/max2-m6/llm-bench/results/refiner-precisie-<datum>`.
+Geldt voor elk venster op max2: Taak 2, 3, 5 en 6. Het blok past niet in de taakvelden van Scrum4Me; elke taak die het gebruikt, verwijst naar deze sectie in de vastgepinde revisie van dit plan in de docs-store (zie het Review record, "Bij de ceremonie"). De paden staan in shellvariabelen; zet ze in elke shell eerst: op max2 `R=/home/janpeter/m6-runs/refiner-precisie-<datum>`, op de Mac `M=~/Development/m6-runs/refiner-precisie-<datum>` en `D=~/Development/max2-m6/llm-bench/results/refiner-precisie-<datum>`.
 
 **Dienststand.** Op max2, naar `$R/dienststand-<venster>-voor.txt` en na het herstel naar `$R/dienststand-<venster>-na.txt`:
 - `systemctl is-active agent-harness-worker`;
@@ -490,3 +490,7 @@ Snelheid of geheugen op een Mac, een ander model voor de productieworker, de var
 - Beide steunen de scope-afweging uit ronde 3: de afbreekroute volgt M5 Taak 13, en één startregel met één eindvoorwaarde is het kleinste dat die bescherming houdt.
 - **Kanttekening van beide:** `-P -F` met een script dat meteen eindigt is niet live gezien. De Mac heeft geen tmux, en een sessie starten op max2 viel buiten de review. Het oordeel rust op de tmux-handleiding, en de tak voor een lege `$sid` is fail-closed.
 - **Scope-delta:** geen. In vier rondes kwam er geen bouw bij. Het eerste resultaat (Q8, docs, seeds 1–3) en de rooktest zijn sinds revisie 1 gelijk.
+
+### Bij de ceremonie (2026-10-01, na dubbel GO)
+
+De Vensterprocedure is ongeveer 6.100 tekens. Dat past niet in de taakvelden van Scrum4Me, die maximaal 4.000 tekens beschrijving en 8.000 tekens plan toelaten. De taken 2, 3, 5 en 6 verwijzen daarom naar de sectie "Vensterprocedure" in de vastgepinde revisie van dit plan in de docs-store (`plans/m6-local-precision-refiner`), zoals M5 dat deed voor de M4-stopprocedure. Taak 5 wordt drie Scrum4Me-taken (5a, 5b en 5c), elk met de tekst van Taak 2, 3 of 4 en de Q4-parameters. Inhoud, scope en acceptatie zijn ongewijzigd; niet opnieuw gereviewd.
