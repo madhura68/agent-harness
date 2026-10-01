@@ -136,7 +136,7 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
 3. Het rapport zet de nieuwe rijen naast gsq en gehost uit M5, met de besluiten van JP over nieuwe vlaggen. Het noemt de regels op of één onder de grens, en geeft het oordeel en de conclusie volgens §1. Na seeds 4–6 rekent het oordeel over seeds 1–6 samen (§4).
 4. Elke `timed_out` staat apart in het rapport. Bepaalt een `timed_out` de uitkomst, dan is de uitslag onbeslist.
 5. Na elke meting draaien op max2 precies de diensten van vooraf.
-6. De unittests in max2 zijn groen, en `check_key.py` vindt nul treffers in de run-mappen. Hier komt geen sleutel aan te pas, maar de controle is goedkoop.
+6. De unittests van de max2-repo zijn groen, en `check_key.py` vindt nul treffers in de run-mappen. Hier komt geen sleutel aan te pas, maar de controle is goedkoop.
 
 ## 6. Risico's en open punten
 
@@ -188,3 +188,7 @@ De run-mappen gaan mee zoals in M5: rijen, `summary.csv`, blind-key, transcripte
 ### Na dubbel GO — JP-besluit (revisie 4, 2026-10-01)
 
 JP koos drie seeds ("schrijf het M6-plan met drie seeds"), het advies uit §6. §2 #6 en §6 leggen dat vast. Ontwerp, scope en acceptatie zijn ongewijzigd; niet opnieuw gereviewd.
+
+### Verduidelijking na de PR-review (2026-10-01)
+
+s4m-codex-reviewer las in PR #28 "De unittests in max2" in criterium 6 als een run op de host max2. Bedoeld is de max2-repository, zoals "in max2" op r. 10 en r. 48 en zoals in M5 (criterium 7, waar de test ook op de Mac draaide). Het criterium luidt nu "De unittests van de max2-repo zijn groen". De betekenis is ongewijzigd, dus geen nieuwe revisie en niet opnieuw gereviewd.
