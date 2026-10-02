@@ -3,6 +3,7 @@ import { mkdir, readdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { diffGitAdmin, SAFE_GIT_CONFIG, snapshotGitAdmin, type GitAdminSnapshot } from '../worker/host-git.js'
+import { BENCH_DIR } from './hidden-check.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -24,9 +25,6 @@ const defaultExec: ExecFileFn = (file, args, options) => execFileAsync(file, arg
 
 // A patch of a binary file can be large; exceeding this throws instead of cutting the output off.
 const MAX_BUFFER = 64 * 1024 * 1024
-
-// The directory that the bench writes its own files to inside the work tree (`.task-bench/hidden.json`). It is never part of a patch.
-const BENCH_DIR = '.task-bench'
 
 async function gitVia(exec: ExecFileFn, ws: Workspace, args: string[]): Promise<string> {
   const { stdout } = await exec('git', [...SAFE_GIT_CONFIG, '--git-dir', ws.gitdir, '--work-tree', ws.work, ...args], {

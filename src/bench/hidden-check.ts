@@ -12,8 +12,11 @@ export type HiddenResult = {
   files: Array<{ file: string; ran: boolean; passed: number; failed: number; other: number }>
 }
 
-// Where the script lets vitest write its JSON report, relative to the work tree. The caller reads it from there.
-const OUTPUT_FILE = '.task-bench/hidden.json'
+/** The directory that the bench writes its own files to inside the work tree. It is never part of a patch. */
+export const BENCH_DIR = '.task-bench'
+
+/** Where the script lets vitest write its JSON report, relative to the work tree. The caller reads it from there. */
+export const HIDDEN_REPORT = `${BENCH_DIR}/hidden.json`
 
 /** Single quotes around the text, and each single quote in it as `'\''`: the shell takes everything in between literally. */
 function shellQuote(text: string): string {
@@ -25,7 +28,7 @@ function shellQuote(text: string): string {
  * the report in `.task-bench/hidden.json`. Every path is quoted, so no path can add an argument or run something.
  */
 export function hiddenCheckScript(files: string[]): string {
-  return ['npx vitest run --reporter=json', `--outputFile=${OUTPUT_FILE}`, ...files.map(shellQuote)].join(' ')
+  return ['npx vitest run --reporter=json', `--outputFile=${HIDDEN_REPORT}`, ...files.map(shellQuote)].join(' ')
 }
 
 // The part of vitest's JSON report that the verdict rests on. Anything that does not fit is treated as no usable report at all.

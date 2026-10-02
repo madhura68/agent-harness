@@ -3,8 +3,10 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
+import type { ZodType } from 'zod'
+import { BenchCaseSchema } from './bench/case.js'
 import { DocsetError, runDocServer } from './bench/doc-server.js'
-import { assertExtraBody, loadManifest, ManifestError, resolveServerEnv } from './manifest.js'
+import { assertExtraBody, loadManifest, ManifestError, ModelSpecSchema, resolveServerEnv } from './manifest.js'
 import { createModelClient } from './model-client.js'
 import { probeDir, runProbe } from './probe.js'
 import { runManifest } from './run.js'
@@ -12,7 +14,7 @@ import { connectStdioClient, connectStdioRegistry, createRegistryView } from './
 import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
 import { checkRunLogs } from './worker/check-run-logs.js'
-import { loadWorkerConfig, workerMcpEnv } from './worker/config.js'
+import { loadWorkerConfig, TaskConfigSchema, workerMcpEnv } from './worker/config.js'
 import { createControlChannel } from './worker/control.js'
 import { capDocArgs } from './worker/doc-tools.js'
 import { collectSecretValues, workerSecretSources } from './worker/redact.js'
@@ -27,6 +29,7 @@ Usage:
   harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe]
   harness check-run-logs --config <worker.json> --dir <run-logs-dir>
   harness doc-server --dir <docset-dir> --product-id <id>
+  harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]
 `
 
 // allowPositionals is required: without it Node throws ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL on the subcommand.
@@ -46,6 +49,11 @@ export const cliArgsConfig = {
     once: { type: 'boolean' },
     dir: { type: 'string' },
     'product-id': { type: 'string' },
+    case: { type: 'string' },
+    'model-config': { type: 'string' },
+    'task-config': { type: 'string' },
+    label: { type: 'string' },
+    'retry-transient': { type: 'boolean' },
   },
 } satisfies ParseArgsConfig
 
@@ -259,6 +267,74 @@ async function cmdDocServer(values: Values): Promise<number> {
   return 0
 }
 
+/**
+ * Runs `work` with a signal that SIGINT and SIGTERM trip (task-bench spec §4.1, "Stoppen"), and waits for it to finish. The signal only
+ * says "stop": `work` aborts what it is doing, cleans up after itself (the containers!) and ends, and nothing here kills it. The
+ * handlers are `once`: a second Ctrl-C finds none and ends the process at once.
+ */
+async function withStopSignals<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const stop = new AbortController()
+  const onSignal = () => {
+    process.stderr.write('task-bench stopt: containers worden opgeruimd (nogmaals Ctrl-C = direct afbreken)\n')
+    stop.abort()
+  }
+  process.once('SIGINT', onSignal)
+  process.once('SIGTERM', onSignal)
+  try {
+    return await work(stop.signal)
+  } finally {
+    process.off('SIGINT', onSignal)
+    process.off('SIGTERM', onSignal)
+  }
+}
+
+/** Reads a JSON file and holds it to `schema`; the message names the file and, for a schema failure, every field. Like loadManifest. */
+function readJsonConfig<T>(path: string, schema: ZodType<T>, what: string): T {
+  let raw: unknown
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'))
+  } catch (err) {
+    throw new ManifestError(`cannot read ${what} ${path}: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  const parsed = schema.safeParse(raw)
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')
+    throw new ManifestError(`invalid ${what} ${path}: ${issues}`)
+  }
+  return parsed.data
+}
+
+// The label becomes a part of the run dir name (`<case>-<label>-<hex>`), so it has to be one plain path segment.
+const BENCH_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+const TASK_BENCH_FLAGS = ['case', 'model-config', 'task-config', 'label', 'out'] as const
+
+/**
+ * M7: one task-bench run (src/bench/task-bench.ts). The exit code says whether `bench-result.json` was written: 0 for every status,
+ * the benchfout and afgebroken ones included; anything that stops it from being written is an error. The bench is imported only
+ * here: its prompt module refuses to load when the worker prompt changed, and `harness worker` must never depend on that.
+ */
+async function cmdTaskBench(values: Values): Promise<number> {
+  const [casePath, modelPath, taskPath, label, out] = TASK_BENCH_FLAGS.map((flag) => {
+    const value = values[flag]
+    if (!value) throw new UsageError(`task-bench needs --${flag}`)
+    return value
+  })
+  if (!BENCH_LABEL.test(label)) throw new UsageError(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): ${JSON.stringify(label)}`)
+  const benchCase = readJsonConfig(casePath, BenchCaseSchema, 'case')
+  const model = readJsonConfig(modelPath, ModelSpecSchema, 'model config')
+  if (model.apiKey !== undefined) throw new ManifestError(`invalid model config ${modelPath}: apiKey: een sleutel hoort niet in een bestand; geef hem via --api-key-env`)
+  const task = readJsonConfig(taskPath, TaskConfigSchema, 'task config')
+  // Read before anything starts, so an unset variable fails with no run dir.
+  const apiKey = readApiKey(values['api-key-env'])
+
+  return withStopSignals(async (signal) => {
+    const { runTaskBench } = await import('./bench/task-bench.js')
+    const result = await runTaskBench({ case: benchCase, model, label, task, out, apiKey, retryTransient: values['retry-transient'] === true, signal })
+    process.stdout.write(`${result.status} — ${result.runId} → ${join(out, result.runId, 'bench-result.json')}\n`)
+    return 0
+  })
+}
+
 export async function main(argv: string[]): Promise<number> {
   let parsed
   try {
@@ -284,6 +360,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdCheckRunLogs(values)
       case 'doc-server':
         return await cmdDocServer(values)
+      case 'task-bench':
+        return await cmdTaskBench(values)
       default:
         process.stderr.write(`${positionals[0]}: not implemented\n`)
         return 1

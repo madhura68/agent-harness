@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { BenchCaseSchema } from '../src/bench/case.js'
 import type { Manifest } from '../src/manifest.js'
 import type { ServerSpec } from '../src/types.js'
+import { TaskConfigSchema } from '../src/worker/config.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 import { startFakeMcp } from './fakes/fake-mcp-server.js'
 import { allFiles, bodyWithKeyAt, dirContains, DUMMY_KEY, leakedFragments, readTrace, tmp } from './helpers.js'
@@ -194,12 +196,12 @@ describe('harness run — answer profile', () => {
   })
 })
 
-/** Runs main() with stdout and stderr captured. */
-async function runMain(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+/** Runs main() (or the `run` given, for a freshly imported cli.ts) with stdout and stderr captured. */
+async function runMain(args: string[], run: typeof main = main): Promise<{ code: number; stdout: string; stderr: string }> {
   const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
   const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
   try {
-    const code = await main(args)
+    const code = await run(args)
     // Read the calls before mockRestore, which resets them.
     return { code, stdout: out.mock.calls.map((c) => String(c[0])).join(''), stderr: err.mock.calls.map((c) => String(c[0])).join('') }
   } finally {
@@ -463,5 +465,265 @@ describe('harness worker — --extra-body-file', () => {
     expect(stderr).toContain('Usage:')
     expect(stderr).not.toContain('PROBE_REQUIRED')
     expect(fake.requests).toHaveLength(0)
+  })
+})
+
+describe('harness task-bench', () => {
+  const KEY_VAR = 'HARNESS_TEST_BENCH_KEY'
+  afterEach(() => {
+    delete process.env[KEY_VAR]
+    vi.doUnmock('../src/bench/task-bench.js')
+    vi.doUnmock('../src/bench/task-prompt.js')
+    vi.resetModules()
+  })
+
+  // A host that cannot resolve (RFC 2606): if a regression ever let one of these tests run the real bench, it would end at the clone
+  // and never reach the network or docker.
+  const REPO = 'https://example.invalid/agent-harness.git'
+  const validCase = {
+    id: 'AH-01',
+    repo_url: REPO,
+    base_commit: 'a1b2c3d4e5'.repeat(4),
+    ref_commit: 'f6e5d4c3b2'.repeat(4),
+    task: { code: 'T-42', title: 'feat: voeg greet() toe', description: 'Voeg een functie greet toe.', implementation_plan: null },
+    story: { title: 'Begroeting', description: null, acceptance_criteria: null },
+    hidden_tests: ['__tests__/greet.test.ts'],
+    lines: 42,
+    kind: 'feat',
+  }
+  const validModel = { baseUrl: 'http://127.0.0.1:11434/v1', name: 'qwen3.8-test' }
+  const validTask = {
+    limits: { maxTurns: 40, maxOutputTokens: 80000, maxWallSeconds: 2400, maxToolErrors: 8, contextTokens: 65536 },
+    image: 'node:24-bookworm',
+    uid: 1000,
+    gid: 1000,
+    npmCacheDir: '/var/lib/agent-harness/npm-cache',
+    recipes: [{ repoUrl: REPO, prepare: ['npm ci'], verify: 'npm test' }],
+  }
+
+  type Files = { case: string; model: string; task: string; out: string }
+  /** The three config files of a call, valid unless `over` breaks one of them (a string is written as it is). */
+  function benchFiles(over: { case?: unknown; model?: unknown; task?: unknown } = {}): Files {
+    const dir = tmp('cli-task-bench')
+    return {
+      case: writeJson(dir, 'case.json', over.case ?? validCase),
+      model: writeJson(dir, 'model.json', over.model ?? validModel),
+      task: writeJson(dir, 'task.json', over.task ?? validTask),
+      out: join(dir, 'runs'),
+    }
+  }
+  /** The task-bench arguments; `without` leaves one flag out, `extra` adds more. */
+  function benchArgs(f: Files, o: { without?: string; label?: string; extra?: string[] } = {}): string[] {
+    const flags: Array<[string, string]> = [['--case', f.case], ['--model-config', f.model], ['--task-config', f.task], ['--label', o.label ?? 'test'], ['--out', f.out]]
+    return ['task-bench', ...flags.filter(([flag]) => flag !== o.without).flat(), ...(o.extra ?? [])]
+  }
+
+  /** A fresh cli.ts whose task-bench module, when one is given, is that stand-in. */
+  async function freshMain(bench?: { runTaskBench: (o: never) => Promise<unknown> }): Promise<typeof main> {
+    vi.resetModules()
+    if (bench) vi.doMock('../src/bench/task-bench.js', () => bench)
+    return (await import('../src/cli.js')).main
+  }
+  const resultOf = (status: string) => ({ caseId: 'AH-01', label: 'test', runId: 'AH-01-test-0a1b2c3d', status })
+
+  it('is in the usage text', async () => {
+    const { code, stdout } = await runMain(['--help'])
+    expect(code).toBe(0)
+    expect(stdout).toContain(
+      'harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]',
+    )
+  })
+
+  it.each(['--case', '--model-config', '--task-config', '--label', '--out'])('needs %s: a usage error, exit 1, and no run dir', async (flag) => {
+    const f = benchFiles()
+    const { code, stdout, stderr } = await runMain(benchArgs(f, { without: flag }))
+    expect(code).toBe(1)
+    expect(stderr).toContain(`task-bench needs ${flag}`)
+    expect(stderr).toContain('Usage:')
+    expect(stdout).toBe('')
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  it.each(['../escape', 'a/b', '.verborgen', 'met spatie'])('refuses the label %j, which would not be one path segment of the run dir', async (label) => {
+    const f = benchFiles()
+    const { code, stderr } = await runMain(benchArgs(f, { label }))
+    expect(code).toBe(1)
+    expect(stderr).toContain('--label')
+    expect(stderr).toContain('Usage:')
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  it('refuses a case that BenchCaseSchema rejects, with the field in the message, and creates no run dir', async () => {
+    const f = benchFiles({ case: { ...validCase, base_commit: 'abc', hidden_tests: [] } })
+    const { code, stderr } = await runMain(benchArgs(f))
+    expect(code).toBe(1)
+    expect(stderr).toContain(f.case)
+    expect(stderr).toContain('base_commit')
+    expect(stderr).toContain('hidden_tests')
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  it('refuses a model config with an apiKey in it, without printing the key', async () => {
+    const f = benchFiles({ model: { ...validModel, apiKey: DUMMY_KEY } })
+    const { code, stdout, stderr } = await runMain(benchArgs(f))
+    expect(code).toBe(1)
+    expect(stderr).toContain('apiKey')
+    expect(stderr).toContain('--api-key-env')
+    expect(leakedFragments(stdout + stderr)).toEqual([])
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  it.each([
+    ['the model config', 'model', { baseUrl: 'geen url', name: '' }, ['baseUrl', 'name']],
+    ['the task config', 'task', { ...validTask, uid: -1, recipes: [] }, ['uid', 'recipes']],
+  ] as const)('refuses %s that its schema rejects, naming the fields', async (_what, which, content, fields) => {
+    const f = benchFiles({ [which]: content })
+    const { code, stderr } = await runMain(benchArgs(f))
+    expect(code).toBe(1)
+    expect(stderr).toContain(f[which])
+    for (const field of fields) expect(stderr).toContain(field)
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  it.each([
+    ['is missing', undefined],
+    ['is not JSON', '{ nope'],
+  ])('refuses a case file that %s, naming the file', async (_what, content) => {
+    const f = benchFiles()
+    const file = content === undefined ? join(f.out, '..', 'ontbreekt.json') : writeJson(join(f.out, '..'), 'kapot.json', content)
+    const { code, stderr } = await runMain(benchArgs({ ...f, case: file }))
+    expect(code).toBe(1)
+    expect(stderr).toContain(file)
+    expect(stderr).toContain('cannot read')
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  it.each([
+    ['an empty variable', ''],
+    ['an unset variable', undefined],
+  ])('exits 1 without a run dir for --api-key-env with %s', async (_what, value) => {
+    const f = benchFiles()
+    if (value !== undefined) process.env[KEY_VAR] = value
+    const { code, stderr } = await runMain(benchArgs(f, { extra: ['--api-key-env', KEY_VAR] }))
+    expect(code).toBe(1)
+    expect(stderr).toContain(KEY_VAR)
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  describe('the call to the bench', () => {
+    it('hands the parsed files, the label, the key from the environment and a signal to runTaskBench, and prints one line', async () => {
+      const f = benchFiles()
+      process.env[KEY_VAR] = DUMMY_KEY
+      const runTaskBench = vi.fn(async (_o: unknown) => resultOf('geslaagd'))
+      const run = await freshMain({ runTaskBench })
+
+      const { code, stdout, stderr } = await runMain(benchArgs(f, { extra: ['--api-key-env', KEY_VAR, '--retry-transient'] }), run)
+
+      expect(code).toBe(0)
+      expect(runTaskBench).toHaveBeenCalledTimes(1)
+      expect(runTaskBench).toHaveBeenCalledWith({
+        case: BenchCaseSchema.parse(validCase),
+        model: validModel,
+        label: 'test',
+        task: TaskConfigSchema.parse(validTask),
+        out: f.out,
+        apiKey: DUMMY_KEY,
+        retryTransient: true,
+        signal: expect.any(AbortSignal),
+      })
+      expect(stdout).toBe(`geslaagd — AH-01-test-0a1b2c3d → ${join(f.out, 'AH-01-test-0a1b2c3d', 'bench-result.json')}\n`)
+      expect(leakedFragments(stdout + stderr)).toEqual([]) // the key never appears in the output
+    })
+
+    it('runs without a key and without retries by default', async () => {
+      const f = benchFiles()
+      const runTaskBench = vi.fn(async (_o: unknown) => resultOf('limiet'))
+      const run = await freshMain({ runTaskBench })
+      const { code } = await runMain(benchArgs(f), run)
+      expect(code).toBe(0)
+      expect(runTaskBench.mock.calls[0][0]).toMatchObject({ apiKey: undefined, retryTransient: false })
+    })
+
+    it.each(['verify_rood', 'benchfout', 'geen_wijzigingen'])('exits 0 for the status %s: the result file is there, whatever the status', async (status) => {
+      const f = benchFiles()
+      const run = await freshMain({ runTaskBench: vi.fn(async () => resultOf(status)) })
+      const { code, stdout } = await runMain(benchArgs(f), run)
+      expect(code).toBe(0)
+      expect(stdout).toContain(`${status} — AH-01-test-0a1b2c3d → `)
+    })
+
+    it('does not swallow a failure of the run itself: there is no result file, so main throws', async () => {
+      const f = benchFiles()
+      const run = await freshMain({ runTaskBench: vi.fn(async () => Promise.reject(new Error('run dir already exists: x'))) })
+      const before = { SIGINT: process.listenerCount('SIGINT'), SIGTERM: process.listenerCount('SIGTERM') }
+      await expect(runMain(benchArgs(f), run)).rejects.toThrow('run dir already exists: x')
+      expect({ SIGINT: process.listenerCount('SIGINT'), SIGTERM: process.listenerCount('SIGTERM') }).toEqual(before) // its handlers went away
+    })
+
+    // The handlers are the CLI's own: the test calls them directly, and leaves the ones of the test runner alone.
+    it.each(['SIGINT', 'SIGTERM'] as const)('aborts the signal of the run on %s, waits for the run to finish, and then removes its handlers', async (name) => {
+      const f = benchFiles()
+      let release!: () => void
+      const finish = new Promise<void>((resolve) => (release = resolve))
+      let seen: AbortSignal | undefined
+      const runTaskBench = vi.fn(async (o: { signal: AbortSignal }) => {
+        seen = o.signal
+        await finish
+        return resultOf('benchfout')
+      })
+      const before = new Set(process.listeners(name))
+      const run = await freshMain({ runTaskBench })
+      let exited: number | undefined
+      const running = runMain(benchArgs(f), run).then((r) => {
+        exited = r.code
+        return r
+      })
+
+      await vi.waitFor(() => expect(seen).toBeDefined())
+      const mine = process.listeners(name).filter((l) => !before.has(l))
+      expect(mine).toHaveLength(1)
+      expect(seen?.aborted).toBe(false)
+
+      mine[0](name)
+      expect(seen?.aborted).toBe(true)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(exited).toBeUndefined() // it waits for the run, which is cleaning up
+
+      release()
+      const { code, stderr } = await running
+      expect(code).toBe(0)
+      expect(stderr).toContain('stopt')
+      expect(process.listeners(name).filter((l) => !before.has(l))).toHaveLength(0)
+    })
+  })
+
+  describe('the bench is loaded only when the command runs', () => {
+    const guard = 'de laadguard van task-prompt sloeg aan'
+    const tripGuard = () => vi.doMock('../src/bench/task-prompt.js', () => { throw new Error(guard) })
+
+    // src/bench/task-prompt.ts throws on load when the worker prompt lost its doc-tools clause. If cli.ts reached it by a static
+    // import, that would stop `harness worker` at startup: the production worker must not depend on the bench.
+    it('loads cli.ts and its other commands even when task-prompt.ts throws on load', async () => {
+      vi.resetModules()
+      tripGuard()
+      const fresh = (await import('../src/cli.js')).main
+      const { code, stdout } = await runMain(['--help'], fresh)
+      expect(code).toBe(0)
+      expect(stdout).toContain('harness worker')
+    })
+
+    it('trips that guard only for the task-bench command itself, and only when it has got as far as running it', async () => {
+      const f = benchFiles()
+      vi.resetModules()
+      tripGuard()
+      const fresh = (await import('../src/cli.js')).main
+      // an argument error comes first, and does not load the bench…
+      expect((await runMain(benchArgs(f, { without: '--case' }), fresh)).code).toBe(1)
+      // …the command that runs does. (vitest wraps what a mock factory throws, and keeps it as the cause.)
+      const error = await runMain(benchArgs(f), fresh).then(() => undefined, (e: unknown) => e)
+      expect(error).toBeInstanceOf(Error)
+      expect(String((error as Error).cause)).toContain(guard)
+      expect(existsSync(f.out)).toBe(false)
+    })
   })
 })
