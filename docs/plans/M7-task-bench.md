@@ -1,6 +1,6 @@
 # M7 — task-bench: Qwen 3.8 voor een 96 GB-machine op echt werk — implementatieplan
 
-_Status: draft, revisie 3 (2026-10-02). Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: reviewed, revisie 4 (2026-10-02), dubbel GO in plan-ronde 3. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -300,6 +300,7 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
     - **Lokale submodule in de test:** git 2.38.1 en later weigert een submodule-clone over `file` ("transport 'file' not allowed").
       - Daarom zet de fixture-helper `vi.stubEnv('GIT_ALLOW_PROTOCOL', 'file')`. `execFile` erft de omgeving. Nagebootst in plan-ronde 2: zonder die variabele exit 1, met de variabele exit 0.
       - Taak 4 en 5 gebruiken dezelfde helper.
+      - `afterEach` roept `vi.unstubAllEnvs()` aan, zodat de variabele andere tests niet tot `file` beperkt.
       - Alleen de test doet dit. De argv van de bench blijft `SAFE_GIT_CONFIG`, zonder `protocol.file.allow`. De echte submodule-URL is `https://`.
   - **De scan van de git-administratie:**
     - `snapshotAdmin` direct na `createWorkspace`;
@@ -523,6 +524,7 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
       - De som telt elke `usage.costUsd` onder `steps` in `probe.json`. Die staat in `steps.<stap>.raw.usage.costUsd`, en voor `c_two_tools` in `raw.turn1` en `raw.turn2`.
       - De client zet het OpenRouter-veld `cost` om naar `costUsd` (`model-client.ts:89-93`). `probe.ts` slaat het geparste resultaat op als `raw`.
     - Staat er geen enkel bedrag, dan wordt het `null`: in het totaal telt het als 0, en het rapport noemt het.
+    - Een stap die een fout gooide heeft `raw: null` en draagt niets bij. De som is dan een ondergrens. De harde grens blijft de sleutellimiet van $20.
 
 ## Increment 2 — de takenset en de driver
 
@@ -569,6 +571,7 @@ Werkplek: de Mac, worktree `~/Development/max2-m7` op branch `feat/m7-task-bench
     - de test start de driver in een eigen sessie (`start_new_session=True`) en stuurt SIGINT naar de hele procesgroep (`os.killpg`), zoals `pkill -s` in het venster;
     - verwacht: dat resultaat bestaat, de kosten staan in het grootboek, de volgende case start niet, en de driver eindigt met exit 6;
     - een tweede test doet hetzelfde met SIGTERM;
+    - een derde test zet de vlag terwijl er geen aanroep loopt. De nep-harness stuurt tijdens de probe SIGINT naar de driver (`os.kill(os.getppid(), signal.SIGINT)`) en eindigt gewoon. Verwacht: de probe staat in het grootboek, er start geen run, en de driver eindigt met exit 6;
     - dat afgebroken resultaat telt niet als benchfout voor de herhaalregel. Bij hervatten draait die case gewoon opnieuw.
   - **`verdict`:**
     - over alle 169 paren (0..12 × 0..12) zijn de aantallen precies 104 `gezakt`, 33 `onbeslist`, 23 `meerwaarde` en 9 `max2 volstaat`. Dat is de telling van beide reviewers in spec-ronde 1;
@@ -609,6 +612,7 @@ def verdict(h, g):
   - **Signalen:** `signal.signal` voor SIGINT en SIGTERM zet alleen een stopvlag en gooit geen `KeyboardInterrupt`.
     - Daardoor wacht `subprocess.run` het kind gewoon af. Nagebootst in plan-ronde 2: met de standaardafhandeling eindigt de driver met -2 en ontbreekt het resultaat van het kind, met de handler exit 6 en een geschreven resultaat.
     - Na de lopende aanroep volgen: het resultaat lezen, het grootboek bijwerken, en exit 6.
+    - De driver kijkt vóór elke nieuwe actie naar de vlag: vóór de endpointlijst, de probe, elke run of herhaling, en vóór het volgende label. Staat de vlag, dan boekt hij wat al klaar is en stopt hij met exit 6.
   - Alleen de standaardbibliotheek, zoals `refiner/run.py`.
   - **`task-config.json`:** de kopie van het `task`-blok (Taak 6).
   - **README:** doel, de twee commando's, de stopcodes, de beslisregel, en een verwijzing naar de spec.
@@ -800,3 +804,31 @@ Reviewers: `mac:codex` (0 BLOCKER, 0 MAJOR, 1 MINOR, GO) en `mac:claude` (0 BLOC
 - een correctie van het kostenveld.
 
 Het eerste resultaat en de praktijkproef blijven in increment 1.
+
+### Ronde 3 (2026-10-02, rev 3 `192c67d` → rev 4, status reviewed)
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 1 MINOR, GO) en `mac:codex` (0 BLOCKER, 0 MAJOR, 1 MINOR, GO). **Dubbel GO.**
+
+Beide namen de drie fixes van ronde 2 na:
+- **De stopvlag** is bij beide met een eigen proef nagebootst, voor SIGINT en SIGTERM op de procesgroep: de driver geeft exit 6, en het resultaat van het kind is geschreven.
+- **`vi.stubEnv`** bereikt elke git-aanroep, want `execFile` krijgt geen `env` mee.
+- **De som van `usage.costUsd`** klopt met `probe.ts:62-109`.
+
+`verdict` en de andere fragiele contracten zijn ongewijzigd.
+
+**Niet overgenomen grens:** beide reviewers zijn het eens dat er geen begrensde wachttijd in de driver of de eindvoorwaarde nodig is.
+- De opruimstap van de bench is zelf begrensd (`containers.ts:25-27`).
+- De escalatie van de Vensterprocedure is de buitengrens.
+- Een timer zou een gemiste vlag niet repareren.
+
+**MINOR (convergent), verwerkt in rev 4:** de stopvlag moet ook gecontroleerd worden als er geen aanroep loopt.
+- Fix in Taak 7: de driver kijkt vóór elke nieuwe actie naar de vlag. Dat geldt voor de endpointlijst, de probe, elke run of herhaling, en het volgende label.
+- Er is een derde stoptest: een SIGINT tijdens de nep-probe geeft exit 6, zonder run.
+
+**Kleine aanvullingen in rev 4:**
+- `vi.unstubAllEnvs()` in `afterEach` (beide reviewers);
+- een notitie dat de probesom een ondergrens is als een stap een fout gooide (`raw: null`; codex en claude).
+
+**Omvang:** geen nieuw onderdeel, alleen een controle en een test. Het eerste resultaat en de praktijkproef blijven in increment 1.
+
+**Volgende stap:** de ceremonie en de uitvoering wachten op JP. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering.
