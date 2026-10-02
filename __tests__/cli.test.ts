@@ -519,7 +519,7 @@ describe('harness task-bench', () => {
   }
 
   /** A fresh cli.ts whose task-bench module, when one is given, is that stand-in. */
-  async function freshMain(bench?: { runTaskBench: (o: never) => Promise<unknown> }): Promise<typeof main> {
+  async function freshMain(bench?: { runTaskBench?: (o: never) => Promise<unknown>; checkCase?: (o: never) => Promise<unknown> }): Promise<typeof main> {
     vi.resetModules()
     if (bench) vi.doMock('../src/bench/task-bench.js', () => bench)
     return (await import('../src/cli.js')).main
@@ -723,6 +723,146 @@ describe('harness task-bench', () => {
       const error = await runMain(benchArgs(f), fresh).then(() => undefined, (e: unknown) => e)
       expect(error).toBeInstanceOf(Error)
       expect(String((error as Error).cause)).toContain(guard)
+      expect(existsSync(f.out)).toBe(false)
+    })
+  })
+
+  describe('--check-case', () => {
+    const checked = (ok: boolean, problems: string[] = []) => ({ caseId: 'AH-01', ok, problems })
+    /** The --check-case arguments; `without` leaves one flag out, `extra` adds more. */
+    function checkArgs(f: Files, o: { without?: string; extra?: string[] } = {}): string[] {
+      const flags: Array<[string, string]> = [['--case', f.case], ['--task-config', f.task], ['--out', f.out]]
+      return ['task-bench', '--check-case', ...flags.filter(([flag]) => flag !== o.without).flat(), ...(o.extra ?? [])]
+    }
+    /** Where the evidence of the check lies: the dir name ends in a random part, so the CLI can only name the pattern. */
+    const evidence = (f: Files) => join(f.out, 'AH-01-check-*', 'case-check.json')
+
+    it('is in the usage text, with the three flags it needs', async () => {
+      const { code, stdout } = await runMain(['--help'])
+      expect(code).toBe(0)
+      expect(stdout).toContain('harness task-bench --check-case --case <json> --task-config <json> --out <dir>')
+    })
+
+    it.each(['--case', '--task-config', '--out'])('needs %s: a usage error, exit 1, and no run dir', async (flag) => {
+      const f = benchFiles()
+      const checkCase = vi.fn(async (_o: unknown) => checked(true))
+      const run = await freshMain({ checkCase })
+      const { code, stdout, stderr } = await runMain(checkArgs(f, { without: flag }), run)
+      expect(code).toBe(1)
+      expect(stderr).toContain(`task-bench needs ${flag}`)
+      expect(stderr).toContain('Usage:')
+      expect(stdout).toBe('')
+      expect(existsSync(f.out)).toBe(false)
+      expect(checkCase).not.toHaveBeenCalled()
+    })
+
+    it('needs no model config, no label and no key: it hands the parsed case and task config, the out dir and a signal to checkCase, and starts no bench run', async () => {
+      const f = benchFiles()
+      const checkCase = vi.fn(async (_o: unknown) => checked(true))
+      const runTaskBench = vi.fn(async (_o: unknown) => resultOf('geslaagd'))
+      const run = await freshMain({ checkCase, runTaskBench })
+
+      const { code, stdout, stderr } = await runMain(checkArgs(f), run)
+
+      expect(code).toBe(0)
+      expect(checkCase).toHaveBeenCalledTimes(1)
+      expect(checkCase).toHaveBeenCalledWith({
+        case: BenchCaseSchema.parse(validCase),
+        task: TaskConfigSchema.parse(validTask),
+        out: f.out,
+        signal: expect.any(AbortSignal),
+      })
+      expect(runTaskBench).not.toHaveBeenCalled()
+      expect(stdout).toBe(`ok — AH-01 → ${evidence(f)}\n`)
+      expect(stderr).toBe('')
+    })
+
+    it('exits 1 when the case is not ok, and prints each problem', async () => {
+      const f = benchFiles()
+      const run = await freshMain({ checkCase: vi.fn(async () => checked(false, ['verify rood op base_commit', 'ref_commit wijzigt de runnerconfig'])) })
+      const { code, stdout } = await runMain(checkArgs(f), run)
+      expect(code).toBe(1)
+      expect(stdout).toBe(`niet ok — AH-01 → ${evidence(f)}\n  - verify rood op base_commit\n  - ref_commit wijzigt de runnerconfig\n`)
+    })
+
+    it('refuses a case that BenchCaseSchema rejects, with the field in the message, and creates no run dir', async () => {
+      const f = benchFiles({ case: { ...validCase, base_commit: 'abc' } })
+      const checkCase = vi.fn(async (_o: unknown) => checked(true))
+      const run = await freshMain({ checkCase })
+      const { code, stderr } = await runMain(checkArgs(f), run)
+      expect(code).toBe(1)
+      expect(stderr).toContain(f.case)
+      expect(stderr).toContain('base_commit')
+      expect(existsSync(f.out)).toBe(false)
+      expect(checkCase).not.toHaveBeenCalled()
+    })
+
+    it('refuses a task config that its schema rejects, naming the fields', async () => {
+      const f = benchFiles({ task: { ...validTask, uid: -1, recipes: [] } })
+      const run = await freshMain({ checkCase: vi.fn(async () => checked(true)) })
+      const { code, stderr } = await runMain(checkArgs(f), run)
+      expect(code).toBe(1)
+      expect(stderr).toContain(f.task)
+      expect(stderr).toContain('uid')
+      expect(stderr).toContain('recipes')
+      expect(existsSync(f.out)).toBe(false)
+    })
+
+    it('does not swallow a failure of the check itself: there is no result file, so main throws, and its handlers go away', async () => {
+      const f = benchFiles()
+      const run = await freshMain({ checkCase: vi.fn(async () => Promise.reject(new Error('run dir already exists: x'))) })
+      const before = { SIGINT: process.listenerCount('SIGINT'), SIGTERM: process.listenerCount('SIGTERM') }
+      await expect(runMain(checkArgs(f), run)).rejects.toThrow('run dir already exists: x')
+      expect({ SIGINT: process.listenerCount('SIGINT'), SIGTERM: process.listenerCount('SIGTERM') }).toEqual(before)
+    })
+
+    // The handlers are the CLI's own: the test calls them directly, and leaves the ones of the test runner alone.
+    it.each(['SIGINT', 'SIGTERM'] as const)('aborts the signal of the check on %s, waits for it to finish, exits 1 on its afgebroken result, and removes its handlers', async (name) => {
+      const f = benchFiles()
+      let release!: () => void
+      const finish = new Promise<void>((resolve) => (release = resolve))
+      let seen: AbortSignal | undefined
+      const checkCase = vi.fn(async (o: { signal: AbortSignal }) => {
+        seen = o.signal
+        await finish
+        return checked(false, ['afgebroken'])
+      })
+      const before = new Set(process.listeners(name))
+      const run = await freshMain({ checkCase })
+      let exited: number | undefined
+      const running = runMain(checkArgs(f), run).then((r) => {
+        exited = r.code
+        return r
+      })
+
+      await vi.waitFor(() => expect(seen).toBeDefined())
+      const mine = process.listeners(name).filter((l) => !before.has(l))
+      expect(mine).toHaveLength(1)
+      expect(seen?.aborted).toBe(false)
+
+      mine[0](name)
+      expect(seen?.aborted).toBe(true)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      expect(exited).toBeUndefined() // it waits for the check, which is cleaning up its containers
+
+      release()
+      const { code, stdout, stderr } = await running
+      expect(code).toBe(1)
+      expect(stdout).toContain('niet ok — AH-01')
+      expect(stdout).toContain('  - afgebroken')
+      expect(stderr).toContain('stopt')
+      expect(process.listeners(name).filter((l) => !before.has(l))).toHaveLength(0)
+    })
+
+    it('loads the bench only when the command runs: the guard of task-prompt.ts trips for --check-case only after the arguments are right', async () => {
+      const f = benchFiles()
+      vi.resetModules()
+      vi.doMock('../src/bench/task-prompt.js', () => { throw new Error('de laadguard van task-prompt sloeg aan') })
+      const fresh = (await import('../src/cli.js')).main
+      expect((await runMain(checkArgs(f, { without: '--case' }), fresh)).code).toBe(1)
+      const error = await runMain(checkArgs(f), fresh).then(() => undefined, (e: unknown) => e)
+      expect(error).toBeInstanceOf(Error)
+      expect(String((error as Error).cause)).toContain('de laadguard van task-prompt sloeg aan')
       expect(existsSync(f.out)).toBe(false)
     })
   })

@@ -108,7 +108,13 @@ export async function capturePatch(ws: Workspace, base: string): Promise<{ patch
 
 // What the hidden check takes from the ref commit: the whole `__tests__/` and the runner configuration in the root (spec §4.1 step 5).
 const ROOT_CONFIG = /^(vitest\.config\..+|package\.json|tsconfig.*\.json)$/
-const isRestored = (name: string): boolean => name === '__tests__' || ROOT_CONFIG.test(name)
+/**
+ * Whether `name`, a name in the root of the repo, is runner configuration (`vitest.config.*`, `package.json`, `tsconfig*.json`). It is
+ * what `restoreForHiddenCheck` puts back from `ref`, and so what `ref` may not change for a case to be fair (spec §4.2 criterion 6):
+ * one definition for both, so that they cannot drift apart.
+ */
+export const isRunnerConfig = (name: string): boolean => ROOT_CONFIG.test(name)
+const isRestored = (name: string): boolean => name === '__tests__' || isRunnerConfig(name)
 
 /**
  * Puts `__tests__/` and the runner configuration (`vitest.config.*`, `package.json`, `tsconfig*.json` in the root) exactly back to

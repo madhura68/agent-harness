@@ -30,6 +30,7 @@ Usage:
   harness check-run-logs --config <worker.json> --dir <run-logs-dir>
   harness doc-server --dir <docset-dir> --product-id <id>
   harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]
+  harness task-bench --check-case --case <json> --task-config <json> --out <dir>
 `
 
 // allowPositionals is required: without it Node throws ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL on the subcommand.
@@ -54,6 +55,7 @@ export const cliArgsConfig = {
     'task-config': { type: 'string' },
     label: { type: 'string' },
     'retry-transient': { type: 'boolean' },
+    'check-case': { type: 'boolean' },
   },
 } satisfies ParseArgsConfig
 
@@ -307,18 +309,27 @@ function readJsonConfig<T>(path: string, schema: ZodType<T>, what: string): T {
 // The label becomes a part of the run dir name (`<case>-<label>-<hex>`), so it has to be one plain path segment.
 const BENCH_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const TASK_BENCH_FLAGS = ['case', 'model-config', 'task-config', 'label', 'out'] as const
+// --check-case has no model and no key: it needs the case, the task config (the recipe and the container settings) and a place to write.
+const CHECK_CASE_FLAGS = ['case', 'task-config', 'out'] as const
+
+/** The value of every one of these flags; the first that is missing is a usage error, before anything else is read or started. */
+function requiredValues(values: Values, flags: readonly (typeof TASK_BENCH_FLAGS)[number][]): string[] {
+  return flags.map((flag) => {
+    const value = values[flag]
+    if (!value) throw new UsageError(`task-bench needs --${flag}`)
+    return value
+  })
+}
 
 /**
  * M7: one task-bench run (src/bench/task-bench.ts). The exit code says whether `bench-result.json` was written: 0 for every status,
  * the benchfout and afgebroken ones included; anything that stops it from being written is an error. The bench is imported only
  * here: its prompt module refuses to load when the worker prompt changed, and `harness worker` must never depend on that.
+ * With `--check-case` it is the proof for a candidate case instead (`cmdCheckCase`).
  */
 async function cmdTaskBench(values: Values): Promise<number> {
-  const [casePath, modelPath, taskPath, label, out] = TASK_BENCH_FLAGS.map((flag) => {
-    const value = values[flag]
-    if (!value) throw new UsageError(`task-bench needs --${flag}`)
-    return value
-  })
+  if (values['check-case'] === true) return cmdCheckCase(values)
+  const [casePath, modelPath, taskPath, label, out] = requiredValues(values, TASK_BENCH_FLAGS)
   if (!BENCH_LABEL.test(label)) throw new UsageError(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): ${JSON.stringify(label)}`)
   const benchCase = readJsonConfig(casePath, BenchCaseSchema, 'case')
   const model = readJsonConfig(modelPath, ModelSpecSchema, 'model config')
@@ -332,6 +343,25 @@ async function cmdTaskBench(values: Values): Promise<number> {
     const result = await runTaskBench({ case: benchCase, model, label, task, out, apiKey, retryTransient: values['retry-transient'] === true, signal })
     process.stdout.write(`${result.status} — ${result.runId} → ${join(out, result.runId, 'bench-result.json')}\n`)
     return 0
+  })
+}
+
+/**
+ * M7: the proof that a candidate task is a bench case (`checkCase`, src/bench/task-bench.ts), with real containers and without a model
+ * or a key. The exit code is the verdict: 0 when the case is ok, 1 when it is not, a check that was stopped included (it still writes
+ * its `case-check.json`). The name of the evidence dir ends in a random part, so the line names the pattern.
+ */
+async function cmdCheckCase(values: Values): Promise<number> {
+  const [casePath, taskPath, out] = requiredValues(values, CHECK_CASE_FLAGS)
+  const benchCase = readJsonConfig(casePath, BenchCaseSchema, 'case')
+  const task = readJsonConfig(taskPath, TaskConfigSchema, 'task config')
+
+  return withStopSignals(async (signal) => {
+    const { checkCase } = await import('./bench/task-bench.js')
+    const check = await checkCase({ case: benchCase, task, out, signal })
+    process.stdout.write(`${check.ok ? 'ok' : 'niet ok'} — ${check.caseId} → ${join(out, `${check.caseId}-check-*`, 'case-check.json')}\n`)
+    for (const problem of check.problems) process.stdout.write(`  - ${problem}\n`)
+    return check.ok ? 0 : 1
   })
 }
 

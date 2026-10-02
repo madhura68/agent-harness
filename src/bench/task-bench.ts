@@ -1,20 +1,21 @@
 import { randomBytes } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { z } from 'zod'
+import { z } from 'zod'
 import type { Manifest, ModelSpecSchema } from '../manifest.js'
 import { createModelClient, type ModelClient } from '../model-client.js'
 import { runManifest, type AfterAnswerResult } from '../run.js'
 import { openTrace, type RunResult, type TraceWriter } from '../trace.js'
 import { findRecipe, type TaskConfig } from '../worker/config.js'
 import { buildScript, containerName, runInContainer, type ContainerDeps } from '../worker/containers.js'
+import type { GitAdminSnapshot } from '../worker/host-git.js'
 import { isGreen, verifyText } from '../worker/task-impl.js'
 import { createTaskTools, type VerifyRun } from '../worker/task-tools.js'
 import type { BenchCase } from './case.js'
 import { BENCH_DIR, evaluateHidden, hiddenCheckScript, readHiddenReport, type HiddenReportRead, type HiddenResult } from './hidden-check.js'
 import { createRetryingClient, type RetryRecord } from './retry-client.js'
 import { BENCH_SYSTEM_PROMPT, benchTaskPrompt } from './task-prompt.js'
-import { AdminChangedError, assertAdminUnchanged, capturePatch, createWorkspace, restoreForHiddenCheck, snapshotAdmin, type Workspace } from './workspace.js'
+import { AdminChangedError, assertAdminUnchanged, capturePatch, createWorkspace, git, isRunnerConfig, restoreForHiddenCheck, snapshotAdmin, type Workspace } from './workspace.js'
 
 export type ModelSpec = z.infer<typeof ModelSpecSchema>
 
@@ -377,4 +378,310 @@ export async function runTaskBench(o: {
   }
   writeFileSync(join(trace.dir, 'bench-result.json'), JSON.stringify(result, null, 2) + '\n')
   return result
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The proof that a candidate task is a case: harness task-bench --check-case.
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * `<out>/<caseId>-check-<hex8>/case-check.json`: the evidence that a candidate task is a valid bench case (spec §4.2, criteria 2, 3
+ * and 6). `ok` is true exactly when `problems` is empty, and `problems` says in words what is wrong. It holds what a machine can
+ * prove; whatever needs a person's judgment is not in here.
+ *
+ * Read `ok` and `problems` first. A part the check did not get to has no verdict: `hiddenOnBase` and `hiddenOnRef` then say
+ * `niet gedraaid`, and `baseVerifyGreen` is false. And `hiddenOnBase.pass === false` is the wanted value, not the proof: what
+ * proves that the hidden tests fail on base is a hidden file with status "failed" in vitest's own report (`failsForReal`).
+ * `lines` is the size of `ref_commit` (insertions and deletions, a rename counted as a delete and an add).
+ */
+export type CaseCheck = {
+  caseId: string
+  ok: boolean
+  baseVerifyGreen: boolean
+  hiddenOnBase: HiddenResult
+  hiddenOnRef: HiddenResult
+  refChangesRunnerConfig: boolean
+  hiddenMatchesRef: boolean
+  lines: number
+  problems: string[]
+}
+
+/** A hidden check that did not run: no verdict, and every hidden file unrun. */
+const notRun = (files: string[]): HiddenResult => ({ pass: false, reason: 'niet gedraaid', files: files.map((file) => ({ file, ran: false, passed: 0, failed: 0, other: 0 })) })
+
+/** Why a prepare container was not green, in a few words (the output is in the trace). */
+const redReason = (run: VerifyRun): string => run.runnerError ?? (run.timedOut ? 'timeout' : `exitcode ${run.exitCode}`)
+
+// The tests that ref_commit adds or changes: `*.test.ts` under `__tests__/`, the same shape as an entry of `hidden_tests` (BenchCaseSchema).
+const HIDDEN_TEST_PATH = /^__tests__\/.+\.test\.ts$/
+
+/**
+ * The pairs of `git diff --name-status -z`: `<status>\0<path>\0` for every changed file. Never two paths for one change: the diff
+ * runs with `--no-renames`, so a rename is a delete and an add.
+ */
+function parseNameStatus(text: string): Array<{ status: string; path: string }> {
+  const parts = text.split('\0')
+  if (parts.at(-1) === '') parts.pop()
+  if (parts.length % 2 !== 0) throw new Error(`onverwachte uitvoer van git diff --name-status: ${JSON.stringify(text.slice(0, 200))}`)
+  const changes: Array<{ status: string; path: string }> = []
+  for (let i = 0; i < parts.length; i += 2) changes.push({ status: parts[i], path: parts[i + 1] })
+  return changes
+}
+
+/**
+ * The lines (insertions plus deletions) of a `git diff --shortstat`: " 3 files changed, 11 insertions(+), 2 deletions(-)". Git
+ * leaves out a part that is 0, and translates the words around the numbers; the markers (+) and (-) stay, so the numbers are found
+ * by them. Output that has neither marker is not understood, and is never taken for a size of 0.
+ */
+function shortstatLines(text: string): number {
+  if (text.trim() === '') return 0 // no change at all
+  const insertions = /(\d+)[^\d(]*\(\+\)/.exec(text)
+  const deletions = /(\d+)[^\d(]*\(-\)/.exec(text)
+  if (!insertions && !deletions) throw new Error(`onverwachte uitvoer van git diff --shortstat: ${JSON.stringify(text.slice(0, 200))}`)
+  return Number(insertions?.[1] ?? 0) + Number(deletions?.[1] ?? 0)
+}
+
+/**
+ * What the diff between `base_commit` and `ref_commit` says about a case, from the text of the two diffs (`--name-status -z` and
+ * `--shortstat`, both `--no-renames`). `hidden_tests` has to be, as a set, the test files that ref adds (A) or modifies (M): a
+ * deleted test can never be a hidden test, and a rename counts as a delete and an add. `missing` are the test files of ref that
+ * `hidden_tests` lacks, `extra` the entries that are none of them (both sorted). `refChangesRunnerConfig` is true when ref changes,
+ * in any way, a file of the runner configuration in the root of the repo (`isRunnerConfig`, the set that the restore puts back).
+ */
+export function analyseRefDiff(o: { nameStatus: string; shortstat: string; hiddenTests: string[] }): {
+  refChangesRunnerConfig: boolean
+  hiddenMatchesRef: boolean
+  missing: string[]
+  extra: string[]
+  lines: number
+} {
+  const changes = parseNameStatus(o.nameStatus)
+  const refTests = new Set(changes.filter((c) => (c.status === 'A' || c.status === 'M') && HIDDEN_TEST_PATH.test(c.path)).map((c) => c.path))
+  const hidden = new Set(o.hiddenTests)
+  const missing = [...refTests].filter((path) => !hidden.has(path)).sort()
+  const extra = [...hidden].filter((path) => !refTests.has(path)).sort()
+  return {
+    // Only a name in the root: `isRunnerConfig` takes a name, and `tsconfig.*\.json` would match `tsconfig/x.json` as a path.
+    refChangesRunnerConfig: changes.some((c) => !c.path.includes('/') && isRunnerConfig(c.path)),
+    hiddenMatchesRef: missing.length === 0 && extra.length === 0,
+    missing,
+    extra,
+    lines: shortstatLines(o.shortstat),
+  }
+}
+
+// The part of vitest's JSON report that tells which files failed.
+const FileStatusSchema = z.object({
+  testResults: z.array(
+    z.object({
+      name: z.string(),
+      status: z.string().optional(),
+      assertionResults: z.array(z.object({ status: z.string() })).optional(),
+    }),
+  ),
+})
+
+/**
+ * The hidden files that vitest reports as failed. `HiddenResult` cannot say this by itself: it counts tests, and a file that cannot be
+ * imported (the usual state of the hidden test of a new module, on the commit before the module existed) has status "failed" and
+ * no test at all. So a file counts as failed when its own status is "failed" or one of its tests is. Which hidden file an entry of the
+ * report is, is decided by `evaluateHidden` (real paths, relative to the work tree), so that both agree: it is given the failed entries
+ * only, and the files it says it ran are the failed ones (the exit code it is given plays no part).
+ */
+function failedHiddenFiles(reportText: string, work: string, files: string[]): string[] {
+  let json: unknown
+  try {
+    json = JSON.parse(reportText)
+  } catch {
+    return []
+  }
+  const report = FileStatusSchema.safeParse(json)
+  if (!report.success) return []
+  const failed = report.data.testResults.filter((r) => r.status === 'failed' || r.assertionResults?.some((a) => a.status === 'failed'))
+  return evaluateHidden({ exitCode: 0, json: { testResults: failed }, work, files }).files.filter((f) => f.ran).map((f) => f.file)
+}
+
+type HiddenCheck = Awaited<ReturnType<typeof runHiddenCheck>>
+
+/**
+ * Whether the hidden check on base_commit shows a real failure of the tests (spec §4.2 criterion 3), and not just a check that did not
+ * pass: the container ended with a non-zero exit code of its own (no runner error, no time-out), vitest left a plain report, and at
+ * least one hidden file has status "failed" in it. An import error counts: it is that status without a failed test. Anything else, a
+ * container that never ran vitest included, proves nothing about the tests.
+ */
+export function failsForReal(check: Pick<HiddenCheck, 'run' | 'report'>, work: string, files: string[]): boolean {
+  const { run, report } = check
+  if (run.runnerError || run.timedOut || run.exitCode === null || run.exitCode === 0 || report.kind !== 'report') return false
+  return failedHiddenFiles(report.text, work, files).length > 0
+}
+
+/** The verdict to put on record: `hidden`, and in front of its reason the cause when the container or its report was unusable. */
+function recorded(check: HiddenCheck): HiddenResult {
+  const cause = check.run.runnerError ?? (check.report.kind === 'unsafe' ? check.report.why : undefined)
+  return cause === undefined ? check.hidden : { ...check.hidden, reason: `${cause}; ${check.hidden.reason}` }
+}
+
+/** A clone and the scan of its git administration, taken right after the clone and before any container. */
+type Opened = { ws: Workspace; snap: GitAdminSnapshot }
+
+/**
+ * The proof that a candidate task is a valid case (spec §4.2, criteria 2, 3 and 6), with real containers and without a model:
+ *
+ * 1. A clone on `base_commit`, then the two diffs with `ref_commit` (the paths, and the size), then a clone on `ref_commit`. All host
+ *    git is done here, before the first container; after that the only host git is the restore, behind its scan.
+ * 2. On `base_commit`: prepare and the recipe's verify (must be green), then the scan, then `__tests__/` and the runner config of
+ *    `ref_commit` put back, then the hidden tests. They must fail for real (`failsForReal`), not merely not pass.
+ * 3. On `ref_commit`: prepare, the scan, and the hidden tests. They must pass.
+ *
+ * Every finding goes to `problems`; the result is in `<out>/<caseId>-check-<hex8>/case-check.json` on every path, and `ok` means
+ * there is no problem. What cannot be judged because the bench itself failed (no recipe, a clone that fails, a red prepare, a
+ * rewritten git administration) is a problem too, and ends the check there. Only a dir that cannot be made throws. The two clones
+ * stay in the check dir (`ws-base`, `ws-ref`), as the clone of a bench run stays in its run dir.
+ *
+ * `signal` is a stop from outside. It aborts every container and waits until they are cleaned up. The result is then `ok: false` with
+ * `problems: ["afgebroken"]` and nothing else, as it is for a container that was not provably stopped: a check that was cut short is
+ * not judged, and the container that was killed proves nothing.
+ */
+export async function checkCase(o: { case: BenchCase; task: TaskConfig; out: string; signal?: AbortSignal; deps?: BenchDeps }): Promise<CaseCheck> {
+  const c = o.case
+  const hex8 = randomBytes(4).toString('hex')
+  const trace = openTrace(o.out, `${c.id}-check-${hex8}`)
+
+  const inner = new AbortController() // aborts every container
+  const onStop = () => inner.abort()
+  o.signal?.addEventListener('abort', onStop, { once: true })
+  if (o.signal?.aborted) inner.abort()
+  const containers = createContainerRunner({ id: hex8, task: o.task, trace, abort: () => inner.abort(), deps: o.deps?.containerDeps })
+
+  // What the result says; the pipeline below fills it in as far as it gets.
+  const problems: string[] = []
+  let baseVerifyGreen = false
+  let hiddenOnBase = notRun(c.hidden_tests)
+  let hiddenOnRef = notRun(c.hidden_tests)
+  let refChangesRunnerConfig = false
+  let hiddenMatchesRef = false
+  let lines = 0
+
+  /** Why the check has to end now, whatever else is going on: a container that was not provably stopped, or a stop from outside. */
+  const stopReason = (): string | undefined => {
+    const name = containers.uncertain()
+    if (name) return `container ${name} niet aantoonbaar gestopt`
+    return o.signal?.aborted ? STOPPED : undefined
+  }
+  const interrupted = (): void => {
+    const reason = stopReason()
+    if (reason) throw new BenchFault(reason)
+  }
+
+  const open = async (commit: string, dir: string, which: string): Promise<Opened> => {
+    let ws: Workspace
+    try {
+      ws = await createWorkspace({ repoUrl: c.repo_url, commit, dir: join(trace.dir, dir) })
+    } catch (err) {
+      throw new BenchFault(`werkruimte aanmaken mislukt (${which}): ${message(err)}`)
+    }
+    return { ws, snap: await snapshotAdmin(ws) }
+  }
+
+  const pipeline = async (): Promise<void> => {
+    interrupted() // a stop that came before anything started
+    const recipe = findRecipe(o.task, c.repo_url)
+    if (!recipe) throw new BenchFault(`geen recept voor ${c.repo_url}`)
+
+    // All host git comes first: both clones and both diffs. They compare two commits, not a work tree that a container has touched.
+    const base = await open(c.base_commit, 'ws-base', 'base_commit')
+    interrupted()
+    let diff: ReturnType<typeof analyseRefDiff>
+    try {
+      // `-z`: without it git quotes a path with special characters, and that path would silently not match anything. `--`: a
+      // revision is never taken for a path.
+      const nameStatus = await git(base.ws, ['diff', '--no-renames', '--name-status', '--no-color', '-z', c.base_commit, c.ref_commit, '--'])
+      const shortstat = await git(base.ws, ['diff', '--no-renames', '--shortstat', '--no-color', c.base_commit, c.ref_commit, '--'])
+      diff = analyseRefDiff({ nameStatus, shortstat, hiddenTests: c.hidden_tests })
+    } catch (err) {
+      throw new BenchFault(`verschil tussen base_commit en ref_commit niet te bepalen: ${message(err)}`)
+    }
+    lines = diff.lines
+    refChangesRunnerConfig = diff.refChangesRunnerConfig
+    hiddenMatchesRef = diff.hiddenMatchesRef
+    if (refChangesRunnerConfig) problems.push('ref_commit wijzigt de runnerconfig')
+    if (!hiddenMatchesRef) {
+      const differences = [...(diff.missing.length > 0 ? [`ontbreekt: ${diff.missing.join(', ')}`] : []), ...(diff.extra.length > 0 ? [`te veel: ${diff.extra.join(', ')}`] : [])]
+      problems.push(`hidden_tests komt niet overeen met de testbestanden die ref_commit toevoegt of wijzigt (${differences.join('; ')})`)
+    }
+    const ref = await open(c.ref_commit, 'ws-ref', 'ref_commit')
+    interrupted()
+
+    // No container is started once a stop has come: the scans and the restore cannot be aborted, and the stop can come during them.
+    const container = (w: Opened, kind: 'prepare' | 'verify', source: ContainerSource, script: string): Promise<VerifyRun> => {
+      interrupted()
+      return containers.run({ worktree: w.ws.work, kind, source, script, signal: inner.signal })
+    }
+    const hiddenCheck = (w: Opened): ReturnType<typeof runHiddenCheck> => {
+      interrupted()
+      return runHiddenCheck({ containers, work: w.ws.work, files: c.hidden_tests, signal: inner.signal })
+    }
+    // An empty prepare list has nothing to run (buildScript([]) would end in a dangling &&).
+    const prepare = async (w: Opened, which: string): Promise<void> => {
+      if (recipe.prepare.length === 0) return
+      const prep = await container(w, 'prepare', 'prepare', buildScript(recipe.prepare))
+      interrupted() // a prepare that the stop killed is no red prepare
+      if (!isGreen(prep)) throw new BenchFault(`prepare rood op ${which} (${redReason(prep)})`)
+    }
+
+    // base_commit: verify green, and the hidden tests failing for real once the tests and runner config of ref_commit are back.
+    await prepare(base, 'base_commit')
+    const verified = await container(base, 'verify', 'gate', buildScript([recipe.verify]))
+    interrupted()
+    baseVerifyGreen = isGreen(verified)
+    if (!baseVerifyGreen) problems.push('verify rood op base_commit')
+
+    await assertAdminUnchanged(base.ws, base.snap) // before the one host git that follows a container
+    await restoreForHiddenCheck(base.ws, c.ref_commit)
+    const onBase = await hiddenCheck(base)
+    interrupted() // the uncertain flag first: what was read from an uncertain container is thrown away
+    hiddenOnBase = recorded(onBase)
+    if (hiddenOnBase.pass) problems.push('verborgen test slaagt al op base_commit')
+    else if (!failsForReal(onBase, base.ws.work, c.hidden_tests)) problems.push('verborgen toets op base_commit zonder echte testfout')
+
+    // ref_commit: the hidden tests pass. No host git follows, but the verdict must not rest on a tree whose git administration was changed.
+    await prepare(ref, 'ref_commit')
+    await assertAdminUnchanged(ref.ws, ref.snap)
+    const onRef = await hiddenCheck(ref)
+    interrupted()
+    hiddenOnRef = recorded(onRef)
+    if (!hiddenOnRef.pass) problems.push('verborgen toets slaagt niet op ref_commit')
+  }
+
+  let failure: { error: unknown } | undefined
+  try {
+    try {
+      await pipeline()
+    } catch (error) {
+      failure = { error }
+    }
+    await containers.settle() // whatever a failure left running, before anything is written
+  } finally {
+    o.signal?.removeEventListener('abort', onStop)
+  }
+  if (failure) {
+    // A stop explains whatever else failed with it, and a check that was cut short is not judged: its one reason is all it says.
+    const reason = stopReason()
+    if (reason) problems.splice(0, problems.length, reason)
+    else problems.push(failure.error instanceof BenchFault || failure.error instanceof AdminChangedError ? failure.error.message : `harness: ${message(failure.error)}`)
+  }
+
+  const check: CaseCheck = {
+    caseId: c.id,
+    ok: problems.length === 0,
+    baseVerifyGreen,
+    hiddenOnBase,
+    hiddenOnRef,
+    refChangesRunnerConfig,
+    hiddenMatchesRef,
+    lines,
+    problems,
+  }
+  writeFileSync(join(trace.dir, 'case-check.json'), JSON.stringify(check, null, 2) + '\n')
+  return check
 }
