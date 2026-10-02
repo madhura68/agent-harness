@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join, sep } from 'node:path'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -5,19 +6,23 @@ import type { BenchCase } from '../src/bench/case.js'
 import { evaluateHidden, hiddenCheckScript } from '../src/bench/hidden-check.js'
 import { createContainerRunner, mapStatus, runTaskBench, type BenchDeps, type BenchResult } from '../src/bench/task-bench.js'
 import { BENCH_SYSTEM_PROMPT, benchTaskPrompt } from '../src/bench/task-prompt.js'
-import { assertAdminUnchanged, capturePatch, restoreForHiddenCheck } from '../src/bench/workspace.js'
+import { assertAdminUnchanged, capturePatch, createWorkspace, restoreForHiddenCheck, swapNodeModules } from '../src/bench/workspace.js'
 import type { Manifest } from '../src/manifest.js'
 import type { ModelClient } from '../src/model-client.js'
 import type { RunDeps } from '../src/run.js'
 import { openTrace, type RunResult } from '../src/trace.js'
 import type { RunStatus } from '../src/types.js'
-import { buildScript, runInContainer } from '../src/worker/containers.js'
+import { buildScript, runInContainer, type SpawnFn } from '../src/worker/containers.js'
 import type { TaskConfig } from '../src/worker/config.js'
 import { benchCaseFor, benchTaskConfigFor } from './fakes/bench-case.js'
 import { benchTmp, cleanupBenchFixtures, createBenchRepo, disposeBenchRepo, type BenchRepo } from './fakes/bench-repo.js'
 import { fakeDocker, type DockerStep, type FakeDockerOptions } from './fakes/fake-docker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { allFiles, bodyWithKeyAt, DUMMY_KEY, leakedFragments, makeFifo, readTrace } from './helpers.js'
+
+// The order of everything that touches a work tree: the clones, the scans of the git administration, the patch, the restore, the swap of
+// node_modules, and the start of every container. The spies below and the docker stand-in in `start()` fill it.
+const { timeline } = vi.hoisted(() => ({ timeline: [] as string[] }))
 
 // Spies that call through. The first shows what runManifest was given; the others show which host-git steps ran, and in which order.
 const runsSeen: Array<{ manifest: Manifest; deps: RunDeps }> = []
@@ -33,11 +38,18 @@ vi.mock('../src/run.js', async (importActual) => {
 })
 vi.mock('../src/bench/workspace.js', async (importActual) => {
   const actual = await importActual<typeof import('../src/bench/workspace.js')>()
+  const traced = <A extends unknown[], R>(name: string, fn: (...args: A) => R) =>
+    vi.fn((...args: A): R => {
+      timeline.push(name)
+      return fn(...args)
+    })
   return {
     ...actual,
-    assertAdminUnchanged: vi.fn(actual.assertAdminUnchanged),
-    capturePatch: vi.fn(actual.capturePatch),
-    restoreForHiddenCheck: vi.fn(actual.restoreForHiddenCheck),
+    createWorkspace: traced('clone', actual.createWorkspace),
+    assertAdminUnchanged: traced('scan', actual.assertAdminUnchanged),
+    capturePatch: traced('patch', actual.capturePatch),
+    restoreForHiddenCheck: traced('restore', actual.restoreForHiddenCheck),
+    swapNodeModules: traced('swap', actual.swapNodeModules),
   }
 })
 
@@ -52,7 +64,10 @@ let model: Fake | undefined
 
 beforeEach(() => {
   runsSeen.length = 0
-  vi.clearAllMocks()
+  timeline.length = 0
+  // Not clearAllMocks: that keeps the queue of mockImplementationOnce, so a test that fails before it used up its queue would pass it on to the
+  // next test. A reset drops the queue and puts the call-through implementation of each spy back.
+  vi.resetAllMocks()
 })
 afterEach(async () => {
   await model?.close()
@@ -110,6 +125,10 @@ async function start(s: Setup = {}) {
   const task = benchTaskConfigFor(repo, s.task)
   s.tune?.(task)
   const docker = fakeDocker(s.docker)
+  const spawn: SpawnFn = (cmd, args, opts) => {
+    if (args[0] === 'run') timeline.push(`docker ${(args[args.indexOf('--name') + 1] ?? '').replace(/^harness-[0-9a-f]{8}-/, '')}`) // 'prepare-1'
+    return docker.spawn(cmd, args, opts)
+  }
   const out = benchTmp('out')
   const benchCase = benchCaseFor(repo, s.case)
   const run = () =>
@@ -122,7 +141,7 @@ async function start(s: Setup = {}) {
       apiKey: s.apiKey,
       retryTransient: s.retryTransient ?? false,
       signal: s.signal,
-      deps: { containerDeps: { spawn: docker.spawn, killGraceMs: 20, cleanupTimeoutMs: 500, pollIntervalMs: 10 }, ...s.deps },
+      deps: { containerDeps: { spawn, killGraceMs: 20, cleanupTimeoutMs: 500, pollIntervalMs: 10 }, ...s.deps },
     })
   return { repo, model: fake, task, docker, out, benchCase, run }
 }
@@ -139,10 +158,10 @@ async function bench(s: Setup = {}) {
 const outcomesOfGate = (runDir: string) => readTrace(runDir).filter((e) => e.type === 'after_answer').map((e) => e.outcome)
 const hex8Of = (result: BenchResult) => result.runId.slice(-8)
 const fileText = (runDir: string, name: string) => readFileSync(join(runDir, name), 'utf8')
-/** Everything the run wrote except the clone: the clone holds the repository, not the run. */
+/** Everything the run wrote except the clones: they hold the repository, not the run. */
 const runText = (runDir: string) =>
   allFiles(runDir)
-    .filter((f) => !f.startsWith(join(runDir, 'ws') + sep))
+    .filter((f) => !f.startsWith(join(runDir, 'ws') + sep) && !f.startsWith(join(runDir, 'ws-deps') + sep))
     .map((f) => readFileSync(f, 'utf8'))
     .join('\n')
 
@@ -228,7 +247,7 @@ describe('runTaskBench — statuses', () => {
     expect(restoreForHiddenCheck).not.toHaveBeenCalled()
   })
 
-  it('is geslaagd when the hidden check passes, after the tests of the ref are back, the dependencies are installed again, and in a verify container of its own', async () => {
+  it('is geslaagd when the hidden check passes, after the tests of the ref are back, the dependencies are installed on a pristine tree, and in a verify container of its own', async () => {
     const seen: { tests?: boolean; work?: boolean } = {}
     const hidden: DockerStep = {
       onStart: ({ work }) => {
@@ -249,14 +268,19 @@ describe('runTaskBench — statuses', () => {
     const last = t.docker.runs.at(-1)
     expect(last).toMatchObject({ purpose: 'hidden', script: buildScript([hiddenCheckScript(['__tests__/b.test.ts'])]) })
     expect(last?.name).toBe(`harness-${hex8Of(t.result)}-verify-4`)
-    // between the gate and the hidden check: the prepare of the recipe once more, as a container of its own
+    // between the gate and the hidden check: the prepare of the recipe once more, on a pristine tree of its own; the hidden check runs on the tree of the model
     expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare', 'hidden'])
-    expect(t.docker.runs[2]).toMatchObject({ name: `harness-${hex8Of(t.result)}-prepare-3`, script: buildScript(['rm -rf node_modules', 'npm ci']) })
+    expect(t.docker.runs[2]).toMatchObject({
+      name: `harness-${hex8Of(t.result)}-prepare-3`,
+      script: buildScript(['npm ci']),
+      work: join(t.runDir, 'ws-deps', 'work'),
+    })
+    expect(last?.work).toBe(join(t.runDir, 'ws', 'work'))
     const containerEvents = readTrace(t.runDir).filter((e) => e.type === 'container')
     expect(containerEvents.map((e) => [e.kind, e.source, e.n])).toEqual([
       ['prepare', 'prepare', 1],
       ['verify', 'gate', 2],
-      ['prepare', 'reinstall', 3],
+      ['prepare', 'clean_install', 3],
       ['verify', 'hidden_check', 4],
     ])
     expect(t.result.hidden).toEqual(
@@ -709,23 +733,24 @@ describe('runTaskBench — a stop from outside', () => {
     expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare', 'hidden'])
   })
 
-  // A container that the stop killed is never green (`runnerError: afgebroken`), so the result check of the reinstall ends the run here whether
-  // or not a guard follows it: this test does not pin that guard (the next one does). What it pins is the kill, and that the stop is no
-  // "herinstallatie … faalde".
-  it('stops during the reinstall that comes before the hidden check: the container is killed, no hidden container starts, and it is no failed reinstall', async () => {
+  // A container that the stop killed is never green (`runnerError: afgebroken`), so the result check of the clean install ends the run here
+  // whether or not a guard follows it: this test does not pin that guard (the next one does). What it pins is the kill, that nothing is
+  // taken over, and that the stop is no "schone installatie … faalde".
+  it('stops during the clean install that comes before the hidden check: the container is killed, nothing is taken over, no hidden container starts, and it is no failed install', async () => {
     const stop = new AbortController()
     const t = await bench({ signal: stop.signal, script: [writeZ(), say()], docker: { prepare: [{}, hangsUntil(stop)] } })
-    expect(t.result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' }) // not "herinstallatie … faalde"
+    expect(t.result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' }) // not "schone installatie … faalde"
     expect(t.saved).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
     expect(t.saved.hidden).toBeUndefined()
     expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-prepare-3`])
     expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare'])
+    expect(swapNodeModules).not.toHaveBeenCalled()
   })
 
-  // The stop can also land just as the reinstall container hands back its result. That container ended green, so nothing in its result stops
-  // the run: only the guard right after the container keeps the hidden container from starting. The stop is raised from inside the third
-  // container call, after the real one returned, which is the one moment a test can reach that window.
-  it('starts no hidden-check container when the stop arrives just as the reinstall container has ended green', async () => {
+  // The stop can also land just as the clean install hands back its result. That container ended green, so nothing in its result stops the
+  // run: only the guard right after the container keeps the swap and the hidden container from starting. The stop is raised from inside the
+  // third container call, after the real one returned, which is the one moment a test can reach that window.
+  it('takes nothing over and starts no hidden-check container when the stop arrives just as the clean install has ended green', async () => {
     const stop = new AbortController()
     const t = await start({ signal: stop.signal, script: [writeZ(), say()] })
     const containers = vi.mocked(runInContainer)
@@ -735,16 +760,64 @@ describe('runTaskBench — a stop from outside', () => {
       .mockImplementationOnce(real) // prepare
       .mockImplementationOnce(real) // the gate
       .mockImplementationOnce(async (...args) => {
-        const run = await real(...args) // the reinstall
+        const run = await real(...args) // the clean install
         stop.abort() // …and the stop lands as it hands back its result
         return run
       })
 
     const result = await t.run()
 
-    expect(containers).toHaveBeenCalledTimes(3) // the premise: the reinstall ran, and no fourth container was asked for
-    const reinstall = readTrace(join(t.out, result.runId)).find((e) => e.type === 'container' && e.source === 'reinstall')
-    expect(reinstall).toMatchObject({ kind: 'prepare', n: 3, exitCode: 0, timedOut: false }) // the premise: it ended green, before the stop
+    expect(containers).toHaveBeenCalledTimes(3) // the premise: the install ran, and no fourth container was asked for
+    const install = readTrace(join(t.out, result.runId)).find((e) => e.type === 'container' && e.source === 'clean_install')
+    expect(install).toMatchObject({ kind: 'prepare', n: 3, exitCode: 0, timedOut: false }) // the premise: it ended green, before the stop
+    expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken', runStatus: 'completed' })
+    expect(result.hidden).toBeUndefined()
+    expect(JSON.parse(readFileSync(join(t.out, result.runId, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
+    expect(swapNodeModules).not.toHaveBeenCalled()
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare']) // no hidden-check container was started…
+    expect(t.docker.kills()).toEqual([]) // …so none had to be killed
+  })
+
+  // The clone of the pristine tree cannot be aborted either, and a stop can come in the time it takes: no container starts after it.
+  it('starts no install container when the stop arrives while the pristine tree is being cloned', async () => {
+    const stop = new AbortController()
+    const t = await start({ signal: stop.signal, script: [writeZ(), say()] })
+    const clone = vi.mocked(createWorkspace)
+    const real = clone.getMockImplementation()
+    if (!real) throw new Error('createWorkspace is not spied on')
+    clone
+      .mockImplementationOnce(real) // the work tree of the model
+      .mockImplementationOnce(async (...args) => {
+        stop.abort() // the stop lands during the clone of the pristine tree
+        return real(...args)
+      })
+
+    const result = await t.run()
+
+    expect(clone).toHaveBeenCalledTimes(2) // the premise: the run did get as far as the pristine clone
+    expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken', runStatus: 'completed' })
+    expect(result.hidden).toBeUndefined()
+    expect(JSON.parse(readFileSync(join(t.out, result.runId, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // no install and no hidden container
+    expect(t.docker.kills()).toEqual([])
+    expect(swapNodeModules).not.toHaveBeenCalled()
+  })
+
+  // The swap cannot be aborted: the hidden container must not start if the stop came while it ran.
+  it('starts no hidden-check container when the stop arrives while node_modules is being taken over', async () => {
+    const stop = new AbortController()
+    const t = await start({ signal: stop.signal, script: [writeZ(), say()] })
+    const swap = vi.mocked(swapNodeModules)
+    const real = swap.getMockImplementation()
+    if (!real) throw new Error('swapNodeModules is not spied on')
+    swap.mockImplementationOnce(async (...args) => {
+      await real(...args)
+      stop.abort() // the stop lands as the swap is done
+    })
+
+    const result = await t.run()
+
+    expect(swap).toHaveBeenCalledTimes(1) // the premise: the run did get as far as the swap
     expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken', runStatus: 'completed' })
     expect(result.hidden).toBeUndefined()
     expect(JSON.parse(readFileSync(join(t.out, result.runId, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
@@ -753,9 +826,10 @@ describe('runTaskBench — a stop from outside', () => {
   })
 
   // The scan and the restore cannot be aborted, and a stop can come in the time they take. No container starts after a stop, the
-  // reinstall before the hidden check no more than the hidden check itself: a container that started anyway would be killed at once, and
-  // a kill that is not provably done is a benchfout of its own ("niet aantoonbaar gestopt") instead of afgebroken.
-  it('starts no reinstall or hidden-check container once the stop has come, also when it came while the work tree was being made ready for them', async () => {
+  // clean install before the hidden check no more than the hidden check itself, and the pristine tree is not even cloned: a container that
+  // started anyway would be killed at once, and a kill that is not provably done is a benchfout of its own ("niet aantoonbaar gestopt")
+  // instead of afgebroken.
+  it('clones no pristine tree and starts no install or hidden-check container once the stop has come, also when it came while the work tree was being made ready for them', async () => {
     const stop = new AbortController()
     const t = await start({ signal: stop.signal, script: [writeZ(), say()] })
     const restore = vi.mocked(restoreForHiddenCheck)
@@ -772,7 +846,8 @@ describe('runTaskBench — a stop from outside', () => {
     expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
     expect(result.hidden).toBeUndefined()
     expect(JSON.parse(readFileSync(join(t.out, result.runId, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
-    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // no reinstall and no hidden container was started…
+    expect(createWorkspace).toHaveBeenCalledTimes(1) // the tree of the model only…
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // …and no install and no hidden container was started…
     expect(t.docker.kills()).toEqual([]) // …so none had to be killed
   })
 
@@ -879,31 +954,40 @@ describe('runTaskBench — the hidden check cannot be forged', () => {
   })
 })
 
-// The hidden check runs vitest from node_modules, and node_modules is in the work tree that the model can write to (the task tools
-// refuse only paths with a .git segment). A model that rewrites the entry point of vitest decides what the hidden check reports. So the
-// hidden check does not trust the node_modules that the model run left: the lockfile and .npmrc of the ref go back with the rest of the
-// runner configuration, and the recipe's prepare (npm ci, which removes node_modules first) runs again before the hidden container.
-describe('runTaskBench — the dependencies are installed afresh before the hidden check', () => {
+// The hidden check runs vitest from node_modules, and node_modules lies in the work tree that the model can write to (the task tools refuse
+// only paths with a .git segment). What fills it lies there too: for scrum4me-mcp the postinstall of `npm ci` runs scripts/gen-schema.sh,
+// and scripts/ is as writable as src/. So the dependencies are neither taken from that tree nor installed in it: the prepare of the recipe
+// runs on a second, pristine clone of ref_commit, which no file of the model run ever reached, and the node_modules it leaves replaces the
+// one of the model. What is not isolated is the code under test: the model's own src/, scripts/ and the like still run in the hidden check.
+describe('runTaskBench — the dependencies come from a pristine install at ref_commit', () => {
   const VITEST_ENTRY = 'node_modules/vitest/vitest.mjs'
   const solve = [writeZ(), say()]
   const entryOf = (work: string): string | undefined => (existsSync(join(work, VITEST_ENTRY)) ? readFileSync(join(work, VITEST_ENTRY), 'utf8') : undefined)
+  const modelTree = (runDir: string) => join(runDir, 'ws', 'work')
+  const pristineTree = (runDir: string) => join(runDir, 'ws-deps', 'work')
 
-  /** `npm ci`: it removes node_modules and installs what the lockfile says, the real vitest among it. */
+  /**
+   * `npm ci`, as far as it matters here: node_modules is removed and installed (the real vitest among it), and then the root postinstall
+   * runs `scripts/gen-schema.sh` of the tree the container runs in, as the one of scrum4me-mcp does. The script is run for real.
+   */
   const npmCi: DockerStep = {
     effect: ({ work }) => {
       rmSync(join(work, 'node_modules'), { recursive: true, force: true })
       mkdirSync(join(work, 'node_modules/vitest'), { recursive: true })
       writeFileSync(join(work, VITEST_ENTRY), 'REAL vitest\n')
+      execFileSync('sh', [join(work, 'scripts/gen-schema.sh')], { cwd: work })
     },
   }
   /**
    * The hidden container runs whatever vitest entry point the work tree has. The real one fails the hidden test: src/y.ts, which it
-   * imports, does not exist. A forged one prints a valid-looking report of a pass without running anything.
+   * imports, does not exist. A forged one prints a valid-looking report of a pass without running anything. `seen` is what the work
+   * tree holds when the container starts.
    */
-  const vitestOfTheTree = (seen: { entry?: string } = {}): DockerStep => {
+  const vitestOfTheTree = (seen: { entry?: string; evil?: boolean } = {}): DockerStep => {
     const step: DockerStep = {
       onStart: ({ work }) => {
         seen.entry = entryOf(work)
+        seen.evil = existsSync(join(work, 'node_modules/evil'))
       },
       effect: ({ work }) => {
         const forged = entryOf(work)?.startsWith('FORGED') === true
@@ -916,54 +1000,147 @@ describe('runTaskBench — the dependencies are installed afresh before the hidd
   /** What the model does with its write_file tool. */
   const writes = (path: string, content: string, id: string): FakeTurn => call('write_file', { path, content }, id)
 
-  it('does not let a vitest entry point that the model wrote decide the hidden check: it is installed again before the hidden container starts', async () => {
-    const seen: { atGate?: string } = {}
+  // N1 of the re-review: an install in the tree of the model runs what the model wrote there.
+  it('does not run what the model wrote in the install that fills node_modules: its scripts/gen-schema.sh is not executed, and what it forges is not in the final node_modules', async () => {
+    const forging = [
+      '#!/bin/sh',
+      'mkdir -p node_modules/vitest',
+      "printf 'FORGED vitest: always reports a pass\\n' > node_modules/vitest/vitest.mjs",
+      'touch node_modules/.written-by-the-script-of-the-model',
+      '',
+    ].join('\n')
     const atHidden: { entry?: string } = {}
     const t = await bench({
-      script: [writes(VITEST_ENTRY, 'FORGED vitest: always reports a pass\n', 'forge'), ...solve],
+      script: [writes('scripts/gen-schema.sh', forging, 'script'), ...solve],
+      docker: { prepare: [npmCi, npmCi], hidden: [vitestOfTheTree(atHidden)] },
+    })
+    // the premise: the model did overwrite the script of the repo, and its tree still has it (scripts/ is the model's, like src/)
+    expect(fileText(t.runDir, 'patch.diff')).toContain('+++ b/scripts/gen-schema.sh')
+    expect(readFileSync(join(modelTree(t.runDir), 'scripts/gen-schema.sh'), 'utf8')).toBe(forging)
+
+    expect(t.result).toMatchObject({ status: 'verborgen_tests_rood', runStatus: 'completed', hidden: { pass: false } }) // not geslaagd
+    expect(atHidden.entry).toBe('REAL vitest\n')
+    expect(existsSync(join(modelTree(t.runDir), 'node_modules/.written-by-the-script-of-the-model'))).toBe(false)
+    // the install that ran after the model loop ran on the pristine tree, where the script is the one of the repo
+    expect(t.docker.runs[2]).toMatchObject({ purpose: 'prepare', work: pristineTree(t.runDir) })
+  })
+
+  it('replaces the node_modules of the model with the pristine one: a vitest.mjs that it wrote, and anything else it put there, are gone', async () => {
+    const seen: { atGate?: string; evilAtGate?: boolean } = {}
+    const atHidden: { entry?: string; evil?: boolean } = {}
+    const t = await bench({
+      script: [
+        writes(VITEST_ENTRY, 'FORGED vitest: always reports a pass\n', 'forge'),
+        writes('node_modules/evil/index.js', 'module.exports = 1\n', 'evil'),
+        ...solve,
+      ],
       docker: {
         prepare: [npmCi, npmCi],
-        verify: [{ onStart: ({ work }) => (seen.atGate = entryOf(work)) }], // the premise: the forgery is in the tree when the model is done
+        verify: [
+          {
+            onStart: ({ work }) => {
+              seen.atGate = entryOf(work)
+              seen.evilAtGate = existsSync(join(work, 'node_modules/evil'))
+            },
+          },
+        ],
         hidden: [vitestOfTheTree(atHidden)],
       },
     })
     expect(t.result).toMatchObject({ status: 'verborgen_tests_rood', runStatus: 'completed', hidden: { pass: false } }) // not geslaagd, whatever the forged vitest reports
-    expect(seen.atGate).toBe('FORGED vitest: always reports a pass\n')
-    expect(atHidden.entry).toBe('REAL vitest\n') // gone and installed again by the container that came before the hidden one
-    // the order of the containers is the point: the prepare of the recipe again, then the hidden check
-    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare', 'hidden'])
-    expect(t.docker.runs.map((r) => r.name)).toEqual(['prepare-1', 'verify-2', 'prepare-3', 'verify-4'].map((n) => `harness-${hex8Of(t.result)}-${n}`))
-    expect(t.docker.runs[2].script).toBe(buildScript(['rm -rf node_modules', 'npm ci'])) // the removal and the commands of the recipe, nothing of the model's
+    expect(seen).toEqual({ atGate: 'FORGED vitest: always reports a pass\n', evilAtGate: true }) // the premise: the forgery is in the tree when the model is done
+    expect(atHidden).toEqual({ entry: 'REAL vitest\n', evil: false })
   })
 
-  // `npm ci` removes node_modules by itself, so the test above would pass on that alone. A prepare that keeps what it finds (`npm install`
-  // trusts a node_modules that is there, a vitest.mjs that the model wrote included) must not leave a forged file either: the script removes
-  // node_modules first, whatever its commands do.
-  it('does not depend on the recipe to clear node_modules: a prepare that keeps what it finds still installs afresh', async () => {
-    const repo = await createBenchRepo()
-    const atHidden: { entry?: string } = {}
-    // `sh -c <script>`, as far as it matters here: `rm -rf node_modules` removes it, and `npm install` adds what is missing (the real vitest)
-    const shell: DockerStep = {
-      effect: ({ work, script }) => {
-        if (script.split(' && ').includes('rm -rf node_modules')) rmSync(join(work, 'node_modules'), { recursive: true, force: true })
-        if (!existsSync(join(work, VITEST_ENTRY))) {
-          mkdirSync(join(work, 'node_modules/vitest'), { recursive: true })
-          writeFileSync(join(work, VITEST_ENTRY), 'REAL vitest\n')
-        }
+  it('installs in a tree of its own, after the restore and before the hidden check: the order of everything that touches a work tree, what each container mounts, and the network', async () => {
+    const t = await bench({ script: solve, docker: { prepare: [npmCi, npmCi], hidden: [hiddenPasses] } })
+    expect(t.result.status).toBe('geslaagd')
+
+    expect(timeline).toEqual([
+      'clone', // the work tree of the model
+      'docker prepare-1',
+      'scan',
+      'docker verify-2', // the gate
+      'scan',
+      'patch',
+      'scan',
+      'restore', // the tests and the runner config of the ref go back
+      'clone', // the pristine tree: new, so no container has touched it
+      'docker prepare-3', // the install, on that tree
+      'scan', // after which its git administration is looked at, as for every tree
+      'swap', // node_modules goes to the work tree of the model
+      'docker verify-4', // the hidden check
+    ])
+
+    const model = modelTree(t.runDir)
+    const pristine = pristineTree(t.runDir)
+    expect(t.docker.runs.map((r) => r.work)).toEqual([model, model, pristine, model])
+    // the clones: the tree of the model at base_commit, the pristine one at ref_commit, under the run dir
+    expect(vi.mocked(createWorkspace).mock.calls.map(([o]) => o)).toEqual([
+      { repoUrl: t.repo.url, commit: t.repo.a, dir: join(t.runDir, 'ws') },
+      { repoUrl: t.repo.url, commit: t.repo.b, dir: join(t.runDir, 'ws-deps') },
+    ])
+    // what each container is given: argv of `docker run`, in the order they started
+    const argv = t.docker.calls.filter((a) => a[0] === 'run')
+    const mounts = (a: string[]) => a.filter((_, i) => a[i - 1] === '-v')
+    expect(mounts(argv[0])).toEqual([`${model}:${model}`, '/tmp/npm-cache:/npm-cache'])
+    expect(mounts(argv[2])).toEqual([`${pristine}:${pristine}`, '/tmp/npm-cache:/npm-cache']) // the install sees the pristine tree and the cache, nothing else
+    expect(argv[2].join(' ')).not.toContain(model) // the tree of the model is nowhere in it
+    expect(mounts(argv[3])).toEqual([`${model}:${model}`])
+    // network: a prepare has it, a verify has none. After the model loop the only one with network is the install on the pristine tree.
+    const hasNetwork = (a: string[]) => !(a.includes('--network') && a[a.indexOf('--network') + 1] === 'none')
+    expect(argv.map(hasNetwork)).toEqual([true, false, true, false])
+    expect(argv.map((a) => a.includes(model))).toEqual([true, true, false, true]) // so no container with network ever has the tree of the model after the model started
+  })
+
+  it('installs in a tree that has the ref and nothing of the model run', async () => {
+    const seen: Record<string, unknown> = {}
+    const install: DockerStep = {
+      effect: npmCi.effect,
+      onStart: ({ work }) => {
+        seen.ref = existsSync(join(work, 'src/y.ts')) // only the ref has it
+        seen.tests = existsSync(join(work, '__tests__/b.test.ts'))
+        seen.solution = existsSync(join(work, 'src/z.ts')) // what the model wrote
+        seen.script = readFileSync(join(work, 'scripts/gen-schema.sh'), 'utf8')
+        seen.modules = existsSync(join(work, 'node_modules')) // a clone has none: installed from nothing
       },
     }
     const t = await bench({
-      script: [writes(VITEST_ENTRY, 'FORGED vitest: always reports a pass\n', 'forge'), ...solve],
-      task: { recipes: [{ repoUrl: repo.url, prepare: ['npm install'], verify: 'npm test' }] },
-      docker: { prepare: [shell, shell], hidden: [vitestOfTheTree(atHidden)] },
+      script: [writes('scripts/gen-schema.sh', '#!/bin/sh\ntouch forged\n', 'script'), ...solve],
+      docker: { prepare: [{}, install], hidden: [hiddenPasses] },
     })
-    expect(t.result).toMatchObject({ status: 'verborgen_tests_rood', hidden: { pass: false } }) // not geslaagd
-    expect(atHidden.entry).toBe('REAL vitest\n')
-    expect(t.docker.runs[0].script).toBe(buildScript(['npm install'])) // the first prepare is the recipe, as it always was
-    expect(t.docker.runs[2].script).toBe(buildScript(['rm -rf node_modules', 'npm install']))
+    expect(t.result.status).toBe('geslaagd')
+    expect(seen).toEqual({ ref: true, tests: true, solution: false, script: '#!/bin/sh\n:\n', modules: false })
   })
 
-  it('runs the commands of the recipe in the same order after the removal of node_modules', async () => {
+  it('puts package-lock.json, npm-shrinkwrap.json and .npmrc back to the ref before the hidden check: the model cannot leave its own', async () => {
+    const seen: { lock?: string; shrinkwrap?: boolean; npmrc?: boolean } = {}
+    const hidden: DockerStep = {
+      onStart: ({ work }) => {
+        seen.lock = readFileSync(join(work, 'package-lock.json'), 'utf8')
+        seen.shrinkwrap = existsSync(join(work, 'npm-shrinkwrap.json'))
+        seen.npmrc = existsSync(join(work, '.npmrc'))
+      },
+      effect: hiddenPasses.effect,
+    }
+    const t = await bench({
+      script: [
+        writes('.npmrc', 'registry=https://registry.invalid/\n', 'npmrc'),
+        writes('npm-shrinkwrap.json', '{ "forged": true }\n', 'shrinkwrap'),
+        writes('package-lock.json', '{ "forged": true }\n', 'lock'),
+        ...solve,
+      ],
+      docker: { hidden: [hidden] },
+    })
+    const patch = fileText(t.runDir, 'patch.diff')
+    expect(patch).toContain('+++ b/.npmrc') // the premise: the model did write them, and the patch was taken before the restore
+    expect(patch).toContain('+++ b/npm-shrinkwrap.json')
+    expect(seen).toEqual({ lock: t.repo.at.b['package-lock.json'], shrinkwrap: false, npmrc: false }) // the ref has no .npmrc and no shrinkwrap
+    expect(t.result.status).toBe('geslaagd')
+    expect(timeline.indexOf('restore')).toBeLessThan(timeline.lastIndexOf('clone')) // the restore comes before the pristine clone
+  })
+
+  it('runs the commands of the recipe, in order and nothing else, on the pristine tree', async () => {
     const repo = await createBenchRepo()
     const prepare = ['npm ci', 'npm run prisma:generate'] // the recipe of scrum4me-mcp
     const t = await bench({ script: solve, task: { recipes: [{ repoUrl: repo.url, prepare, verify: 'npm test' }] }, docker: { hidden: [hiddenPasses] } })
@@ -971,52 +1148,30 @@ describe('runTaskBench — the dependencies are installed afresh before the hidd
     expect(t.docker.runs.map((r) => r.script)).toEqual([
       buildScript(prepare),
       buildScript(['npm test']),
-      buildScript(['rm -rf node_modules', ...prepare]), // the removal first, then every command of the recipe, in order
+      buildScript(prepare), // the same commands, nothing of the model's and no extra ones
       buildScript([hiddenCheckScript(['__tests__/b.test.ts'])]),
     ])
   })
 
-  it('puts package-lock.json, npm-shrinkwrap.json and .npmrc back to the ref before the reinstall: the model cannot choose what is installed', async () => {
-    const seen: { lock?: string; shrinkwrap?: boolean; npmrc?: boolean; restores?: number } = {}
-    const reinstall: DockerStep = {
-      onStart: ({ work }) => {
-        seen.lock = readFileSync(join(work, 'package-lock.json'), 'utf8')
-        seen.shrinkwrap = existsSync(join(work, 'npm-shrinkwrap.json'))
-        seen.npmrc = existsSync(join(work, '.npmrc'))
-        seen.restores = vi.mocked(restoreForHiddenCheck).mock.calls.length
-      },
+  describe('a clean install that does not succeed', () => {
+    const swap = () => vi.mocked(swapNodeModules)
+    /** The run ended at the install: the model run was fine, there is no verdict on the hidden tests, no hidden container, and the result is on disk. */
+    const endedAtTheInstall = (t: Awaited<ReturnType<typeof bench>>, containersStarted = 3) => {
+      expect(t.result).toMatchObject({ status: 'benchfout', runStatus: 'completed' })
+      expect(t.saved).toMatchObject({ status: 'benchfout', benchError: t.result.benchError })
+      expect(t.result.hidden).toBeUndefined()
+      expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare'].slice(0, containersStarted)) // no hidden container
+      expect(existsSync(join(t.runDir, 'hidden-vitest.json'))).toBe(false)
     }
-    const t = await bench({
-      script: [
-        writes('.npmrc', 'registry=https://registry.invalid/\n', 'npmrc'),
-        writes('npm-shrinkwrap.json', '{ "forged": true }\n', 'shrinkwrap'), // npm takes this one before package-lock.json
-        writes('package-lock.json', '{ "forged": true }\n', 'lock'),
-        ...solve,
-      ],
-      docker: { prepare: [{}, reinstall], hidden: [hiddenPasses] },
-    })
-    const patch = fileText(t.runDir, 'patch.diff')
-    expect(patch).toContain('+++ b/.npmrc') // the premise: the model did write them, and the patch was taken before the restore
-    expect(patch).toContain('+++ b/npm-shrinkwrap.json')
-    // the ref has no .npmrc and no shrinkwrap; the restore ran before the reinstall
-    expect(seen).toEqual({ lock: t.repo.at.b['package-lock.json'], shrinkwrap: false, npmrc: false, restores: 1 })
-    expect(t.result.status).toBe('geslaagd')
-    expect(vi.mocked(restoreForHiddenCheck)).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(capturePatch)).toHaveBeenCalledTimes(1) // and no host git follows the reinstall
-  })
 
-  describe('a reinstall that does not succeed', () => {
     it.each([
       ['is red', { code: 1, out: 'npm ERR! ECONNRESET' }, 'exitcode 1\nnpm ERR! ECONNRESET'],
       ['cannot run at all', { code: null, errorMessage: 'spawn docker ENOENT' }, 'docker-proces eindigde zonder exitcode: spawn docker ENOENT\n'],
-    ] as const)('is a benchfout of the bench when it %s, and no hidden container starts', async (_what, step, text) => {
+    ] as const)('is a benchfout of the bench when it %s, and nothing is taken over', async (_what, step, text) => {
       const t = await bench({ script: solve, docker: { prepare: [{}, step], hidden: [hiddenPasses] } })
-      expect(t.result).toMatchObject({ status: 'benchfout', runStatus: 'completed' }) // the model run itself was fine
-      expect(t.result.benchError).toBe(`herinstallatie vóór de verborgen toets faalde: ${text}`)
-      expect(t.saved).toMatchObject({ status: 'benchfout', benchError: t.result.benchError })
-      expect(t.result.hidden).toBeUndefined()
-      expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare']) // no hidden container
-      expect(existsSync(join(t.runDir, 'hidden-vitest.json'))).toBe(false)
+      expect(t.result.benchError).toBe(`schone installatie vóór de verborgen toets faalde: ${text}`)
+      endedAtTheInstall(t)
+      expect(swap()).not.toHaveBeenCalled()
     })
 
     it('is a benchfout of the bench when it runs into its timeout', async () => {
@@ -1027,18 +1182,76 @@ describe('runTaskBench — the dependencies are installed afresh before the hidd
           task.prepareTimeoutSeconds = 0.05 // the first prepare is done long before
         },
       })
-      expect(t.result.status).toBe('benchfout')
-      expect(t.result.benchError).toBe('herinstallatie vóór de verborgen toets faalde: timeout\n')
-      expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare'])
+      expect(t.result.benchError).toBe('schone installatie vóór de verborgen toets faalde: timeout\n')
+      endedAtTheInstall(t)
       expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-prepare-3`]) // and the container is cleaned up
+    })
+
+    it('is a benchfout of the bench when the pristine tree cannot be cloned, and no container follows', async () => {
+      const t = await start({ script: solve, docker: { hidden: [hiddenPasses] } })
+      const clone = vi.mocked(createWorkspace)
+      const real = clone.getMockImplementation()
+      if (!real) throw new Error('createWorkspace is not spied on')
+      clone.mockImplementationOnce(real).mockImplementationOnce(async () => {
+        throw new Error('fatal: unable to access the repository')
+      })
+      const result = await t.run()
+      const runDir = join(t.out, result.runId)
+      expect(result).toMatchObject({ status: 'benchfout', runStatus: 'completed', benchError: 'schone werkruimte aanmaken mislukt: fatal: unable to access the repository' })
+      expect(result.hidden).toBeUndefined()
+      expect(JSON.parse(readFileSync(join(runDir, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout' })
+      expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // no install, no hidden check
+      expect(swap()).not.toHaveBeenCalled()
+    })
+
+    it('is a benchfout naming the path when a container rewrote the submodule pointer of the pristine tree, and nothing is taken over', async () => {
+      const repo = await createBenchRepo()
+      const rewrites: DockerStep = { effect: ({ work }) => writeFileSync(join(work, repo.sub.path, '.git'), 'gitdir: /elsewhere\n') }
+      const t = await bench({ script: solve, docker: { prepare: [{}, rewrites], hidden: [hiddenPasses] } })
+      expect(t.result.benchError).toBe('git-administratie gewijzigd: changed: vendor/sub/.git')
+      endedAtTheInstall(t)
+      expect(swap()).not.toHaveBeenCalled()
+    })
+
+    it('is a benchfout of the bench when the install leaves no node_modules to take over, and the node_modules of the model is not removed', async () => {
+      const leavesNothing: DockerStep = { effect: ({ work }) => rmSync(join(work, 'node_modules'), { recursive: true, force: true }) }
+      const seen: { atHidden?: string } = {}
+      const t = await bench({
+        script: [writes(VITEST_ENTRY, 'FORGED vitest: always reports a pass\n', 'forge'), ...solve],
+        docker: { prepare: [{}, leavesNothing], hidden: [{ onStart: ({ work }) => (seen.atHidden = entryOf(work)) }] },
+      })
+      expect(t.result.benchError).toBe('node_modules van de schone installatie overnemen mislukt: de schone installatie heeft geen gewone map node_modules opgeleverd')
+      endedAtTheInstall(t)
+      expect(swap()).toHaveBeenCalledTimes(1)
+      expect(entryOf(modelTree(t.runDir))).toBe('FORGED vitest: always reports a pass\n') // untouched: nothing came to replace it, and the run is over
+    })
+
+    it('is a benchfout of the bench when taking node_modules over fails, with the cause', async () => {
+      const t = await start({ script: solve, docker: { hidden: [hiddenPasses] } })
+      swap().mockImplementationOnce(async () => {
+        throw new Error("EACCES: permission denied, rmdir 'node_modules/a/b'")
+      })
+      const result = await t.run()
+      const runDir = join(t.out, result.runId)
+      expect(result).toMatchObject({
+        status: 'benchfout',
+        runStatus: 'completed',
+        benchError: "node_modules van de schone installatie overnemen mislukt: EACCES: permission denied, rmdir 'node_modules/a/b'",
+      })
+      expect(result.hidden).toBeUndefined()
+      expect(JSON.parse(readFileSync(join(runDir, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout' })
+      expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare']) // the install ran; no hidden container follows
     })
   })
 
-  it('has nothing to install when the recipe has no prepare commands, and goes straight to the hidden check', async () => {
+  it('has nothing to install when the recipe has no prepare commands: no pristine tree, and the hidden check follows', async () => {
     const repo = await createBenchRepo()
     const t = await bench({ script: solve, task: { recipes: [{ repoUrl: repo.url, prepare: [], verify: 'npm test' }] }, docker: { hidden: [hiddenPasses] } })
     expect(t.result.status).toBe('geslaagd')
     expect(t.docker.runs.map((r) => r.purpose)).toEqual(['verify', 'hidden'])
+    expect(vi.mocked(createWorkspace)).toHaveBeenCalledTimes(1) // the tree of the model only
+    expect(vi.mocked(swapNodeModules)).not.toHaveBeenCalled()
+    expect(existsSync(join(t.runDir, 'ws-deps'))).toBe(false)
   })
 })
 

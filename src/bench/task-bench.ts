@@ -15,7 +15,7 @@ import type { BenchCase } from './case.js'
 import { BENCH_DIR, evaluateHidden, hiddenCheckScript, readHiddenReport, type HiddenReportRead, type HiddenResult } from './hidden-check.js'
 import { createRetryingClient, UnusableAnswerError, type RetryRecord } from './retry-client.js'
 import { BENCH_SYSTEM_PROMPT, benchTaskPrompt } from './task-prompt.js'
-import { AdminChangedError, assertAdminUnchanged, capturePatch, createWorkspace, git, isRunnerConfig, restoreForHiddenCheck, snapshotAdmin, type Workspace } from './workspace.js'
+import { AdminChangedError, assertAdminUnchanged, capturePatch, createWorkspace, git, isRunnerConfig, restoreForHiddenCheck, snapshotAdmin, swapNodeModules, type Workspace } from './workspace.js'
 
 export type ModelSpec = z.infer<typeof ModelSpecSchema>
 
@@ -76,10 +76,10 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
 // ---------------------------------------------------------------------------------------------------
 
 /**
- * What a container is for; it shows in the `container` event of the trace. `reinstall` is the prepare of the recipe once more, right
- * before the hidden check (see `runTaskBench`).
+ * What a container is for; it shows in the `container` event of the trace. `clean_install` is the prepare of the recipe on the pristine
+ * tree, right before the hidden check (see `runTaskBench`).
  */
-export type ContainerSource = 'prepare' | 'run_tests' | 'gate' | 'hidden_check' | 'reinstall'
+export type ContainerSource = 'prepare' | 'run_tests' | 'gate' | 'hidden_check' | 'clean_install'
 
 export type ContainerRunner = {
   /** Runs one container on the work tree `worktree`: a `prepare` or `verify` container with this script, which `signal` stops. Never starts one after an uncertain cleanup. */
@@ -141,8 +141,8 @@ export function createContainerRunner(o: { id: string; task: TaskConfig; trace: 
 
 /**
  * The hidden test run (spec §4.1 step 5): vitest with the JSON reporter on exactly `files`, in a verify container. The caller has put
- * `__tests__/` and the runner config back (`restoreForHiddenCheck`), and, for a work tree that a model has written to, has installed
- * the dependencies again (vitest is run from `node_modules`). `.task-bench` is removed first, so that the report can only
+ * `__tests__/` and the runner config back (`restoreForHiddenCheck`), and, for a work tree that a model has written to, has replaced its
+ * `node_modules` with a pristine install (`swapNodeModules`): vitest is run from there. `.task-bench` is removed first, so that the report can only
  * come from this container: a file the model run left there could otherwise be read as the verdict when vitest dies before it writes.
  * The report is read with `readHiddenReport`, which refuses whatever the container made of the path (a link, a FIFO): `report` says
  * what it found, and an `unsafe` one has no verdict (`hidden` is then only what no usable report gives). `hidden` is the verdict on
@@ -178,13 +178,6 @@ const TASK_TOOLS = ['list_files', 'read_file', 'write_file', 'edit_file', 'searc
 
 const STOPPED = 'afgebroken'
 
-/**
- * The first command of the reinstall before the hidden check. `npm ci` removes `node_modules` by itself, but a fresh install must not
- * depend on what the commands of a recipe do with a `node_modules` that is there (`npm install` trusts it, a vitest.mjs that the model
- * wrote included). Relative: the container runs in the work tree.
- */
-const REMOVE_NODE_MODULES = 'rm -rf node_modules'
-
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
 /** A failure of the bench itself, never of the model: it ends the run as a `benchfout`, and its message becomes the `benchError`. */
@@ -208,11 +201,13 @@ function withDroppedCost(usage: RunResult['usage'], costs: Array<number | undefi
  * patch, the hidden check with the tests of `ref_commit`. The result is in `<out>/<runId>/bench-result.json` on every path, also
  * when the bench itself failed or was stopped. Only a run dir that cannot be made throws.
  *
- * The hidden check does not trust what the model run left in the work tree. `__tests__/` and the runner config (the lockfile, either
- * `package-lock.json` or `npm-shrinkwrap.json`, and the `.npmrc` among it) go back from `ref_commit`, and the dependencies are installed
- * again in a container of its own (`reinstall`) before the hidden container: `node_modules` is removed, then the prepare commands of the
- * recipe run. vitest is run from `node_modules`, and the model can write there like anywhere in the work tree. `checkCase` does not do
- * this; it has no model run in its work trees.
+ * What the hidden check rests on, and what it does not. `__tests__/` and the runner config (`vitest.config.*`, `package.json`, the
+ * lockfile, either `package-lock.json` or `npm-shrinkwrap.json`, the `.npmrc` and `tsconfig*.json`) come back from `ref_commit`. The
+ * dependencies come from a pristine install at `ref_commit`: the prepare of the recipe runs on a second clone of it (`ws-deps`), which no
+ * file of the model run ever reached, and its `node_modules` (the generated Prisma client in it included) replaces the one in the work
+ * tree of the model (`swapNodeModules`). From the moment the model starts, its work tree is mounted only in verify containers, which have
+ * no network. Not isolated is the code under test: whatever else the model wrote in its work tree (`src/`, scripts, setup files) is what
+ * the hidden container runs. `checkCase` takes no such step; it has no model run in its work trees.
  *
  * A verify container that cannot run at all (`runnerError`: docker did not start, or its process ended without an exit code) is a failure
  * of the bench, not a red verify: the run is aborted and ends as a `benchfout` (`verify-container: <cause>`), where the worker counts
@@ -222,7 +217,8 @@ function withDroppedCost(usage: RunResult['usage'], costs: Array<number | undefi
  * containers are cleaned up. The run is then a `benchfout` with `benchError: "afgebroken"`, and is never scored.
  *
  * Host git runs only on a work tree whose git administration is as it was before the first container (the scan, `assertAdminUnchanged`);
- * a container that was not provably stopped ends the run before any host git.
+ * a container that was not provably stopped ends the run before any host git. The pristine clone is made late, but it is a new tree that
+ * no container has touched.
  */
 export async function runTaskBench(o: {
   case: BenchCase
@@ -385,7 +381,7 @@ export async function runTaskBench(o: {
     if (ended.status !== 'completed' || captured.empty) return
 
     // The hidden check, out of the model's sight: the tests and runner config of ref_commit go back first. The runner config includes
-    // package.json, the lockfile and .npmrc, which is what the dependencies are installed from just below.
+    // package.json, the lockfile and .npmrc: the pristine install below uses the ones of the ref, so the work tree has to hold them too.
     interrupted()
     await assertAdminUnchanged(ws, snap)
     await restoreForHiddenCheck(ws, c.ref_commit)
@@ -393,15 +389,32 @@ export async function runTaskBench(o: {
     // during them. A container that started anyway is killed at once, and a kill that is not provably done would be reported as a
     // benchfout of its own ("niet aantoonbaar gestopt") instead of afgebroken.
     interrupted()
-    // The hidden check runs vitest from node_modules, which is part of the work tree that the model could write to. So it does not use
-    // that one: node_modules is removed, and the prepare of the recipe runs again on the restored files, in a prepare container of its
-    // own. The removal is explicit, so that it does not depend on the commands of the recipe (npm ci would do it, npm install would not).
-    // No host git follows this container, so it needs no scan. An empty prepare list has nothing to run (buildScript([]) would end in a
-    // dangling &&), and then nothing was ever installed either.
+    // The hidden check runs vitest from node_modules, which lies in the work tree that the model could write to, and what fills it (the
+    // postinstall of the repo: scripts/, prisma/) lies there too. So the dependencies are neither taken from that tree nor installed in
+    // it. The prepare of the recipe runs on a second clone at ref_commit, which no file of the model run ever reached, with the network that
+    // a prepare has; its node_modules replaces the one of the model. From the moment the model started, its tree is mounted only in verify
+    // containers, which have none. Not isolated: the code under test, i.e. the rest of what the model wrote. An empty prepare list installs
+    // nothing, and then there is nothing to take over (buildScript([]) would end in a dangling &&).
     if (recipe.prepare.length > 0) {
-      const reinstall = await container('prepare', 'reinstall', buildScript([REMOVE_NODE_MODULES, ...recipe.prepare]), inner.signal)
-      interrupted() // a reinstall that the stop killed is no failed reinstall, and no hidden container starts after a stop
-      if (!isGreen(reinstall)) throw new BenchFault(`herinstallatie vóór de verborgen toets faalde: ${verifyText(reinstall)}`)
+      let clean: Workspace
+      try {
+        clean = await createWorkspace({ repoUrl: c.repo_url, commit: c.ref_commit, dir: join(trace.dir, 'ws-deps') })
+      } catch (err) {
+        throw new BenchFault(`schone werkruimte aanmaken mislukt: ${message(err)}`)
+      }
+      const cleanSnap = await snapshotAdmin(clean) // directly after the clone, before the container, as for every work tree
+      interrupted() // the clone cannot be aborted: no container is started once a stop has come
+      const install = await containers.run({ worktree: clean.work, kind: 'prepare', source: 'clean_install', script: buildScript(recipe.prepare), signal: inner.signal })
+      interrupted() // an install that the stop killed is no failed install, and nothing follows a stop
+      if (!isGreen(install)) throw new BenchFault(`schone installatie vóór de verborgen toets faalde: ${verifyText(install)}`)
+      // No host git follows on this tree, but what is taken over from it must not rest on a tree whose git administration a container changed.
+      await assertAdminUnchanged(clean, cleanSnap)
+      try {
+        await swapNodeModules({ from: clean, into: ws })
+      } catch (err) {
+        throw new BenchFault(`node_modules van de schone installatie overnemen mislukt: ${message(err)}`)
+      }
+      interrupted() // the swap cannot be aborted either: no hidden container starts after a stop
     }
     const check = await runHiddenCheck({ containers, work: ws.work, files: c.hidden_tests, signal: inner.signal })
     interrupted()
@@ -605,7 +618,7 @@ type Opened = { ws: Workspace; snap: GitAdminSnapshot }
  *    `ref_commit` put back, then the hidden tests. They must fail for real (`failsForReal`), not merely not pass.
  * 3. On `ref_commit`: prepare, the scan, and the hidden tests. They must pass.
  *
- * Unlike `runTaskBench`, the hidden tests run here without installing the dependencies again: no model has run in these work trees,
+ * Unlike `runTaskBench`, the hidden tests run here without a pristine install of the dependencies: no model has run in these work trees,
  * each of them was installed fresh by the prepare from the lockfile of its own commit, and a `ref_commit` that changes the lockfile or
  * the `.npmrc` (which would make the two differ) is a problem of its own (`refChangesRunnerConfig`, criterion 6).
  *
@@ -714,7 +727,7 @@ export async function checkCase(o: { case: BenchCase; task: TaskConfig; out: str
 
     await assertAdminUnchanged(base.ws, base.snap) // before the one host git that follows a container
     await restoreForHiddenCheck(base.ws, c.ref_commit)
-    // No reinstall here, unlike runTaskBench: no model ran in this work tree (see the doc comment above).
+    // No pristine install here, unlike runTaskBench: no model ran in this work tree (see the doc comment above).
     const onBase = await hiddenCheck(base)
     interrupted() // the uncertain flag first: what was read from an uncertain container is thrown away
     hiddenOnBase = recorded(onBase)

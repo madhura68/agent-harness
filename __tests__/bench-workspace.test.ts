@@ -12,6 +12,7 @@ import {
   isRunnerConfig,
   restoreForHiddenCheck,
   snapshotAdmin,
+  swapNodeModules,
   type ExecFileFn,
   type Workspace,
 } from '../src/bench/workspace.js'
@@ -442,6 +443,109 @@ describe('capturePatch', () => {
       expect(patch).toContain('+export const x = 42')
       expect(patch).not.toContain('EXPORT CONST')
     })
+  })
+})
+
+// The dependencies of the hidden check come from an install on a pristine clone of the ref, which the bench moves into the work tree of the
+// model run: the directory that the model could write to is replaced as a whole, and nothing else of the pristine tree comes over.
+describe('swapNodeModules', () => {
+  /** The two trees of a bench run: the work tree of the model run, and the pristine one that the dependencies were installed in. */
+  async function trees() {
+    const repo = await createBenchRepo()
+    const model = await createWorkspace({ repoUrl: repo.url, commit: repo.b, dir: benchTmp('model') })
+    const pristine = await createWorkspace({ repoUrl: repo.url, commit: repo.b, dir: benchTmp('pristine') })
+    return { model, pristine }
+  }
+
+  it('moves the node_modules of the pristine tree into the model tree, which loses everything it had there', async () => {
+    const { model, pristine } = await trees()
+    write(pristine, 'node_modules/vitest/vitest.mjs', 'REAL vitest\n')
+    write(pristine, 'node_modules/.bin/vitest', 'shim\n') // hidden entries travel too
+    write(model, 'node_modules/vitest/vitest.mjs', 'FORGED vitest\n')
+    write(model, 'node_modules/evil/index.js', 'module.exports = 1\n')
+
+    await swapNodeModules({ from: pristine, into: model })
+
+    expect(read(model, 'node_modules/vitest/vitest.mjs')).toBe('REAL vitest\n')
+    expect(read(model, 'node_modules/.bin/vitest')).toBe('shim\n')
+    expect(existsSync(join(model.work, 'node_modules/evil'))).toBe(false)
+    expect(existsSync(join(pristine.work, 'node_modules'))).toBe(false) // moved, not copied
+  })
+
+  it('works when the model tree has no node_modules at all', async () => {
+    const { model, pristine } = await trees()
+    write(pristine, 'node_modules/vitest/vitest.mjs', 'REAL vitest\n')
+    await swapNodeModules({ from: pristine, into: model })
+    expect(read(model, 'node_modules/vitest/vitest.mjs')).toBe('REAL vitest\n')
+  })
+
+  it('takes along what a generator wrote into node_modules (the Prisma client of scrum4me-mcp), and nothing from outside it', async () => {
+    const { model, pristine } = await trees()
+    write(pristine, 'node_modules/.prisma/client/index.js', 'generated\n')
+    write(pristine, 'prisma/schema.prisma', 'written by the postinstall of the pristine tree\n') // outside node_modules
+    write(model, 'prisma/schema.prisma', 'of the model\n')
+
+    await swapNodeModules({ from: pristine, into: model })
+
+    expect(read(model, 'node_modules/.prisma/client/index.js')).toBe('generated\n')
+    expect(read(model, 'prisma/schema.prisma')).toBe('of the model\n') // nothing else of the pristine tree comes over
+    expect(read(pristine, 'prisma/schema.prisma')).toBe('written by the postinstall of the pristine tree\n')
+  })
+
+  it('removes a node_modules of the model that is a symlink, and a link inside it, without following them', async () => {
+    const { model, pristine } = await trees()
+    const outside = benchTmp('outside')
+    writeFileSync(join(outside, 'bewaar.txt'), 'blijft staan')
+    const other = benchTmp('other')
+    writeFileSync(join(other, 'ook.txt'), 'blijft ook staan')
+    symlinkSync(outside, join(model.work, 'node_modules'))
+    write(pristine, 'node_modules/vitest/vitest.mjs', 'REAL vitest\n')
+
+    await swapNodeModules({ from: pristine, into: model })
+
+    expect(lstatSync(join(model.work, 'node_modules')).isSymbolicLink()).toBe(false)
+    expect(read(model, 'node_modules/vitest/vitest.mjs')).toBe('REAL vitest\n')
+    expect(readdirSync(outside)).toEqual(['bewaar.txt']) // what the link pointed at is as it was
+
+    // the same with a link inside a real node_modules, which the next swap removes
+    const second = await trees()
+    mkdirSync(join(second.model.work, 'node_modules'))
+    symlinkSync(other, join(second.model.work, 'node_modules/link'))
+    write(second.pristine, 'node_modules/vitest/vitest.mjs', 'REAL vitest\n')
+    await swapNodeModules({ from: second.pristine, into: second.model })
+    expect(existsSync(join(second.model.work, 'node_modules/link'))).toBe(false)
+    expect(readFileSync(join(other, 'ook.txt'), 'utf8')).toBe('blijft ook staan')
+  })
+
+  it('rejects, and touches neither tree, when the pristine tree has no node_modules directory', async () => {
+    const { model, pristine } = await trees()
+    write(model, 'node_modules/vitest/vitest.mjs', 'FORGED vitest\n')
+    await expect(swapNodeModules({ from: pristine, into: model })).rejects.toThrow(/geen gewone map node_modules/)
+    expect(read(model, 'node_modules/vitest/vitest.mjs')).toBe('FORGED vitest\n') // nothing was removed: there is nothing to replace it with
+  })
+
+  it('rejects for a node_modules in the pristine tree that is a symlink: only a real directory is taken over', async () => {
+    const { model, pristine } = await trees()
+    const outside = benchTmp('outside')
+    symlinkSync(outside, join(pristine.work, 'node_modules'))
+    write(model, 'node_modules/vitest/vitest.mjs', 'FORGED vitest\n')
+    await expect(swapNodeModules({ from: pristine, into: model })).rejects.toThrow(/geen gewone map node_modules/)
+    expect(read(model, 'node_modules/vitest/vitest.mjs')).toBe('FORGED vitest\n')
+  })
+
+  // As root the permission bits do not stop the removal, so the failure cannot be made.
+  it.skipIf(process.getuid?.() === 0)('rejects, and leaves the pristine node_modules where it was, when the old one cannot be removed', async () => {
+    const { model, pristine } = await trees()
+    write(model, 'node_modules/a/b/c/x.js', 'x\n')
+    write(pristine, 'node_modules/vitest/vitest.mjs', 'REAL vitest\n')
+    const stuck = join(model.work, 'node_modules/a/b')
+    chmodSync(stuck, 0o000) // what code of the model in a verify container could leave behind
+    try {
+      await expect(swapNodeModules({ from: pristine, into: model })).rejects.toThrow()
+      expect(read(pristine, 'node_modules/vitest/vitest.mjs')).toBe('REAL vitest\n') // not moved
+    } finally {
+      chmodSync(stuck, 0o755) // so that the fixture dirs can be removed
+    }
   })
 })
 

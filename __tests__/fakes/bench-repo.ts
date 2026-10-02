@@ -49,6 +49,8 @@ export async function fixtureGit(cwd: string, args: string[]): Promise<string> {
 const CONFIG = ['[user]', '\tname = Bench Fixture', '\temail = bench-fixture@example.com', '[init]', '\tdefaultBranch = main', ''].join('\n')
 
 const FILES_A: Record<string, string> = {
+  // A stand-in for the generator that the postinstall of a repo runs (scrum4me-mcp: `bash scripts/gen-schema.sh …`). It touches nothing.
+  'scripts/gen-schema.sh': '#!/bin/sh\n:\n',
   'package-lock.json': '{ "name": "bench-fixture", "lockfileVersion": 3, "requires": true, "packages": {} }\n',
   'src/x.ts': 'export const x = 1\n',
   '__tests__/a.test.ts': "import { expect, it } from 'vitest'\nimport { x } from '../src/x.js'\n\nit('x is 1', () => {\n  expect(x).toBe(1)\n})\n",
@@ -66,11 +68,12 @@ export type BenchRepo = {
   /** `file://` URL of the fixture origin: what the bench takes as `repoUrl`. */
   url: string
   /**
-   * Commit A, the base: `src/x.ts`, `__tests__/a.test.ts`, `vitest.config.ts`, `package-lock.json` and the submodule `sub.path`, pinned
-   * at `sub.pinned`. There is no `package.json` and no `.npmrc`: a test that wants the restore to bring either back builds an origin of its own.
+   * Commit A, the base: `src/x.ts`, `__tests__/a.test.ts`, `vitest.config.ts`, `package-lock.json`, `scripts/gen-schema.sh` and the
+   * submodule `sub.path`, pinned at `sub.pinned`. There is no `package.json` and no `.npmrc`: a test that wants the restore to bring either
+   * back builds an origin of its own.
    */
   a: string
-  /** Commit B, the ref: A plus `src/y.ts`, `__tests__/b.test.ts` and a changed `__tests__/a.test.ts`. The gitlink and the lockfile stay the same. */
+  /** Commit B, the ref: A plus `src/y.ts`, `__tests__/b.test.ts` and a changed `__tests__/a.test.ts`. The gitlink, the lockfile and the script stay the same. */
   b: string
   /** The content of every plain file (path relative to the repo root) at commit A and at commit B. */
   at: { a: Record<string, string>; b: Record<string, string> }

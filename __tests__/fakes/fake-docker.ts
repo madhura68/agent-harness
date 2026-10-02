@@ -1,3 +1,5 @@
+import { existsSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import type { SpawnFn } from '../../src/worker/containers.js'
 
@@ -27,7 +29,11 @@ export type DockerStep = {
   delayMs?: number
   /** Runs at once when the container starts, with the container in hand. For a test that wants to act "while it runs". */
   onStart?: (run: DockerRun) => void
-  /** The work the container does in the work tree; it runs just before a container that does not hang ends. */
+  /**
+   * The work the container does in the work tree; it runs just before a container that does not hang ends. A `prepare` container has
+   * installed by then: it leaves a `node_modules` in its work tree, when that exists (an install does, and the bench takes it over from a
+   * pristine install), so an effect that wants none removes it again.
+   */
   effect?: (run: DockerRun) => void
 }
 
@@ -67,7 +73,10 @@ function fakeChild(step: DockerStep, run?: DockerRun): FakeChild {
   }
   if (!step.hang) {
     const settle = () => {
-      if (run) step.effect?.(run)
+      if (run) {
+        if (run.purpose === 'prepare' && existsSync(run.work)) mkdirSync(join(run.work, 'node_modules'), { recursive: true })
+        step.effect?.(run)
+      }
       finish(step.code === undefined ? 0 : step.code)
     }
     if (step.delayMs) setTimeout(settle, step.delayMs)

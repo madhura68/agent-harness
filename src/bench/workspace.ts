@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdir, readdir, rm } from 'node:fs/promises'
+import { lstat, mkdir, readdir, rename, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { diffGitAdmin, SAFE_GIT_CONFIG, snapshotGitAdmin, type GitAdminSnapshot } from '../worker/host-git.js'
@@ -131,10 +131,10 @@ export async function capturePatch(ws: Workspace, base: string): Promise<{ patch
 }
 
 // What the hidden check takes from the ref commit: the whole `__tests__/` and the runner configuration in the root (spec §4.1 step 5).
-// `package-lock.json`, `npm-shrinkwrap.json` and `.npmrc` are part of it because the hidden check installs the dependencies again after
-// this restore (runTaskBench): what npm installs, and from which registry, is decided by those files and `package.json`, and the model
-// must not be the one who decides it. `npm-shrinkwrap.json` is a lockfile like the other, and when both are there npm uses it and ignores
-// `package-lock.json`: restoring only the one would leave the model a way to choose.
+// `package-lock.json`, `npm-shrinkwrap.json` and `.npmrc` are part of it because they decide what npm installs and from which registry,
+// and the `node_modules` that the hidden check runs with comes from an install on the ref (runTaskBench, `swapNodeModules`): the work
+// tree has to hold the same files, and the ref may not change them (criterion 6: no new dependency). `npm-shrinkwrap.json` is a lockfile
+// like the other, and when both are there npm uses it and ignores `package-lock.json`: restoring only the one would leave a way to differ.
 const ROOT_CONFIG = /^(vitest\.config\..+|package\.json|package-lock\.json|npm-shrinkwrap\.json|\.npmrc|tsconfig.*\.json)$/
 /**
  * Whether `name`, a name in the root of the repo, is runner configuration (`vitest.config.*`, `package.json`, `package-lock.json`,
@@ -149,7 +149,7 @@ const isRestored = (name: string): boolean => name === '__tests__' || isRunnerCo
  * `.npmrc`, `tsconfig*.json` in the root) exactly back to their state in `ref`, so that nothing the model did to tests or configuration
  * can change what the hidden check proves. Files the model added there are gone (an `.npmrc` or `npm-shrinkwrap.json` that `ref` does
  * not have among them), and files it deleted are back. Everything else in the work tree stays as the model left it, `node_modules`
- * included: the caller installs that again.
+ * included: the caller replaces that one with a pristine install (`swapNodeModules`).
  * After a container, run `assertAdminUnchanged` first.
  */
 export async function restoreForHiddenCheck(ws: Workspace, ref: string): Promise<void> {
@@ -161,4 +161,27 @@ export async function restoreForHiddenCheck(ws: Workspace, ref: string): Promise
   const keep = (await git(ws, ['ls-tree', '-z', '--name-only', ref])).split('\0').filter(isRestored)
   // 3. Check it out.
   if (keep.length > 0) await git(ws, ['checkout', ref, '--', ...keep])
+}
+
+/**
+ * Takes the `node_modules` of `o.from` over into `o.into`: the one that `o.into` has is removed, and the one of `o.from` is moved there
+ * with a rename, so both work trees have to be on the same file system. `o.from` is a pristine tree (a clone of the ref that a prepare
+ * container installed the dependencies in), `o.into` the work tree of a model run: whatever the model put in its `node_modules` is gone,
+ * and nothing of `o.into` is read, run or copied. The removal unlinks a symlink, also one inside, instead of following it. Nothing else of
+ * `o.from` moves, so what a generator wrote into `node_modules` (the Prisma client of scrum4me-mcp: `node_modules/.prisma/client`) comes
+ * along, and nothing outside it does.
+ *
+ * Rejects when `o.from` has no real directory `node_modules` (a symlink is none), before anything of `o.into` is removed; a removal or a
+ * rename that fails rejects too. After either, the caller ends the run: it does not use the work tree again.
+ */
+export async function swapNodeModules(o: { from: Workspace; into: Workspace }): Promise<void> {
+  const source = join(o.from.work, 'node_modules')
+  const found = await lstat(source).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return undefined
+    throw err
+  })
+  if (!found?.isDirectory()) throw new Error('de schone installatie heeft geen gewone map node_modules opgeleverd')
+  const target = join(o.into.work, 'node_modules')
+  await rm(target, { recursive: true, force: true })
+  await rename(source, target)
 }
