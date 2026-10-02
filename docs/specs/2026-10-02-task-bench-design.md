@@ -1,8 +1,8 @@
 ---
 title: "Agent-harness M7 — Qwen 3.8 voor een 96 GB-machine op echt werk (task-bench)"
-status: draft
+status: reviewed
 last_updated: 2026-10-02
-revision: 4
+revision: 5
 ---
 
 # Agent-harness M7 — Qwen 3.8 voor een 96 GB-machine op echt werk (task-bench)
@@ -121,9 +121,15 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
   - **De gate** is gelijk aan die in `runTaskJob`. `afterAnswer` draait `recipe.verify`, met `maxVerifyRepairs` pogingen en dezelfde tekst bij rood. `isGreen` en `verifyText` worden geëxporteerd, zonder gedragswijziging, en de bench gebruikt ze. Net als `runTaskJob` houdt de bench lopende containers bij. Meldt `runInContainer` dat een container niet aantoonbaar is opgeruimd (`cleanup: 'uncertain'`), dan stopt de run en is het een `benchfout`.
 - **Herhalen bij storingen, alleen op de gehoste route.**
   - De bench geeft `runManifest` een modelclient die een verzoek bij een tijdelijke fout tot 3 keer opnieuw doet. Tijdelijk is: een netwerkfout, HTTP 408, 429 of 5xx, of een foutbody van OpenRouter met zo'n code.
+  - **Herkenning:** de bench stelt de foutsoort vast op een gesaneerde code (HTTP-status, of de code uit de foutbody). Die code bepaalt hij vóór het maskeren en inkorten van de melding, niet uit afgekapte tekst.
+  - **Afgebroken signaal:** een netwerkfout telt alleen als tijdelijk zolang het signaal van de run niet is afgebroken. Na een afbreking, door de deadline of een stop, herhaalt de bench nooit.
+  - Alle andere fouten blijven direct een fout: ongeldige JSON van het model, tool- of schemafouten en rode tests.
   - Tussen de pogingen zit een oplopende wachttijd, binnen `maxWallSeconds`.
   - Elke herhaling staat in de trace en in de resultaat-JSON. Pas als de herhalingen op zijn, eindigt de run op `MODEL_ERROR`, en dus op een benchfout.
-  - Met de 16-bit-route is er maar één aanbieder (§4.3), en de modelclient zelf herhaalt niet (§3). Zonder deze herhaling zou een losse storing bij DeepInfra (uptime 98,45% over een dag) ongeveer een op de drie runs als benchfout laten eindigen.
+  - **Waarom:** met de 16-bit-route is er maar één aanbieder (§4.3), en de modelclient zelf herhaalt niet (§3).
+    - Zonder herhaling doet een losse storing een hele taak opnieuw draaien.
+    - Een scenario met onafhankelijke fouten per verzoek (98,45% succes, de uptime van DeepInfra over een dag, en 25 verzoeken per run) geeft zonder herhaling ongeveer een op de drie runs als benchfout.
+    - Echte storingen kunnen samenhangen; het getal is een illustratie, geen meting.
   - Voor `gsq-lokaal` staat het uit, zoals in productie: daar kan een fout van Ollama ook modelgedrag zijn.
 - **De taakconfig** is een kopie van het `task`-blok uit `worker.json`: limieten, image, uid/gid, npm-cache, `maxVerifyRepairs` en recepten. Zo meet de bench met precies de grenzen van productie.
 - **Verloop per run:**
@@ -242,7 +248,7 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
      - een gate-test gelijk aan die van de worker;
      - de prompttests uit §4.1;
      - de verborgen toets, met een test die laat zien dat een aangepaste runnerconfig of een weggehaalde test niet als geslaagd telt;
-     - het herhalen bij storingen: alleen tijdelijke fouten, hooguit 3 keer, binnen de deadline, en alleen op de gehoste route.
+     - het herhalen bij storingen: alleen tijdelijke fouten, hooguit 3 keer, binnen de deadline, nooit na een afgebroken signaal, en alleen op de gehoste route.
    - De PR in agent-harness; JP merget.
    - Op max2 de worktree `~/Development/agent-harness-m7` met `npm ci` en een build.
    - Eén taak met de hand gekozen en gecontroleerd volgens §4.2.
@@ -294,7 +300,10 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
   - Valt DeepInfra langer weg of verandert hij van precisie, dan worden het benchfouten en een stop voor JP, geen run op een andere precisie.
   - Een herhaling kan ook een fout verbergen die door de uitvoer van het model komt. Daarom toont het rapport de herhalingen per taak.
 - **Gehost is niet herhaalbaar.** Eén run per taak is een steekproef; een tweede run past niet in het budget.
-- **Storingen bij aanbieders.** Een 429 of 5xx eindigt een run meteen als `MODEL_ERROR`, want de modelclient herhaalt niet. §4.1 maakt daar een benchfout van, met één herhaling en daarna een stop voor JP. Zo bepaalt een storing het oordeel niet.
+- **Storingen bij aanbieders.** De modelclient zelf herhaalt niet.
+  - Op de gehoste route herhaalt de bench een verzoek bij een 429 of 5xx tot 3 keer (§4.1). Pas daarna eindigt de run als `MODEL_ERROR`.
+  - Dat is een benchfout. Daarvoor geldt de regel van één herhaling van de hele taak, en daarna een stop voor JP.
+  - Zo bepaalt een storing het oordeel niet.
 - **Verborgen tests kunnen te streng zijn,** als ze toevallige details van de oude oplossing toetsen. Criterium 4 in §4.2 beperkt dat. Het rapport toont bij elk `verborgen_tests_rood` de falende tests, zodat JP het kan beoordelen.
 - **Lekken.** De commits zijn van augustus tot oktober 2026 en staan in privérepo's, dus de kans dat ze in de training van Qwen 3.8 zaten is klein. De docs-store van nu valt weg (§4.1), en criterium 5 sluit plannen uit die de oplossing al bevatten.
 - **Geen doc-tools** maakt de bench iets strenger dan productie, voor beide modellen gelijk.
@@ -392,3 +401,21 @@ Fix in §4.1 en §4.3: een begrensde herhaling in de bench, alleen op de gehoste
 - herhaling: vastlopen.
 
 Geen enkele toevoeging is een nieuw subsysteem. Weg kan alleen de aparte scorer, en die mag al een functie in het run-script zijn. Het eerste resultaat en de praktijkproef staan nog in increment 1.
+
+### Ronde 4 (2026-10-02, rev 4 `9eb1a78`): dubbel GO
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 1 MINOR, GO) en `mac:codex` (0 BLOCKER, 0 MAJOR, 2 MINOR, GO). Beide zagen de fix van ronde 3 als gehouden, en geen van beide vond een regressie.
+- Beide vinden de herhaling, alleen op de gehoste route, eerlijk tussen de modellen: een tijdelijke fout telt voor geen van beide als modelfout.
+- Beide onderschrijven de omvangtoets.
+
+**Verwerkt na het dubbele GO** (rev 5, niet opnieuw gereviewd; alleen verduidelijkingen binnen de goedgekeurde opzet):
+- **Claude MINOR, de herkenning in §4.1:**
+  - de foutsoort volgt uit een gesaneerde code die vóór het maskeren en inkorten wordt bepaald;
+  - na een afgebroken signaal (deadline of stop) wordt nooit herhaald;
+  - andere fouten blijven direct een fout;
+  - de unittest in §4.7 dekt het afgebroken geval.
+  - Dit dekt ook de implementatienoot van codex over de afgekapte foutbody.
+- **Codex MINOR 1:** de percentages in §4.1 zijn nu een scenario met onafhankelijke fouten, geen meting. De herhaling is vooral nodig om te voorkomen dat een losse storing een hele taak opnieuw laat draaien. De getallen in het verslag van ronde 3 hierboven horen bij dat scenario.
+- **Codex MINOR 2:** §6 beschrijft nu de herhaling in de bench vóór `MODEL_ERROR`.
+
+**Status:** de spec is `reviewed` in revisie 5. Een technisch GO autoriseert geen plan, uitvoering, venster, merge of deployment.
