@@ -573,6 +573,71 @@ describe('harness task-bench', () => {
     expect(existsSync(f.out)).toBe(false)
   })
 
+  // --extra-body-file belongs to probe. harness run and harness worker refuse it; task-bench used to read it into nothing, so every
+  // request could go out without the provider block (no 16-bit pin, no data_collection: deny) while the operator thought it was there.
+  it('refuses --extra-body-file as a usage error: it only applies to probe, before the bench is loaded and before anything is created', async () => {
+    const f = benchFiles()
+    const file = writeJson(join(f.out, '..'), 'extra.json', extraBody)
+    const runTaskBench = vi.fn(async (_o: unknown) => resultOf('geslaagd'))
+    const run = await freshMain({ runTaskBench })
+    const { code, stdout, stderr } = await runMain(benchArgs(f, { extra: ['--extra-body-file', file] }), run)
+    expect(code).toBe(1)
+    expect(stderr).toContain('--extra-body-file only applies to harness probe')
+    expect(stderr).toContain('for harness task-bench put extraBody in the --model-config file (extraBody)')
+    expect(stderr).toContain('Usage:') // printed by a UsageError, like every other wrong invocation
+    expect(stdout).toBe('')
+    expect(runTaskBench).not.toHaveBeenCalled()
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  // The schema of the model block strips a key it does not know. A typo such as extra_body would silently send every request without
+  // the provider block, so task-bench reads its model config strictly. The shared schema is not strict: run and worker are unchanged.
+  it.each(['extra_body', 'extrabody', 'reasoning_effort', 'temperature', 'model'])(
+    'refuses the key %s in the model config, which the model spec does not know, naming the file and the key',
+    async (key) => {
+      const f = benchFiles({ model: { ...validModel, [key]: { provider: { data_collection: 'deny' } } } })
+      const runTaskBench = vi.fn(async (_o: unknown) => resultOf('geslaagd'))
+      const run = await freshMain({ runTaskBench })
+      const { code, stderr } = await runMain(benchArgs(f), run)
+      expect(code).toBe(1)
+      expect(stderr).toContain(f.model)
+      expect(stderr).toContain(`"${key}"`)
+      expect(runTaskBench).not.toHaveBeenCalled()
+      expect(existsSync(f.out)).toBe(false)
+    },
+  )
+
+  it('names every unknown key of the model config at once', async () => {
+    const f = benchFiles({ model: { ...validModel, extra_body: {}, temperature: 0 } })
+    const { code, stderr } = await runMain(benchArgs(f))
+    expect(code).toBe(1)
+    expect(stderr).toContain('"extra_body"')
+    expect(stderr).toContain('"temperature"')
+  })
+
+  it('still takes every key of the model spec: baseUrl, name, reasoningEffort and extraBody reach the bench as they are', async () => {
+    const model = {
+      ...validModel,
+      reasoningEffort: 'low',
+      extraBody: { provider: { data_collection: 'deny', require_parameters: true, quantizations: ['bf16', 'fp16'] }, reasoning: { effort: 'medium' } },
+    }
+    const f = benchFiles({ model })
+    const runTaskBench = vi.fn(async (_o: unknown) => resultOf('geslaagd'))
+    const run = await freshMain({ runTaskBench })
+    const { code } = await runMain(benchArgs(f), run)
+    expect(code).toBe(0)
+    expect(runTaskBench.mock.calls[0][0]).toMatchObject({ model })
+  })
+
+  it('still refuses the rules of extraBody under the strict read: a reserved key in it is refused with its path', async () => {
+    const f = benchFiles({ model: { ...validModel, extraBody: { max_tokens: 1 } } })
+    const { code, stderr } = await runMain(benchArgs(f))
+    expect(code).toBe(1)
+    expect(stderr).toContain(f.model)
+    expect(stderr).toContain('extraBody')
+    expect(stderr).toContain('"max_tokens"')
+  })
+
   it.each([
     ['the model config', 'model', { baseUrl: 'geen url', name: '' }, ['baseUrl', 'name']],
     ['the task config', 'task', { ...validTask, uid: -1, recipes: [] }, ['uid', 'recipes']],

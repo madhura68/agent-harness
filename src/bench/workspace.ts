@@ -18,7 +18,7 @@ export type Workspace = { work: string; gitdir: string }
 export type ExecFileFn = (
   file: string,
   args: string[],
-  options: { cwd?: string; maxBuffer: number; encoding: 'utf8' },
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; maxBuffer: number; encoding: 'utf8' },
 ) => Promise<{ stdout: string; stderr: string }>
 
 const defaultExec: ExecFileFn = (file, args, options) => execFileAsync(file, args, options)
@@ -26,9 +26,30 @@ const defaultExec: ExecFileFn = (file, args, options) => execFileAsync(file, arg
 // A patch of a binary file can be large; exceeding this throws instead of cutting the output off.
 const MAX_BUFFER = 64 * 1024 * 1024
 
+/**
+ * The env of the bootstrap clone: the process env, which a clone over https needs (`GIT_ASKPASS` and friends) and which holds the git
+ * config of the user (on the bench host the credential helper for the forge that agent-harness is cloned from), without the API key of
+ * a hosted window. No git child, nor a hook, filter or credential helper that it starts, has any use for that key.
+ */
+function cloneEnv(): NodeJS.ProcessEnv {
+  const { OPENROUTER_API_KEY: _key, ...env } = process.env
+  return env
+}
+
+/**
+ * The env of every git call after the clone: `cloneEnv()` with the global and the system git config switched off, the way
+ * `gitEnv()` of host-git.ts does it. Those calls are all local, so nothing of the user's config (an external diff, a textconv filter,
+ * colour, a credential helper) can change what they do or say. The rest of the process env stays; `gitEnv()` itself keeps only `PATH`
+ * and `HOME`, which is too little for the tests (they hand git `GIT_ALLOW_PROTOCOL`) and for a submodule update over https.
+ */
+function localGitEnv(): NodeJS.ProcessEnv {
+  return { ...cloneEnv(), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }
+}
+
 async function gitVia(exec: ExecFileFn, ws: Workspace, args: string[]): Promise<string> {
   const { stdout } = await exec('git', [...SAFE_GIT_CONFIG, '--git-dir', ws.gitdir, '--work-tree', ws.work, ...args], {
     cwd: ws.work,
+    env: localGitEnv(),
     maxBuffer: MAX_BUFFER,
     encoding: 'utf8',
   })
@@ -40,7 +61,7 @@ async function gitVia(exec: ExecFileFn, ws: Workspace, args: string[]): Promise<
  * via `execFile` with `cwd` the work tree, and resolves to its stdout. The explicit git dir means git never goes looking for
  * `work/.git`, which the container can have rewritten; the safe flags switch off hooks, fsmonitor and submodule recursion. Neither
  * of the two is the real control. The scan is (`snapshotAdmin` / `assertAdminUnchanged`), and it must run before this after every
- * container. The env is the process env, on purpose: a clone over https needs `GIT_ASKPASS` and friends.
+ * container. The env is the process env without `OPENROUTER_API_KEY` and without the global and system git config (`localGitEnv`).
  */
 export function git(ws: Workspace, args: string[]): Promise<string> {
   return gitVia(defaultExec, ws, args)
@@ -52,8 +73,9 @@ export function git(ws: Workspace, args: string[]): Promise<string> {
  * at the gitdir. Git itself refuses a `dir` that already holds a `work` or `gitdir`, so a workspace is never reused.
  *
  * The clone is the one git call that runs without `--git-dir`/`--work-tree` (with them it fails: "work already exists"); it still
- * has `SAFE_GIT_CONFIG`. Every call after it goes through the same path as `git()`. `deps.execFile` replaces the real `execFile` in
- * tests; production passes nothing.
+ * has `SAFE_GIT_CONFIG`. It is also the one call that keeps the git config of the user (`cloneEnv`): every call after it goes
+ * through the same path as `git()`, which is local and runs without it. `deps.execFile` replaces the real `execFile` in tests;
+ * production passes nothing.
  */
 export async function createWorkspace(o: { repoUrl: string; commit: string; dir: string }, deps: { execFile?: ExecFileFn } = {}): Promise<Workspace> {
   const exec = deps.execFile ?? defaultExec
@@ -62,6 +84,7 @@ export async function createWorkspace(o: { repoUrl: string; commit: string; dir:
   await mkdir(dir, { recursive: true })
   await exec('git', [...SAFE_GIT_CONFIG, 'clone', '--no-checkout', '--separate-git-dir', ws.gitdir, o.repoUrl, ws.work], {
     cwd: dir,
+    env: cloneEnv(),
     maxBuffer: MAX_BUFFER,
     encoding: 'utf8',
   })
@@ -98,11 +121,12 @@ export async function assertAdminUnchanged(ws: Workspace, snap: GitAdminSnapshot
 /**
  * The work done in the work tree as a patch against `base`: everything staged with `add -A` (new, changed and deleted files,
  * binary files included) except `.task-bench/`. `empty` is true when there is no change at all. After a container, run
- * `assertAdminUnchanged` first.
+ * `assertAdminUnchanged` first. The diff is the plain patch whatever the environment asks of git: no external diff program, no
+ * textconv filter, no colour.
  */
 export async function capturePatch(ws: Workspace, base: string): Promise<{ patch: string; empty: boolean }> {
   await git(ws, ['add', '-A', '--', '.', `:(exclude)${BENCH_DIR}`])
-  const patch = await git(ws, ['diff', '--cached', '--binary', base])
+  const patch = await git(ws, ['diff', '--cached', '--binary', '--no-ext-diff', '--no-textconv', '--no-color', base])
   return { patch, empty: patch.length === 0 }
 }
 

@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { afterAll, afterEach, describe, expect, it } from 'vitest'
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import {
   AdminChangedError,
   assertAdminUnchanged,
@@ -16,6 +16,7 @@ import {
 } from '../src/bench/workspace.js'
 import { SAFE_GIT_CONFIG, snapshotGitAdmin } from '../src/worker/host-git.js'
 import { benchTmp, cleanupBenchFixtures, createBenchRepo, disposeBenchRepo, fixtureGit, type BenchRepo } from './fakes/bench-repo.js'
+import { DUMMY_KEY } from './helpers.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -67,6 +68,33 @@ describe('createWorkspace', () => {
     // argv to the git binary, never a shell
     expect(calls.every((c) => c.file === 'git')).toBe(true)
     expect(calls.every((c) => !('shell' in c.options))).toBe(true)
+  })
+
+  // The clone is the one call that needs the git config of the user (on the bench host it holds the credential helper for the forge that
+  // agent-harness is cloned from). Everything after it is local, so it runs without that config, and no git child ever gets the API key.
+  it('gives the clone the process env minus the API key, and every later call that env without the git config of the user', async () => {
+    const repo = await createBenchRepo()
+    vi.stubEnv('OPENROUTER_API_KEY', DUMMY_KEY) // as in a hosted window
+    const calls: Array<{ args: string[]; options: Parameters<ExecFileFn>[2] }> = []
+    const spy: ExecFileFn = (file, args, options) => {
+      calls.push({ args: [...args], options })
+      return execFileAsync(file, args, options)
+    }
+
+    await createWorkspace({ repoUrl: repo.url, commit: repo.a, dir: benchTmp('ws') }, { execFile: spy })
+
+    expect(calls.length).toBeGreaterThanOrEqual(3)
+    const [clone, ...later] = calls
+    expect(clone.options.env).toBeDefined()
+    expect(clone.options.env).not.toHaveProperty('OPENROUTER_API_KEY')
+    expect(clone.options.env?.GIT_CONFIG_GLOBAL).toBe(process.env.GIT_CONFIG_GLOBAL) // the config of the user stays for the clone
+    expect(clone.options.env?.GIT_ALLOW_PROTOCOL).toBe('file') // and so does the rest of the process env
+    for (const c of later) {
+      const label = c.args.join(' ')
+      expect(c.options.env, label).toBeDefined()
+      expect(c.options.env, label).not.toHaveProperty('OPENROUTER_API_KEY')
+      expect(c.options.env, label).toMatchObject({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_ALLOW_PROTOCOL: 'file' })
+    }
   })
 
   it('makes <dir>/work and <dir>/gitdir, with work/.git a file that points outside the work tree', async () => {
@@ -146,6 +174,30 @@ describe('git', () => {
     const { repo, ws } = await setup()
     expect((await git(ws, ['rev-parse', 'HEAD'])).trim()).toBe(repo.a)
     await expect(git(ws, ['rev-parse', '--verify', '--quiet', 'refs/heads/nope'])).rejects.toThrow()
+  })
+
+  // A shell alias runs in the env that git hands to its children, so it shows what the real child got. It prints the four variables
+  // under test and nothing else: a failing run must not print the whole environment of whoever runs the tests.
+  it('runs git without the API key, with the global and system git config switched off, and with the rest of the process env', async () => {
+    const { ws } = await setup()
+    vi.stubEnv('OPENROUTER_API_KEY', DUMMY_KEY) // as in a hosted window
+    const names = ['OPENROUTER_API_KEY', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_ALLOW_PROTOCOL']
+    const show = `!printf '%s\\n' ${names.map((name) => '"' + name + '=${' + name + '-unset}"').join(' ')}`
+    const out = await git(ws, ['-c', `alias.show-env=${show}`, 'show-env'])
+    const seen = Object.fromEntries(out.trim().split('\n').map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]))
+    expect(seen).toEqual({
+      OPENROUTER_API_KEY: 'unset',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_ALLOW_PROTOCOL: 'file', // the rest of the process env stays, as GIT_ASKPASS would for a clone over https
+    })
+  })
+
+  it('does not read the global git config of the user: what it sets there is not set for a call on the workspace', async () => {
+    const { ws } = await setup()
+    // the premise: the env of this test points git at a global config that sets user.name
+    expect((await execFileAsync('git', ['config', '--global', '--get', 'user.name'])).stdout.trim()).toBe('Bench Fixture')
+    await expect(git(ws, ['config', '--get', 'user.name'])).rejects.toThrow() // exit code 1: set nowhere git looks
   })
 })
 
@@ -339,6 +391,56 @@ describe('capturePatch', () => {
     expect(empty).toBe(false)
     expect(patch).toContain('src/new.ts')
     expect(patch).not.toContain('.task-bench')
+  })
+
+  // The patch is what is stored and compared, so nothing in the environment of the operator may change what it says. The sources
+  // below are the ones that outlive a pinned global config: an env var, and config handed over through GIT_CONFIG_COUNT.
+  describe('is the plain patch, whatever the environment asks of git', () => {
+    /** Config for every git child of this test, the way an environment can hand it over (GIT_CONFIG_COUNT and friends). */
+    function envConfig(...pairs: Array<[key: string, value: string]>): void {
+      vi.stubEnv('GIT_CONFIG_COUNT', String(pairs.length))
+      pairs.forEach(([key, value], i) => {
+        vi.stubEnv(`GIT_CONFIG_KEY_${i}`, key)
+        vi.stubEnv(`GIT_CONFIG_VALUE_${i}`, value)
+      })
+    }
+    const script = (name: string, body: string): string => {
+      const path = join(benchTmp('program'), name)
+      writeFileSync(path, `#!/bin/sh\n${body}\n`)
+      chmodSync(path, 0o755)
+      return path
+    }
+
+    it('has no colour codes, also with colour set to always', async () => {
+      const { repo, ws } = await setup()
+      envConfig(['color.ui', 'always'])
+      write(ws, 'src/x.ts', 'export const x = 42\n')
+      const { patch } = await capturePatch(ws, repo.a)
+      expect(patch).not.toContain('\u001b[')
+      expect(patch).toContain('+export const x = 42')
+    })
+
+    it('does not run an external diff program, with GIT_EXTERNAL_DIFF set', async () => {
+      const { repo, ws } = await setup()
+      const marker = join(benchTmp('markers'), 'external-diff-ran')
+      vi.stubEnv('GIT_EXTERNAL_DIFF', script('extdiff.sh', `touch "${marker}"\necho EXTERNAL-DIFF-OUTPUT`))
+      write(ws, 'src/x.ts', 'export const x = 42\n')
+      const { patch } = await capturePatch(ws, repo.a)
+      expect(existsSync(marker)).toBe(false)
+      expect(patch).not.toContain('EXTERNAL-DIFF-OUTPUT')
+      expect(patch).toContain('+export const x = 42')
+    })
+
+    it('does not run a textconv filter on a file whose attributes name one', async () => {
+      const { repo, ws } = await setup()
+      const upper = script('upper.sh', 'tr a-z A-Z < "$1"')
+      envConfig(['diff.up.textconv', upper])
+      write(ws, '.gitattributes', '*.ts diff=up\n') // as the model's code could write it
+      write(ws, 'src/x.ts', 'export const x = 42\n')
+      const { patch } = await capturePatch(ws, repo.a)
+      expect(patch).toContain('+export const x = 42')
+      expect(patch).not.toContain('EXPORT CONST')
+    })
   })
 })
 

@@ -1,11 +1,14 @@
 import { setTimeout as wait } from 'node:timers/promises'
 import { ModelError, type ModelClient, type ModelErrorDetail } from '../model-client.js'
+import type { CompleteResult } from '../types.js'
 
 /**
  * One retry of a model request, as the trace and the result file record it. `attempt` numbers the retries from 1: the first
- * failure that is retried is attempt 1. `status` and `bodyCode` are there when the failure had one.
+ * failure that is retried is attempt 1. `kind` is the kind of the failure (`network`, `http`, `error_body`) or `finish_other`, for an
+ * answer that came back whole but cannot be used (see `UnusableAnswerError`). `status` and `bodyCode` are there when the failure had
+ * one. `costUsd` is there when the dropped answer reported what it cost: it was paid for, and the run loop never sees it.
  */
-export type RetryRecord = { attempt: number; kind: string; status?: number; bodyCode?: number }
+export type RetryRecord = { attempt: number; kind: string; status?: number; bodyCode?: number; costUsd?: number }
 
 // Spec §4.1: up to three retries, with a wait that grows. The wait is bound by the run: the signal of the call stops it.
 const MAX_RETRIES = 3
@@ -37,10 +40,30 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
 }
 
 /**
+ * The failure of an answer that came back whole but cannot be used: its finish reason is 'other'. The model client turns every
+ * finish reason it does not know into that one, and for OpenRouter that includes "error": a provider that fails after the answer
+ * has begun gives HTTP 200 with `finish_reason: "error"` and the error inside the choice, possibly with partial output. Scored as an
+ * answer, that would end a run on a model that never answered. It is final for the retrying client (`isTransient` is false for it),
+ * and it is what `runManifest` ends on as MODEL_ERROR when the retries run out.
+ *
+ * `costUsd` is what the answer cost, and only when no retry record carries it: an answer that is dropped for a retry has its cost in
+ * the record, and one that is dropped for good (no retry left, or a stop) has no record, so the error says it.
+ */
+export class UnusableAnswerError extends ModelError {
+  constructor(readonly costUsd?: number) {
+    super('model answer unusable: finish_reason other (OpenRouter reports a provider error that way)', { kind: 'invalid' })
+  }
+}
+
+/**
  * Wraps a model client so that a request which fails with a temporary error is made again, up to `maxRetries` times
  * (default 3), after the matching entry of `delaysMs` (default 2 s, 8 s, 30 s; the last one repeats if the list is
  * shorter). Every retry gets the same messages and options, so also the same signal. `onRetry` is called once per
  * retry, before the wait. `sleep` is a test seam; the default is a real timer that the signal cuts short.
+ *
+ * An answer with finish reason 'other' counts as a temporary failure too (kind `finish_other`, with its cost in the record), and
+ * takes its retries from the same budget. It is never handed on: it is retried, or, when the retries run out or the signal is
+ * aborted, it ends the call as an `UnusableAnswerError`. The other finish reasons pass as they are.
  *
  * A stop during the wait ends the call with the failure that was being retried, without another request. When the
  * retries run out the last failure is thrown. The bench wraps only the hosted route in this (spec §4.1): the local
@@ -55,25 +78,42 @@ export function createRetryingClient(
   const sleep = opts.sleep ?? ((ms: number, signal: AbortSignal) => wait(ms, undefined, { signal }))
   return {
     async complete(messages, options) {
+      /** Records the retry, waits, and gives `failure` instead of another request when the stop came meanwhile. */
+      const retryAfter = async (retry: number, record: Omit<RetryRecord, 'attempt'>, failure: unknown): Promise<void> => {
+        opts.onRetry?.({ attempt: retry + 1, ...record })
+        const delayMs = delaysMs[Math.min(retry, delaysMs.length - 1)] ?? 0
+        // A real wait rejects when the signal fires and a stub may just return; both end in the model failure, not in the abort.
+        await sleep(delayMs, options.signal).catch((waitErr: unknown) => {
+          if (!options.signal.aborted) throw waitErr
+        })
+        if (options.signal.aborted) throw failure
+      }
+
       for (let retry = 0; ; retry++) {
+        let res: CompleteResult
         try {
-          return await inner.complete(messages, options)
+          res = await inner.complete(messages, options)
         } catch (err) {
           const detail = transientDetail(err, options.signal)
           if (!detail || retry >= maxRetries) throw err
-          opts.onRetry?.({
-            attempt: retry + 1,
-            kind: detail.kind,
-            ...(detail.status !== undefined ? { status: detail.status } : {}),
-            ...(detail.bodyCode !== undefined ? { bodyCode: detail.bodyCode } : {}),
-          })
-          const delayMs = delaysMs[Math.min(retry, delaysMs.length - 1)] ?? 0
-          // A real wait rejects when the signal fires and a stub may just return; both end in the model failure, not in the abort.
-          await sleep(delayMs, options.signal).catch((waitErr: unknown) => {
-            if (!options.signal.aborted) throw waitErr
-          })
-          if (options.signal.aborted) throw err
+          await retryAfter(
+            retry,
+            {
+              kind: detail.kind,
+              ...(detail.status !== undefined ? { status: detail.status } : {}),
+              ...(detail.bodyCode !== undefined ? { bodyCode: detail.bodyCode } : {}),
+            },
+            err,
+          )
+          continue
         }
+        if (res.finishReason !== 'other') return res
+
+        const costUsd = typeof res.usage.costUsd === 'number' ? res.usage.costUsd : undefined
+        // Dropped for good: no record follows, so the error carries the cost.
+        if (options.signal.aborted || retry >= maxRetries) throw new UnusableAnswerError(costUsd)
+        // Dropped for a retry: the record carries the cost, and so the error that a stop during the wait turns it into does not.
+        await retryAfter(retry, { kind: 'finish_other', ...(costUsd !== undefined ? { costUsd } : {}) }, new UnusableAnswerError())
       }
     },
   }

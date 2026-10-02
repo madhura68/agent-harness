@@ -71,13 +71,18 @@ function readApiKey(varName: string | undefined): string | undefined {
 }
 
 /**
- * --extra-body-file is a probe option. run and worker take extraBody from the model block, and ignoring the flag in
- * silence would send every request without the fields it was meant to carry, such as the provider block.
+ * --extra-body-file is a probe option. run and worker take extraBody from the model block, and task-bench from its
+ * --model-config file; ignoring the flag in silence would send every request without the fields it was meant to carry,
+ * such as the provider block.
  */
-function rejectExtraBodyFile(values: Values, command: 'run' | 'worker'): void {
+function rejectExtraBodyFile(values: Values, command: 'run' | 'worker' | 'task-bench'): void {
   if (values['extra-body-file'] === undefined) return
-  const block = command === 'run' ? 'the model block of the manifest' : 'the model block of the worker config'
-  throw new UsageError(`--extra-body-file only applies to harness probe; for harness ${command} put extraBody in ${block} (model.extraBody)`)
+  const where = {
+    run: 'the model block of the manifest (model.extraBody)',
+    worker: 'the model block of the worker config (model.extraBody)',
+    'task-bench': 'the --model-config file (extraBody)',
+  }[command]
+  throw new UsageError(`--extra-body-file only applies to harness probe; for harness ${command} put extraBody in ${where}`)
 }
 
 /** The JSON object in --extra-body-file, held to the same rules as `model.extraBody` in a manifest. */
@@ -329,10 +334,13 @@ function requiredValues(values: Values, flags: readonly (typeof TASK_BENCH_FLAGS
  */
 async function cmdTaskBench(values: Values): Promise<number> {
   if (values['check-case'] === true) return cmdCheckCase(values)
+  rejectExtraBodyFile(values, 'task-bench')
   const [casePath, modelPath, taskPath, label, out] = requiredValues(values, TASK_BENCH_FLAGS)
   if (!BENCH_LABEL.test(label)) throw new UsageError(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): ${JSON.stringify(label)}`)
   const benchCase = readJsonConfig(casePath, BenchCaseSchema, 'case')
-  const model = readJsonConfig(modelPath, ModelSpecSchema, 'model config')
+  // Strict, unlike run and worker: the schema strips a key it does not know, and a typo such as `extra_body` would send every request
+  // without the provider block (no 16-bit pin, no data_collection: deny). `.strict()` makes a copy; the shared schema stays as it is.
+  const model = readJsonConfig(modelPath, ModelSpecSchema.strict(), 'model config')
   if (model.apiKey !== undefined) throw new ManifestError(`invalid model config ${modelPath}: apiKey: een sleutel hoort niet in een bestand; geef hem via --api-key-env`)
   const task = readJsonConfig(taskPath, TaskConfigSchema, 'task config')
   // Read before anything starts, so an unset variable fails with no run dir.

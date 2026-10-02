@@ -510,6 +510,120 @@ describe('runTaskBench — transient model failures', () => {
   })
 })
 
+// What OpenRouter documents for a provider that fails after the answer has begun: HTTP 200, no top-level error, and the error inside
+// the choice (finish_reason "error"). The model client turns that finish reason into 'other'. It is a provider failure, not an answer:
+// scored as one, it would run the gate on an untouched tree and end the run as geen_wijzigingen, a verdict on a model that never answered.
+describe('runTaskBench — a provider error inside a 200', () => {
+  const providerError = (cost = 0.0004): FakeTurn => ({
+    body: {
+      id: 'gen-1',
+      object: 'chat.completion',
+      model: 'fake-model',
+      choices: [{ index: 0, error: { code: 502, message: 'Provider disconnected unexpectedly' }, message: { role: 'assistant', content: '' }, finish_reason: 'error' }],
+      usage: { prompt_tokens: 100, completion_tokens: 0, cost },
+    },
+  })
+  /** A turn of the model that costs `cost`. */
+  const paid = (turn: FakeTurn, cost: number): FakeTurn => ({ body: { ...(turn.body as object), usage: { prompt_tokens: 10, completion_tokens: 5, cost } } })
+  const noWait = { sleep: async () => undefined }
+
+  it('retries it, runs the gate on the answer that follows and not on the error, and counts what the dropped answer cost', async () => {
+    const t = await bench({
+      retryTransient: true,
+      script: [providerError(0.0004), paid(writeZ(), 0.001), paid(say(), 0.0005)],
+      docker: { hidden: [hiddenPasses] },
+      deps: noWait,
+    })
+    expect(t.result).toMatchObject({ status: 'geslaagd', runStatus: 'completed' })
+    expect(t.result.retries).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004 }])
+    expect(t.model.requests).toHaveLength(3)
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'hidden']) // one gate run: for the answer, not for the error
+    expect(outcomesOfGate(t.runDir)).toEqual(['accept'])
+    expect(readTrace(t.runDir).filter((e) => e.type === 'model_retry')).toEqual([
+      expect.objectContaining({ type: 'model_retry', attempt: 1, kind: 'finish_other', costUsd: 0.0004 }),
+    ])
+    // the loop saw 0.001 + 0.0005; the dropped answer was paid for as well, and the ledger reads this file
+    expect(t.result.usage.costUsd).toBeCloseTo(0.0019, 10)
+    expect(t.saved.usage.costUsd).toBeCloseTo(0.0019, 10)
+  })
+
+  it('ends four of them in a row as a benchfout on MODEL_ERROR, with all four counted and no gate run', async () => {
+    const t = await bench({ retryTransient: true, script: [providerError(), providerError(), providerError(), providerError(), say()], deps: noWait })
+    expect(t.result).toMatchObject({ status: 'benchfout', runStatus: 'failed', error: { code: 'MODEL_ERROR' }, patchBytes: 0 })
+    expect(t.result.error?.message).toContain('finish_reason other')
+    expect(t.result.benchError).toBeUndefined() // the run itself ended so; the bench did not fail on its own
+    expect(t.result.retries.map((r) => [r.attempt, r.kind])).toEqual([[1, 'finish_other'], [2, 'finish_other'], [3, 'finish_other']])
+    expect(t.model.requests).toHaveLength(4)
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare']) // no gate: there was no answer
+    expect(t.result.usage.costUsd).toBeCloseTo(4 * 0.0004, 10) // three in the records, the last on the error
+    expect(t.saved.usage.costUsd).toBeCloseTo(4 * 0.0004, 10)
+  })
+
+  // "Possibly with partial output": a tool call that was cut off with the error would otherwise be run, with arguments that are not whole.
+  it('drops the partial output with it: a tool call that came with the error is not executed', async () => {
+    const partial: FakeTurn = {
+      body: {
+        id: 'gen-1',
+        object: 'chat.completion',
+        model: 'fake-model',
+        choices: [
+          {
+            index: 0,
+            error: { code: 502, message: 'Provider disconnected unexpectedly' },
+            message: {
+              role: 'assistant',
+              content: 'Ik schrijf het bestand',
+              tool_calls: [{ id: 'cut', type: 'function', function: { name: 'write_file', arguments: '{"path":"src/z.ts","content":"export const z' } }],
+            },
+            finish_reason: 'error',
+          },
+        ],
+        usage: { prompt_tokens: 100, completion_tokens: 12, cost: 0.0004 },
+      },
+    }
+    const t = await bench({ retryTransient: true, script: [partial, say()], deps: noWait })
+    expect(t.result.retries).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004 }])
+    expect(readTrace(t.runDir).some((e) => e.type === 'tool_call')).toBe(false) // never offered to the tools
+    expect(t.result.usage.toolCalls).toBe(0)
+    expect(t.model.requests[1].body.messages.some((m: { role: string }) => m.role === 'tool')).toBe(false) // and the retry does not mention it
+  })
+
+  it('counts the cost once when the stop comes during the wait before the retry', async () => {
+    const stop = new AbortController()
+    let waiting!: () => void
+    const inWait = new Promise<void>((resolve) => (waiting = resolve))
+    const t = await start({
+      signal: stop.signal,
+      retryTransient: true,
+      script: [providerError(0.0004)],
+      deps: {
+        // like the real wait: it ends with an error when the signal fires
+        sleep: (_ms, signal) =>
+          new Promise<void>((_resolve, reject) => {
+            waiting()
+            signal.addEventListener('abort', () => reject(new Error('afgebroken')), { once: true })
+          }),
+      },
+    })
+    const running = t.run()
+    await inWait
+    stop.abort()
+    const result = await running
+    expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
+    expect(result.retries).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004 }])
+    expect(result.usage.costUsd).toBeCloseTo(0.0004, 10) // in the record, and not a second time from the error
+    expect(t.model.requests).toHaveLength(1)
+  })
+
+  it('leaves the local route alone: without retryTransient the answer goes to the loop as before', async () => {
+    const t = await bench({ retryTransient: false, script: [providerError(), say()] })
+    expect(t.result).toMatchObject({ status: 'geen_wijzigingen', runStatus: 'completed', retries: [] })
+    expect(t.model.requests).toHaveLength(1)
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // the loop took it for an answer and ran the gate
+    expect(t.result.usage.costUsd).toBeCloseTo(0.0004, 10) // counted by the loop itself
+  })
+})
+
 describe('runTaskBench — what the result says about the responses', () => {
   const turn = (body: Record<string, unknown>, usage: Record<string, number>, provider: string): FakeTurn => ({ body: { ...body, usage, provider } })
 
@@ -583,6 +697,30 @@ describe('runTaskBench — a stop from outside', () => {
     expect(t.saved.hidden).toBeUndefined()
     expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-verify-3`])
     expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'hidden'])
+  })
+
+  // The scan and the restore cannot be aborted, and a stop can come in the time they take. No container starts after a stop: a hidden
+  // check that started anyway would be killed at once, and a kill that is not provably done is a benchfout of its own ("niet aantoonbaar
+  // gestopt") instead of afgebroken.
+  it('starts no hidden-check container once the stop has come, also when it came while the work tree was being made ready for it', async () => {
+    const stop = new AbortController()
+    const t = await start({ signal: stop.signal, script: [writeZ(), say()] })
+    const restore = vi.mocked(restoreForHiddenCheck)
+    const real = restore.getMockImplementation()
+    if (!real) throw new Error('restoreForHiddenCheck is not spied on')
+    restore.mockImplementationOnce(async (...args) => {
+      stop.abort() // the stop lands during the restore
+      return real(...args)
+    })
+
+    const result = await t.run()
+
+    expect(restore).toHaveBeenCalledTimes(1) // the premise: the run did get as far as the restore
+    expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
+    expect(result.hidden).toBeUndefined()
+    expect(JSON.parse(readFileSync(join(t.out, result.runId, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // no hidden container was started…
+    expect(t.docker.kills()).toEqual([]) // …so none had to be killed
   })
 
   it('stops a model request that is in flight', async () => {

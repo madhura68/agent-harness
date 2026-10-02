@@ -13,7 +13,7 @@ import { isGreen, verifyText } from '../worker/task-impl.js'
 import { createTaskTools, type VerifyRun } from '../worker/task-tools.js'
 import type { BenchCase } from './case.js'
 import { BENCH_DIR, evaluateHidden, hiddenCheckScript, readHiddenReport, type HiddenReportRead, type HiddenResult } from './hidden-check.js'
-import { createRetryingClient, type RetryRecord } from './retry-client.js'
+import { createRetryingClient, UnusableAnswerError, type RetryRecord } from './retry-client.js'
 import { BENCH_SYSTEM_PROMPT, benchTaskPrompt } from './task-prompt.js'
 import { AdminChangedError, assertAdminUnchanged, capturePatch, createWorkspace, git, isRunnerConfig, restoreForHiddenCheck, snapshotAdmin, type Workspace } from './workspace.js'
 
@@ -33,7 +33,9 @@ export type BenchDeps = {
  * `<out>/<runId>/bench-result.json`. `runStatus` is the raw end status of `runManifest`, or `not_run` when the bench failed before the
  * model loop started. `error` is the end error of that run (masked by the model client). `hidden` is the verdict of the hidden check,
  * and absent when that did not run or its container failed. `durationMs` is the wall time of the whole bench run: clone, prepare,
- * model loop and hidden check. `providers` lists the `provider` of the responses that named one, in order.
+ * model loop and hidden check. `providers` lists the `provider` of the responses that named one, in order. `usage` is what the run
+ * itself counted, plus the `costUsd` of the answers that the retry client dropped (see `retries`): they were paid for, and the run
+ * never saw them. The ledger reads this file, so its `usage.costUsd` has to be the whole bill.
  */
 export type BenchResult = {
   caseId: string
@@ -180,6 +182,16 @@ class BenchFault extends Error {}
 const NO_USAGE: RunResult['usage'] = { source: 'missing', inputTokens: 0, outputTokens: 0, turns: 0, toolCalls: 0, toolErrors: 0 }
 
 /**
+ * `usage` with the cost of the dropped answers added to its `costUsd`: `costs` has an entry per dropped answer, and `undefined` for one
+ * that reported no cost. Like the other sums of `usage`, `costUsd` stays absent unless some response reported it.
+ */
+function withDroppedCost(usage: RunResult['usage'], costs: Array<number | undefined>): RunResult['usage'] {
+  const reported = costs.filter((cost): cost is number => cost !== undefined)
+  if (reported.length === 0) return usage
+  return { ...usage, costUsd: (usage.costUsd ?? 0) + reported.reduce((sum, cost) => sum + cost, 0) }
+}
+
+/**
  * One bench run (spec §4.1): a fresh clone of the repo at the case's `base_commit`; prepare; the model loop of the worker with the
  * bench prompts, the six task tools and the verify gate; the patch against `base_commit`; and, for a run that completes with a
  * patch, the hidden check with the tests of `ref_commit`. The result is in `<out>/<runId>/bench-result.json` on every path, also
@@ -227,6 +239,8 @@ export async function runTaskBench(o: {
   let lastTail = undefined as string | undefined
   const retries: RetryRecord[] = []
   const providers: string[] = []
+  // The cost of the answer that was dropped on the last attempt: no retry follows it, so it is on the error and not in `retries`.
+  let droppedLastUsd = undefined as number | undefined
 
   /** Why the run has to end now, whatever else is going on: a container that was not provably stopped, or a stop from outside. */
   const stopReason = (): string | undefined => {
@@ -284,7 +298,10 @@ export async function runTaskBench(o: {
       : base
     const client: ModelClient = {
       async complete(messages, options) {
-        const res = await retrying.complete(messages, options)
+        const res = await retrying.complete(messages, options).catch((err: unknown) => {
+          if (err instanceof UnusableAnswerError && err.costUsd !== undefined) droppedLastUsd = (droppedLastUsd ?? 0) + err.costUsd
+          throw err
+        })
         if (res.provider) providers.push(res.provider)
         return res
       },
@@ -331,6 +348,10 @@ export async function runTaskBench(o: {
     interrupted()
     await assertAdminUnchanged(ws, snap)
     await restoreForHiddenCheck(ws, c.ref_commit)
+    // No container is started once a stop has come, as in checkCase: the scan and the restore cannot be aborted, and the stop can come
+    // during them. A container that started anyway is killed at once, and a kill that is not provably done would be reported as a
+    // benchfout of its own ("niet aantoonbaar gestopt") instead of afgebroken.
+    interrupted()
     const check = await runHiddenCheck({ containers, work: ws.work, files: c.hidden_tests, signal: inner.signal })
     interrupted()
     if (check.run.runnerError) {
@@ -369,7 +390,7 @@ export async function runTaskBench(o: {
     ...(run?.error ? { error: run.error } : {}),
     gate: { reds, ...(lastTail !== undefined ? { lastTail } : {}) },
     ...(hidden ? { hidden } : {}),
-    usage: run?.usage ?? NO_USAGE,
+    usage: withDroppedCost(run?.usage ?? NO_USAGE, [...retries.map((r) => r.costUsd), droppedLastUsd]),
     providers,
     retries,
     patchBytes: patch?.bytes ?? 0,
