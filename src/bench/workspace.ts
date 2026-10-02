@@ -131,23 +131,25 @@ export async function capturePatch(ws: Workspace, base: string): Promise<{ patch
 }
 
 // What the hidden check takes from the ref commit: the whole `__tests__/` and the runner configuration in the root (spec §4.1 step 5).
-// `package-lock.json` and `.npmrc` are part of it because the hidden check installs the dependencies again after this restore
-// (runTaskBench): what npm installs, and from which registry, is decided by those two files and `package.json`, and the model must not be
-// the one who decides it.
-const ROOT_CONFIG = /^(vitest\.config\..+|package\.json|package-lock\.json|\.npmrc|tsconfig.*\.json)$/
+// `package-lock.json`, `npm-shrinkwrap.json` and `.npmrc` are part of it because the hidden check installs the dependencies again after
+// this restore (runTaskBench): what npm installs, and from which registry, is decided by those files and `package.json`, and the model
+// must not be the one who decides it. `npm-shrinkwrap.json` is a lockfile like the other, and when both are there npm uses it and ignores
+// `package-lock.json`: restoring only the one would leave the model a way to choose.
+const ROOT_CONFIG = /^(vitest\.config\..+|package\.json|package-lock\.json|npm-shrinkwrap\.json|\.npmrc|tsconfig.*\.json)$/
 /**
  * Whether `name`, a name in the root of the repo, is runner configuration (`vitest.config.*`, `package.json`, `package-lock.json`,
- * `.npmrc`, `tsconfig*.json`). It is what `restoreForHiddenCheck` puts back from `ref`, and so what `ref` may not change for a case to
- * be fair (spec §4.2 criterion 6: no new dependency): one definition for both, so that they cannot drift apart.
+ * `npm-shrinkwrap.json`, `.npmrc`, `tsconfig*.json`). It is what `restoreForHiddenCheck` puts back from `ref`, and so what `ref` may not
+ * change for a case to be fair (spec §4.2 criterion 6: no new dependency): one definition for both, so that they cannot drift apart.
  */
 export const isRunnerConfig = (name: string): boolean => ROOT_CONFIG.test(name)
 const isRestored = (name: string): boolean => name === '__tests__' || isRunnerConfig(name)
 
 /**
- * Puts `__tests__/` and the runner configuration (`vitest.config.*`, `package.json`, `package-lock.json`, `.npmrc`, `tsconfig*.json`
- * in the root) exactly back to their state in `ref`, so that nothing the model did to tests or configuration can change what the hidden
- * check proves. Files the model added there are gone (an `.npmrc` that `ref` does not have among them), and files it deleted are back.
- * Everything else in the work tree stays as the model left it, `node_modules` included: the caller installs that again.
+ * Puts `__tests__/` and the runner configuration (`vitest.config.*`, `package.json`, `package-lock.json`, `npm-shrinkwrap.json`,
+ * `.npmrc`, `tsconfig*.json` in the root) exactly back to their state in `ref`, so that nothing the model did to tests or configuration
+ * can change what the hidden check proves. Files the model added there are gone (an `.npmrc` or `npm-shrinkwrap.json` that `ref` does
+ * not have among them), and files it deleted are back. Everything else in the work tree stays as the model left it, `node_modules`
+ * included: the caller installs that again.
  * After a container, run `assertAdminUnchanged` first.
  */
 export async function restoreForHiddenCheck(ws: Workspace, ref: string): Promise<void> {

@@ -430,9 +430,11 @@ describe('checkCase — the diff between A and B, from real git', () => {
     // B replaces one line of the file (1 line in, 1 out) on top of the 11 lines of the standard B
     ['vitest.config.ts', { 'vitest.config.ts': "import { defineConfig } from 'vitest/config'\n\nexport default defineConfig({ test: {} })\n" }, 13],
     ['package.json', { 'package.json': '{ "name": "origin", "version": "2" }\n' }, 13],
-    // A has neither of these: B adds a file of one line. The hidden check installs the dependencies again from the lockfile and the
-    // .npmrc of B (runTaskBench), so a B that changes them changes what is installed: no new dependency (criterion 6).
+    // A has none of these: B adds a file of one line. The hidden check installs the dependencies again from the lockfile (npm takes
+    // npm-shrinkwrap.json before package-lock.json) and the .npmrc of B (runTaskBench), so a B that changes them changes what is installed:
+    // no new dependency (criterion 6).
     ['package-lock.json', { 'package-lock.json': '{ "lockfileVersion": 3 }\n' }, 12],
+    ['npm-shrinkwrap.json', { 'npm-shrinkwrap.json': '{ "lockfileVersion": 3 }\n' }, 12],
     ['.npmrc', { '.npmrc': 'registry=https://registry.invalid/\n' }, 12],
   ])('is not ok when B changes %s, and still measures B in lines', async (_name, change, lines) => {
     const t = await check({ origin: await originWith(change) })
@@ -441,7 +443,14 @@ describe('checkCase — the diff between A and B, from real git', () => {
 
   it('is not bothered by config-like files below the root', async () => {
     const t = await check({
-      origin: await originWith({ 'sub/package.json': '{}\n', 'packages/a/tsconfig.json': '{}\n', 'tsconfig.d/x.json': '{}\n', 'sub/package-lock.json': '{}\n', 'packages/a/.npmrc': 'a=b\n' }),
+      origin: await originWith({
+        'sub/package.json': '{}\n',
+        'packages/a/tsconfig.json': '{}\n',
+        'tsconfig.d/x.json': '{}\n',
+        'sub/package-lock.json': '{}\n',
+        'sub/npm-shrinkwrap.json': '{}\n',
+        'packages/a/.npmrc': 'a=b\n',
+      }),
     })
     expect(t.result).toMatchObject({ ok: true, refChangesRunnerConfig: false })
   })
@@ -525,7 +534,7 @@ describe('analyseRefDiff', () => {
   })
 
   it.each(['A', 'M', 'D', 'T'])('sees a change of status %s to the runner config of the root', (status) => {
-    for (const name of ['vitest.config.ts', 'vitest.config.mts', 'package.json', 'package-lock.json', '.npmrc', 'tsconfig.json', 'tsconfig.build.json']) {
+    for (const name of ['vitest.config.ts', 'vitest.config.mts', 'package.json', 'package-lock.json', 'npm-shrinkwrap.json', '.npmrc', 'tsconfig.json', 'tsconfig.build.json']) {
       expect(analyse(nul(status, name)).refChangesRunnerConfig, `${status} ${name}`).toBe(true)
     }
   })
@@ -536,8 +545,10 @@ describe('analyseRefDiff', () => {
     'tsconfig/x.json',
     'tsconfig.d/x.json',
     'sub/package-lock.json',
+    'sub/npm-shrinkwrap.json',
     'sub/.npmrc',
     'package-lock.json.bak',
+    'npm-shrinkwrap.json.bak',
     '.npmrc.bak',
     'x.npmrc',
     'package.json.bak',

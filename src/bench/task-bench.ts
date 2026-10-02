@@ -178,6 +178,13 @@ const TASK_TOOLS = ['list_files', 'read_file', 'write_file', 'edit_file', 'searc
 
 const STOPPED = 'afgebroken'
 
+/**
+ * The first command of the reinstall before the hidden check. `npm ci` removes `node_modules` by itself, but a fresh install must not
+ * depend on what the commands of a recipe do with a `node_modules` that is there (`npm install` trusts it, a vitest.mjs that the model
+ * wrote included). Relative: the container runs in the work tree.
+ */
+const REMOVE_NODE_MODULES = 'rm -rf node_modules'
+
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
 /** A failure of the bench itself, never of the model: it ends the run as a `benchfout`, and its message becomes the `benchError`. */
@@ -201,10 +208,11 @@ function withDroppedCost(usage: RunResult['usage'], costs: Array<number | undefi
  * patch, the hidden check with the tests of `ref_commit`. The result is in `<out>/<runId>/bench-result.json` on every path, also
  * when the bench itself failed or was stopped. Only a run dir that cannot be made throws.
  *
- * The hidden check does not trust what the model run left in the work tree. `__tests__/` and the runner config (the lockfile and the
- * `.npmrc` among it) go back from `ref_commit`, and the dependencies are installed again by the prepare of the recipe, in a container of
- * its own (`reinstall`) before the hidden container: vitest is run from `node_modules`, and the model can write there like anywhere in
- * the work tree. `checkCase` does not do this; it has no model run in its work trees.
+ * The hidden check does not trust what the model run left in the work tree. `__tests__/` and the runner config (the lockfile, either
+ * `package-lock.json` or `npm-shrinkwrap.json`, and the `.npmrc` among it) go back from `ref_commit`, and the dependencies are installed
+ * again in a container of its own (`reinstall`) before the hidden container: `node_modules` is removed, then the prepare commands of the
+ * recipe run. vitest is run from `node_modules`, and the model can write there like anywhere in the work tree. `checkCase` does not do
+ * this; it has no model run in its work trees.
  *
  * A verify container that cannot run at all (`runnerError`: docker did not start, or its process ended without an exit code) is a failure
  * of the bench, not a red verify: the run is aborted and ends as a `benchfout` (`verify-container: <cause>`), where the worker counts
@@ -386,11 +394,12 @@ export async function runTaskBench(o: {
     // benchfout of its own ("niet aantoonbaar gestopt") instead of afgebroken.
     interrupted()
     // The hidden check runs vitest from node_modules, which is part of the work tree that the model could write to. So it does not use
-    // that one: the prepare of the recipe runs again on the restored files, in a prepare container of its own (npm ci removes
-    // node_modules first, so what the model put there is gone). No host git follows this container, so it needs no scan. An empty
-    // prepare list has nothing to run (buildScript([]) would end in a dangling &&), and then nothing was ever installed either.
+    // that one: node_modules is removed, and the prepare of the recipe runs again on the restored files, in a prepare container of its
+    // own. The removal is explicit, so that it does not depend on the commands of the recipe (npm ci would do it, npm install would not).
+    // No host git follows this container, so it needs no scan. An empty prepare list has nothing to run (buildScript([]) would end in a
+    // dangling &&), and then nothing was ever installed either.
     if (recipe.prepare.length > 0) {
-      const reinstall = await container('prepare', 'reinstall', buildScript(recipe.prepare), inner.signal)
+      const reinstall = await container('prepare', 'reinstall', buildScript([REMOVE_NODE_MODULES, ...recipe.prepare]), inner.signal)
       interrupted() // a reinstall that the stop killed is no failed reinstall, and no hidden container starts after a stop
       if (!isGreen(reinstall)) throw new BenchFault(`herinstallatie vóór de verborgen toets faalde: ${verifyText(reinstall)}`)
     }
