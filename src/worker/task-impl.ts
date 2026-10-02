@@ -48,15 +48,18 @@ function repoUrlOf(p: TaskPayload): string {
   return filled(p.task.repo_url) ? p.task.repo_url.trim() : filled(p.product.repo_url) ? p.product.repo_url.trim() : ''
 }
 
-/** The user message: task, plan, story, product id and repository as data; empty or null fields are left out. */
-export function renderTaskPrompt(p: TaskPayload): string {
+/**
+ * The user message: task, plan, story, product id and repository as data; empty or null fields are left out.
+ * `productBlock: false` leaves out the `## Product` block, for a run without doc tools (the task-bench).
+ */
+export function renderTaskPrompt(p: TaskPayload, opts?: { productBlock?: boolean }): string {
   const block = (heading: string, ...parts: Array<string | null | undefined>) => [heading, ...parts.filter(filled)].join('\n\n')
   const sections = [block('## Taak', p.task.title, p.task.description)]
   if (filled(p.task.implementation_plan)) sections.push(block('## Plan', p.task.implementation_plan))
   sections.push(
     block('## Story', p.story.title, p.story.description, filled(p.story.acceptance_criteria) ? `### Acceptatiecriteria\n\n${p.story.acceptance_criteria}` : null),
   )
-  sections.push(block('## Product', `product_id: \`${p.product.id}\` — gebruik exact dit id voor search_product_docs en list_product_docs`))
+  if (opts?.productBlock !== false) sections.push(block('## Product', `product_id: \`${p.product.id}\` — gebruik exact dit id voor search_product_docs en list_product_docs`))
   const repo = repoUrlOf(p)
   sections.push(block('## Repository', repo ? `URL: ${repo}` : null, `Branch: ${p.branch_name}`))
   return sections.join('\n\n')
@@ -121,10 +124,10 @@ const LEFTOVER_ERROR = 'achtergebleven harness-container niet aantoonbaar opgeru
 const STOPPED = 'worker gestopt'
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
-const isGreen = (run: VerifyRun) => !run.runnerError && !run.timedOut && run.exitCode === 0
+export const isGreen = (run: VerifyRun) => !run.runnerError && !run.timedOut && run.exitCode === 0
 
 /** What the model and the logs see of a red run: the reason it was not green, then the output tail. */
-function verifyText(run: VerifyRun): string {
+export function verifyText(run: VerifyRun): string {
   const head = run.runnerError ? `${run.runnerError}\n` : run.timedOut ? 'timeout\n' : `exitcode ${run.exitCode}\n`
   return tail(head + run.output, VERIFY_TAIL)
 }
