@@ -2,7 +2,7 @@
 title: "Agent-harness M7 — Qwen 3.8 voor een 96 GB-machine op echt werk (task-bench)"
 status: draft
 last_updated: 2026-10-02
-revision: 3
+revision: 4
 ---
 
 # Agent-harness M7 — Qwen 3.8 voor een 96 GB-machine op echt werk (task-bench)
@@ -119,6 +119,12 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
   - **taakprompt:** `renderTaskPrompt` met een nieuwe optie die het blok `## Product` weglaat. De standaard laat het blok staan, dus de worker verandert niet. Een test bewijst dat systeem- en taakprompt van de bench geen naam van een doc-tool bevatten.
   - `createTaskTools`, `runInContainer` met het recept van de repo, en `runManifest` met profiel `tools`.
   - **De gate** is gelijk aan die in `runTaskJob`. `afterAnswer` draait `recipe.verify`, met `maxVerifyRepairs` pogingen en dezelfde tekst bij rood. `isGreen` en `verifyText` worden geëxporteerd, zonder gedragswijziging, en de bench gebruikt ze. Net als `runTaskJob` houdt de bench lopende containers bij. Meldt `runInContainer` dat een container niet aantoonbaar is opgeruimd (`cleanup: 'uncertain'`), dan stopt de run en is het een `benchfout`.
+- **Herhalen bij storingen, alleen op de gehoste route.**
+  - De bench geeft `runManifest` een modelclient die een verzoek bij een tijdelijke fout tot 3 keer opnieuw doet. Tijdelijk is: een netwerkfout, HTTP 408, 429 of 5xx, of een foutbody van OpenRouter met zo'n code.
+  - Tussen de pogingen zit een oplopende wachttijd, binnen `maxWallSeconds`.
+  - Elke herhaling staat in de trace en in de resultaat-JSON. Pas als de herhalingen op zijn, eindigt de run op `MODEL_ERROR`, en dus op een benchfout.
+  - Met de 16-bit-route is er maar één aanbieder (§4.3), en de modelclient zelf herhaalt niet (§3). Zonder deze herhaling zou een losse storing bij DeepInfra (uptime 98,45% over een dag) ongeveer een op de drie runs als benchfout laten eindigen.
+  - Voor `gsq-lokaal` staat het uit, zoals in productie: daar kan een fout van Ollama ook modelgedrag zijn.
 - **De taakconfig** is een kopie van het `task`-blok uit `worker.json`: limieten, image, uid/gid, npm-cache, `maxVerifyRepairs` en recepten. Zo meet de bench met precies de grenzen van productie.
 - **Verloop per run:**
   1. Een wegwerpclone van de repo in een map binnen `--out`, vers en buiten elke workercache. Checkout van `base_commit`, daarna `git submodule update --init --recursive` op de gitlinks van die commit.
@@ -145,6 +151,7 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
 - **De resultaat-JSON** bevat verder:
   - de case-id, het model, de status, en de ruwe eindstatus van `runManifest` met de foutmelding (gemaskeerd);
   - per respons de aanbieder;
+  - het aantal herhaalde verzoeken, met hun foutcodes;
   - modelbeurten, toolaanroepen en toolfouten;
   - tokens in en uit, `costUsd` en de wandtijd;
   - de staart van de laatste gate-uitvoer en de vitest-JSON van de verborgen toets.
@@ -153,6 +160,7 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
   - geen MCP-job, geen claim, geen commit of push, geen status- of logaanroepen;
   - **geen doc-tools.** De docs-store van nu kan de oplossing van een oude taak al bevatten. Daarom verdwijnen ze ook uit de prompts (zie Samenstelling). De docs in de repo zelf blijven leesbaar via `read_file`.
   - **geen `verify_task_against_plan`.** De verborgen toets neemt die taak over.
+  - **herhalen bij storingen op de gehoste route.** De worker draait lokaal en heeft geen route naar een aanbieder op afstand.
 
 ### 4.2 De takenset
 
@@ -180,7 +188,8 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
   - Met `provider: {data_collection: "deny", require_parameters: true, quantizations: ["bf16", "fp16"]}` en `reasoning: {effort: "medium"}`, zoals de docs-variant in M5 maar nu op 16-bit.
   - Met tools en `require_parameters` blijft nu alleen DeepInfra (BF16) over.
   - Het rapport legt per respons de aanbieder vast, en bij het begin van elk venster een kopie van de publieke endpointlijst als bewijs van de precisie.
-  - Is er geen toegestane route, dan geeft OpenRouter een fout. Dat wordt een benchfout (§4.1), nooit een terugval naar een lagere of onbekende precisie.
+  - Is er geen toegestane route, dan geeft OpenRouter een fout. Na de herhalingen (§4.1) wordt dat een benchfout, nooit een terugval naar een lagere of onbekende precisie.
+  - Herhalen bij storingen staat aan voor dit label, en uit voor `gsq-lokaal` (§4.1).
   - Temperatuur en seed blijven op de standaard, net als bij de worker.
 - Beide krijgen de limieten uit §3. Eén run per taak. Gehost is niet herhaalbaar, dus één run is een steekproef; dat noemt het rapport.
 
@@ -232,11 +241,12 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
      - een nepmodel en neppe containers;
      - een gate-test gelijk aan die van de worker;
      - de prompttests uit §4.1;
-     - de verborgen toets, met een test die laat zien dat een aangepaste runnerconfig of een weggehaalde test niet als geslaagd telt.
+     - de verborgen toets, met een test die laat zien dat een aangepaste runnerconfig of een weggehaalde test niet als geslaagd telt;
+     - het herhalen bij storingen: alleen tijdelijke fouten, hooguit 3 keer, binnen de deadline, en alleen op de gehoste route.
    - De PR in agent-harness; JP merget.
    - Op max2 de worktree `~/Development/agent-harness-m7` met `npm ci` en een build.
    - Eén taak met de hand gekozen en gecontroleerd volgens §4.2.
-   - Op JP's go een venster van ongeveer een uur: die taak met `qwen3.8-openrouter`, op de 16-bit-route. De proef controleert dat elke respons van een aanbieder op 16-bit kwam.
+   - Op JP's go een venster van ongeveer een uur: die taak met `qwen3.8-openrouter`, op de 16-bit-route. De proef controleert dat elke respons van een aanbieder op 16-bit kwam, en meldt hoeveel verzoeken herhaald zijn.
 2. **Increment 2: takenset en driver.** De selectie van 12 taken, met bewijs. JP keurt goed, en de set wordt bevroren. Driver en scorer met tests, als PR in max2.
 3. **Increment 3:** op JP's go `qwen3.8-openrouter` op alle 12 taken, in een venster van ongeveer 3 uur.
 4. **Increment 4:** op JP's go `gsq-lokaal` op alle 12 taken, in een nachtvenster (tot 40 minuten per taak).
@@ -260,11 +270,14 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
 1. `harness task-bench` volgt de lus van de worker:
    - Systeemprompt, taakprompt, tools, recept, gate met `maxVerifyRepairs` en limieten zijn gelijk aan `runTaskJob` met de taakconfig van max2.
    - Twee uitzonderingen: de doc-tools-bijzin en het blok `## Product` vallen weg.
-   - Unittests tonen dat er geen naam van een doc-tool in de prompts staat, en dat de verborgen toets een aangepaste runnerconfig of een weggehaalde test niet als geslaagd telt.
+   - Unittests tonen drie dingen:
+     - er staat geen naam van een doc-tool in de prompts;
+     - de verborgen toets telt een aangepaste runnerconfig of een weggehaalde test niet als geslaagd;
+     - het herhalen bij storingen raakt alleen tijdelijke fouten op de gehoste route, en hooguit 3 keer.
    - De trace van de praktijkproef laat de lus zien.
 2. De praktijkproef draaide één taak met `qwen3.8-openrouter` door de bench.
    - Er is een resultaat-JSON, met kosten en tijd.
-   - Elke respons kwam van een aanbieder op 16-bit.
+   - Elke respons kwam van een aanbieder op 16-bit, en het aantal herhaalde verzoeken staat erbij.
    - De verborgen toets draaide met de `__tests__/` en de runnerconfig van `ref_commit`.
 3. De takenset telt 12 taken (6 per repo). Elke taak heeft het bewijs voor de criteria 2 en 3 uit §4.2, met de bron-pin. JP keurde de lijst goed vóór increment 3.
 4. Beide modellen draaiden alle 12 taken geldig. Elke run eindigde in een van de modelstatussen uit §4.1, na hooguit één herhaling bij een benchfout.
@@ -276,7 +289,10 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
 
 - **Kleine aantallen.** Bij 12 taken scheelt één taak 8 procentpunt. Daarom de grens: een uitslag vlak bij een drempel is onbeslist, geen bewijs. Meer taken is dan JP's keuze.
 - **Gehost ≠ lokaal.** In M5 kwam gehost door de zeef, bij aanbieders met een onbekende precisie, en in M6 zakte de lokale Q8. M7 legt de gehoste precisie vast op 16-bit (§4.3), maar engine en template blijven anders dan op een Mac. Een positief oordeel is een kandidaat voor een proef op echte hardware, geen koopadvies.
-- **Eén aanbieder op 16-bit.** Met tools blijft alleen DeepInfra over. Valt die weg of verandert hij van precisie, dan worden het benchfouten en een stop voor JP, geen run op een andere precisie.
+- **Eén aanbieder op 16-bit.** Met tools blijft alleen DeepInfra over.
+  - Losse storingen vangt de herhaling in de bench op (§4.1).
+  - Valt DeepInfra langer weg of verandert hij van precisie, dan worden het benchfouten en een stop voor JP, geen run op een andere precisie.
+  - Een herhaling kan ook een fout verbergen die door de uitvoer van het model komt. Daarom toont het rapport de herhalingen per taak.
 - **Gehost is niet herhaalbaar.** Eén run per taak is een steekproef; een tweede run past niet in het budget.
 - **Storingen bij aanbieders.** Een 429 of 5xx eindigt een run meteen als `MODEL_ERROR`, want de modelclient herhaalt niet. §4.1 maakt daar een benchfout van, met één herhaling en daarna een stop voor JP. Zo bepaalt een storing het oordeel niet.
 - **Verborgen tests kunnen te streng zijn,** als ze toevallige details van de oude oplossing toetsen. Criterium 4 in §4.2 beperkt dat. Het rapport toont bij elk `verborgen_tests_rood` de falende tests, zodat JP het kan beoordelen.
@@ -346,3 +362,33 @@ Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 1 MINOR, GO) en `mac:codex` (0 BLOC
 - per respons de aanbieder in de resultaat-JSON.
 
 **Omvang:** geen nieuw onderdeel. Er komen bij: een precisiefilter in de modelconfig, bewijs van aanbieder en precisie, en een lagere drempel voor de proef. Het eerste resultaat en de praktijkproef blijven gelijk.
+
+### Ronde 3 (2026-10-02, rev 3 `b2cc43d` → rev 4)
+
+Reviewers: `mac:codex` (0 BLOCKER, 0 MAJOR, 0 MINOR, GO) en `mac:claude` (0 BLOCKER, 1 MAJOR, 0 MINOR, NO-GO). Beide zagen alle vijf fixes van ronde 2 als gehouden. Claude controleerde de routing-docs van OpenRouter: `quantizations` filtert, en zonder passende aanbieder komt er een fout.
+
+**MAJOR van claude: met één aanbieder en een modelclient zonder herhaling worden benchfouten waarschijnlijk.** Nagerekend met de publieke uptime van DeepInfra (98,45% over een dag) en `model-client.ts`, dat niet herhaalt:
+- bij ongeveer 25 verzoeken per run eindigt zo'n 32% van de runs in een benchfout;
+- de kans dat dezelfde taak twee keer faalt is ongeveer 10%;
+- de kans dat increment 3 minstens één keer stopt is ongeveer 73%.
+
+Een verkeerd oordeel volgt er niet uit, want een onvolledige set wordt nooit gescoord. Maar het plan voor increment 3 houdt dan geen stand. Codex achtte één aanbieder aanvaardbaar, omdat een storing de proef stopt in plaats van een modelfout te maken. Beide lezingen kloppen: claude's punt gaat over de uitvoerbaarheid.
+
+Fix in §4.1 en §4.3: een begrensde herhaling in de bench, alleen op de gehoste route.
+- tijdelijke fouten: netwerk, 408, 429, 5xx;
+- hooguit 3 keer, binnen de deadline;
+- vastgelegd in de trace en de resultaat-JSON.
+- Voor gsq staat het uit, want een fout van Ollama kan modelgedrag zijn.
+- Unittest in §4.7, criterium 1 en 2, en het risico in §6.
+
+**Omvangtoets vóór ronde 4.** Elke toevoeging uit de rondes 1–3 beantwoordt een aangetoond faalpad:
+- promptoptie: doc-tool-fouten;
+- statusmapping: storing telt als modelfout;
+- terugzetten en JSON: een vals geslaagd;
+- submodule: prepare faalt;
+- exports: drift van de gate;
+- grootboek: overschrijding;
+- precisiefilter: verkeerde precisie;
+- herhaling: vastlopen.
+
+Geen enkele toevoeging is een nieuw subsysteem. Weg kan alleen de aparte scorer, en die mag al een functie in het run-script zijn. Het eerste resultaat en de praktijkproef staan nog in increment 1.
