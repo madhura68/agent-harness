@@ -1,6 +1,6 @@
 # M7 — task-bench: Qwen 3.8 voor een 96 GB-machine op echt werk — implementatieplan
 
-_Status: draft, revisie 2 (2026-10-02). Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: draft, revisie 3 (2026-10-02). Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -70,6 +70,10 @@ _Status: draft, revisie 2 (2026-10-02). Een technisch GO autoriseert geen ceremo
 - **Stoppen:** `harness task-bench` (ook met `--check-case`) vangt SIGINT en SIGTERM af.
   - Het breekt modelverzoeken, de wachttijd van de herhaling en de containers af, en wacht tot alle containers zijn opgeruimd.
   - Daarna schrijft het `bench-result.json` (status `benchfout`, `benchError: "afgebroken"`) en stopt het.
+  - **De driver (`run.py`) doodt de bench nooit.** Hij vangt SIGINT en SIGTERM af met een handler die alleen een stopvlag zet.
+    - De lopende harness-aanroep wacht hij gewoon af. Die kreeg hetzelfde signaal via `pkill -s` en ruimt zijn containers zelf op.
+    - Daarna boekt hij de kosten van die run en stopt hij met exit 6, zonder nieuwe run.
+    - Waarom: met de standaardafhandeling stopt `subprocess.run` het kind na 0,25 s met SIGKILL, midden in het opruimen. De containers (`sh -c` als PID 1, zonder `--init`) negeren het doorgestuurde signaal en draaien door. Nagebootst in plan-ronde 2.
 - **Forgejo is de forge, nooit `gh`.**
   - Geen merge zonder JP.
   - Nooit `git branch -D`, nooit een kale `git stash`, geen `--force` bij `git worktree remove`.
@@ -115,9 +119,9 @@ Alleen de namen en vier punten zijn anders voor M7:
    - Gedekt in Taak 2.
 3. **Een container die niet aantoonbaar stopt, een stop van buiten, of host-git na een container.**
    - Verwacht: de run stopt als benchfout en er start geen container meer.
-   - Bij SIGINT of SIGTERM wacht de bench tot de containers zijn opgeruimd.
+   - Bij SIGINT of SIGTERM wacht de bench tot de containers zijn opgeruimd, ook onder de driver: die wacht op de bench en stuurt zelf nooit een SIGKILL.
    - Host-git draait niet zolang de scan van de git-administratie een verschil toont, ook niet bij een herschreven `.git`-verwijzing van een submodule.
-   - Gedekt in Taak 3 en Taak 4.
+   - Gedekt in Taak 3, 4 en 7.
 4. **Een sleutel die lekt.**
    - Verwacht: met een dummywaarde in `OPENROUTER_API_KEY` staat die waarde nergens in stdout, stderr, de trace, de resultaat-JSON of het patchbestand van de bench, en ook niet in de uitvoer van de driver.
    - Gedekt in Taak 4 en Taak 7.
@@ -293,6 +297,10 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
     - `work/.git` is een bestand en geen map, met de gitdir buiten `work`;
     - HEAD staat op A;
     - een submodule in de fixture wordt op de gitlink van A gezet, met haar admin onder `gitdir/modules/`.
+    - **Lokale submodule in de test:** git 2.38.1 en later weigert een submodule-clone over `file` ("transport 'file' not allowed").
+      - Daarom zet de fixture-helper `vi.stubEnv('GIT_ALLOW_PROTOCOL', 'file')`. `execFile` erft de omgeving. Nagebootst in plan-ronde 2: zonder die variabele exit 1, met de variabele exit 0.
+      - Taak 4 en 5 gebruiken dezelfde helper.
+      - Alleen de test doet dit. De argv van de bench blijft `SAFE_GIT_CONFIG`, zonder `protocol.file.allow`. De echte submodule-URL is `https://`.
   - **De scan van de git-administratie:**
     - `snapshotAdmin` direct na `createWorkspace`;
     - daarna herschrijft de test de `.git`-verwijzing van de submodule in `work/…/` naar een andere gitdir met een hook;
@@ -511,8 +519,10 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
   - Kost de run meer dan $1,00, dan stopt M7 voor JP's besluit.
   - **Het grootboek** `$R/ledger.jsonl` krijgt:
     - de run: `{"id": "<runId>", "kind": "run", "cost_usd": <x>}`;
-    - de probe van stap 3: `{"id": "probe-qwen3.8-openrouter-<ts>", "kind": "probe", "cost_usd": <som>}`, met de som van `usage.cost` over de antwoorden in `probe.json`.
-    - Een ontbrekend bedrag wordt `null`: in het totaal telt het als 0, en het rapport noemt het.
+    - de probe van stap 3: `{"id": "probe-qwen3.8-openrouter-<ts>", "kind": "probe", "cost_usd": <som>}`.
+      - De som telt elke `usage.costUsd` onder `steps` in `probe.json`. Die staat in `steps.<stap>.raw.usage.costUsd`, en voor `c_two_tools` in `raw.turn1` en `raw.turn2`.
+      - De client zet het OpenRouter-veld `cost` om naar `costUsd` (`model-client.ts:89-93`). `probe.ts` slaat het geparste resultaat op als `raw`.
+    - Staat er geen enkel bedrag, dan wordt het `null`: in het totaal telt het als 0, en het rapport noemt het.
 
 ## Increment 2 — de takenset en de driver
 
@@ -528,7 +538,7 @@ Werkplek: de Mac, worktree `~/Development/max2-m7` op branch `feat/m7-task-bench
 - Consumes: de CLI van `harness task-bench` (Taak 4), `bench-result.json`, en `refiner/check_key.py`.
 - Produces:
   - `run.py --harness "<cmd>" --models <labels…> [--models-file models.json] --cases cases.jsonl --task-config task-config.json --out <dir> --ledger <ledger.jsonl> [--budget-stop 14]`;
-  - stopcodes: 0 klaar, 3 tweede benchfout, 4 budget, 5 probe of endpoint, 2 gebruiksfout;
+  - stopcodes: 0 klaar, 3 tweede benchfout, 4 budget, 5 probe of endpoint, 6 afgebroken (SIGINT of SIGTERM), 2 gebruiksfout;
   - `score.py <dir> --models <hosted> <gsq>`: schrijft `summary.csv` en print de tabel en het oordeel;
   - `verdict(h: int, g: int) -> str`.
 
@@ -543,7 +553,8 @@ Werkplek: de Mac, worktree `~/Development/max2-m7` op branch `feat/m7-task-bench
     - een tweede benchfout op dezelfde case geeft exit 3, met de case-id in de melding, en de volgende cases draaien niet.
   - **Grootboek:**
     - elke run voegt `{"id", "kind": "run", "label", "case", "cost_usd"}` toe aan `--ledger`;
-    - elke probe voegt `{"id", "kind": "probe", "label", "cost_usd"}` toe, met de som van `usage.cost` uit `probe.json`. Dat gebeurt vóór de volgende betaalde run;
+    - elke probe voegt `{"id", "kind": "probe", "label", "cost_usd"}` toe. Dat gebeurt vóór de volgende betaalde run;
+    - `cost_usd` van een probe is de som van elke `usage.costUsd` onder `steps` in `probe.json`, ook die in `raw.turn1` en `raw.turn2` van `c_two_tools`. Toets het met een `probe.json` met vijf verschillende bedragen boven 0 en de exacte som. Een `probe.json` zonder enig bedrag geeft `null`;
     - een ontbrekend bedrag wordt `null`: het telt als 0 in het totaal, en `score.py` noemt het aantal;
     - staat het totaal (`math.fsum`) op $14 of meer, dan start er geen run meer: exit 4;
     - het grootboek van de proef telt mee.
@@ -553,6 +564,12 @@ Werkplek: de Mac, worktree `~/Development/max2-m7` op branch `feat/m7-task-bench
     - voor een OpenRouter-label haalt de driver de publieke endpointlijst op via een te vervangen functie (in de test een nep-respons) en schrijft die naar `<out>/endpoints-<label>-<ts>.json`;
     - zonder 16-bit-endpoint met tools: exit 5.
   - **De sleutel:** met `OPENROUTER_API_KEY` als dummywaarde staat die waarde niet in stdout, stderr, het grootboek of een bestand onder `--out`. De driver geeft alleen `--api-key-env OPENROUTER_API_KEY` door.
+  - **Stoppen:**
+    - de nep-harness vangt SIGINT af, wacht 2 s en schrijft dan zijn `bench-result.json` met `benchfout` en `benchError: "afgebroken"`;
+    - de test start de driver in een eigen sessie (`start_new_session=True`) en stuurt SIGINT naar de hele procesgroep (`os.killpg`), zoals `pkill -s` in het venster;
+    - verwacht: dat resultaat bestaat, de kosten staan in het grootboek, de volgende case start niet, en de driver eindigt met exit 6;
+    - een tweede test doet hetzelfde met SIGTERM;
+    - dat afgebroken resultaat telt niet als benchfout voor de herhaalregel. Bij hervatten draait die case gewoon opnieuw.
   - **`verdict`:**
     - over alle 169 paren (0..12 × 0..12) zijn de aantallen precies 104 `gezakt`, 33 `onbeslist`, 23 `meerwaarde` en 9 `max2 volstaat`. Dat is de telling van beide reviewers in spec-ronde 1;
     - daarnaast de gevallen (8,0) onbeslist, (9,9) onbeslist, (12,9) onbeslist, (12,8) onbeslist, (12,7) meerwaarde, (10,6) meerwaarde, (10,7) onbeslist, (11,11) max2 volstaat en (7,0) gezakt.
@@ -589,6 +606,9 @@ def verdict(h, g):
     - het grootboek bijwerken;
     - de benchfoutregel.
   - De modelconfig per label schrijft hij als JSON naar `<out>/model-<label>.json`: `baseUrl`, `name`, `extraBody`, zonder sleutel.
+  - **Signalen:** `signal.signal` voor SIGINT en SIGTERM zet alleen een stopvlag en gooit geen `KeyboardInterrupt`.
+    - Daardoor wacht `subprocess.run` het kind gewoon af. Nagebootst in plan-ronde 2: met de standaardafhandeling eindigt de driver met -2 en ontbreekt het resultaat van het kind, met de handler exit 6 en een geschreven resultaat.
+    - Na de lopende aanroep volgen: het resultaat lezen, het grootboek bijwerken, en exit 6.
   - Alleen de standaardbibliotheek, zoals `refiner/run.py`.
   - **`task-config.json`:** de kopie van het `task`-blok (Taak 6).
   - **README:** doel, de twee commando's, de stopcodes, de beslisregel, en een verwijzing naar de spec.
@@ -638,7 +658,7 @@ def verdict(h, g):
   - de taakconfig is gelijk aan `worker.json` (Vensterprocedure);
   - de max2-worktree staat op de gemergde `main` met `cases.jsonl`. Gebruik op max2 een losse clone of worktree van max2 (`~/Development/max2-m7`), buiten de checkout van de worker.
 - [ ] **Het venster van ongeveer 3 uur, op JP's go**, volgens de Vensterprocedure met de sleutelstap: `run.py --harness "node /home/janpeter/Development/agent-harness-m7/dist/cli.js" --models qwen3.8-openrouter --cases llm-bench/task_bench/cases.jsonl --task-config llm-bench/task_bench/task-config.json --out $R/gehost --ledger $R/ledger.jsonl`, in tmux.
-- [ ] **Bij exit 3, 4 of 5:**
+- [ ] **Bij exit 3, 4, 5 of 6** (6 = afgebroken, na Afbreken door de operator of het vangnet):
   - herstellen;
   - de sleutel verwijderen;
   - JP melden met de reden;
@@ -746,5 +766,37 @@ Geen enkele taak hoeft weg. `verdict` haalt bij beide de telling 104/33/23/9.
 - de signaalafhandeling, naar het patroon van de worker;
 - een strengere voorwaarde voor de proef;
 - vier verduidelijkingen.
+
+Het eerste resultaat en de praktijkproef blijven in increment 1.
+
+### Ronde 2 (2026-10-02, rev 2 `c820639` → rev 3)
+
+Reviewers: `mac:codex` (0 BLOCKER, 0 MAJOR, 1 MINOR, GO) en `mac:claude` (0 BLOCKER, 1 MAJOR, 2 MINOR, NO-GO). Beide vinden de fixes van ronde 1 terug in de tree. Alleen de probekosten hielden bij beide maar half. Alle bevindingen zijn tegen de tree gecontroleerd, met een proef, en overgenomen.
+
+**MAJOR:**
+1. **De driver doodt de bench bij Afbreken** (claude).
+   - `refiner/run.py` roept de harness aan met `subprocess.run` (r. 536). Bij SIGINT wacht CPython 0,25 s en stuurt dan SIGKILL. Het opruimen van de containers wordt zo afgekapt.
+   - De containers (`docker run --rm … sh -c`, zonder `--init`, `containers.ts:52-62`) negeren het doorgestuurde signaal. De eindvoorwaarde zou dan "JP" geven, ook in het nachtvenster.
+   - Nagebootst: met `subprocess.run` eindigt de driver met -2 en ontbreekt het resultaat van een langzaam stoppend kind. Met een handler die alleen een vlag zet: exit 6, en het resultaat is geschreven.
+   - Fix (Global Constraints "Stoppen", Taak 7): de driver zet bij SIGINT en SIGTERM alleen een stopvlag, wacht de lopende aanroep af, boekt de kosten en stopt met exit 6. Een afgebroken resultaat telt niet als benchfout. Er zijn tests voor SIGINT en SIGTERM, en Taak 9 noemt exit 6.
+   - Niet overgenomen: de begrensde wachttijd in de driver (150 s) en in de eindvoorwaarde.
+     - Een driver die vóór zijn kind stopt, laat de containers alsnog achter.
+     - De grens is al de escalatie van de Vensterprocedure.
+     - Met de oorzaak weg is een extra wachttijd in de eindvoorwaarde niet nodig.
+
+**MINOR's:**
+- **Een lokale submodule in de test** (claude). Git 2.38.1 en later weigert de submodule-clone over `file`.
+  - Nagebootst met git 2.53: exit 1, "transport 'file' not allowed". Met `GIT_ALLOW_PROTOCOL=file` exit 0.
+  - Fix: de fixture-helper zet `vi.stubEnv`, voor Taak 3, 4 en 5. De argv van de bench blijft ongewijzigd.
+- **Het veld van de probekosten** (codex en claude, convergent). `probe.json` heeft `usage.costUsd`, en bij `c_two_tools` onder `raw.turn1` en `raw.turn2`. Het veld `usage.cost` bestaat er niet.
+  - Bronnen: `model-client.ts:89-93`, `probe.ts:79-105` en `cli.ts:104-108`.
+  - Fix in Taak 6 en 7: de som van elke `usage.costUsd` onder `steps`, met een test met vijf verschillende bedragen.
+
+**Nagekeken, geen bevinding:** max2 kan agent-harness en scrum4me-mcp over `https://` lezen (`git ls-remote`, alleen-lezen). Dat is nodig, want agent-harness is niet anoniem leesbaar.
+
+**Omvang:** geen nieuw onderdeel. Er komen bij:
+- een signaalhandler van een paar regels in de driver, met twee tests;
+- een testomgevingsvariabele;
+- een correctie van het kostenveld.
 
 Het eerste resultaat en de praktijkproef blijven in increment 1.
