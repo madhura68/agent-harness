@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join, sep } from 'node:path'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BenchCase } from '../src/bench/case.js'
@@ -17,7 +17,7 @@ import { benchCaseFor, benchTaskConfigFor } from './fakes/bench-case.js'
 import { benchTmp, cleanupBenchFixtures, createBenchRepo, disposeBenchRepo, type BenchRepo } from './fakes/bench-repo.js'
 import { fakeDocker, type DockerStep, type FakeDockerOptions } from './fakes/fake-docker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
-import { allFiles, bodyWithKeyAt, DUMMY_KEY, leakedFragments, readTrace } from './helpers.js'
+import { allFiles, bodyWithKeyAt, DUMMY_KEY, leakedFragments, makeFifo, readTrace } from './helpers.js'
 
 // Spies that call through. The first shows what runManifest was given; the others show which host-git steps ran, and in which order.
 const runsSeen: Array<{ manifest: Manifest; deps: RunDeps }> = []
@@ -133,6 +133,12 @@ async function bench(s: Setup = {}) {
 const outcomesOfGate = (runDir: string) => readTrace(runDir).filter((e) => e.type === 'after_answer').map((e) => e.outcome)
 const hex8Of = (result: BenchResult) => result.runId.slice(-8)
 const fileText = (runDir: string, name: string) => readFileSync(join(runDir, name), 'utf8')
+/** Everything the run wrote except the clone: the clone holds the repository, not the run. */
+const runText = (runDir: string) =>
+  allFiles(runDir)
+    .filter((f) => !f.startsWith(join(runDir, 'ws') + sep))
+    .map((f) => readFileSync(f, 'utf8'))
+    .join('\n')
 
 describe('runTaskBench — the loop is the worker loop', () => {
   it('gives runManifest the bench prompts, the six task tools and the task limits', async () => {
@@ -682,13 +688,89 @@ describe('runTaskBench — the hidden check cannot be forged', () => {
   })
 })
 
+// The hidden container runs model-written code on a writable work tree, so what it leaves at .task-bench/hidden.json is hostile until
+// proven otherwise. The bench reads that path on the host once the container is gone: it must not follow a link out of the work tree
+// (the bench user can read more than the work tree: a key file in a hosted window), and must not wait on a FIFO (the stop signals
+// could not run, and no result would be written). Such a run is a benchfout with a clear message, never a copy of a host file.
+describe('runTaskBench — a hostile report path after the hidden check', () => {
+  const MARKER = 'HOST-SECRET-MARKER-4f9c'
+  const solve = [writeZ(), say()]
+  /** A dir outside every work tree, with a file in it that holds the MARKER. */
+  function hostSide() {
+    const dir = benchTmp('host')
+    writeFileSync(join(dir, 'secret.key'), MARKER)
+    return { dir, secret: join(dir, 'secret.key') }
+  }
+  const notCopied = (t: Awaited<ReturnType<typeof bench>>) => {
+    expect(runText(t.runDir)).not.toContain(MARKER) // not in hidden-vitest.json, bench-result.json, the trace, anywhere the run wrote
+    expect(existsSync(join(t.runDir, 'hidden-vitest.json'))).toBe(false)
+    expect(t.result.hidden).toBeUndefined()
+  }
+
+  it('refuses a hidden.json that is a symlink to a file of the host: benchfout, and nothing of that file is copied', async () => {
+    const { secret } = hostSide()
+    const link: DockerStep = {
+      effect: ({ work }) => {
+        mkdirSync(join(work, '.task-bench'))
+        symlinkSync(secret, join(work, '.task-bench/hidden.json'))
+      },
+    }
+    const t = await bench({ script: solve, docker: { hidden: [link] } })
+    notCopied(t)
+    expect(t.result.status).toBe('benchfout')
+    expect(t.result.benchError).toBe('verborgen toets: .task-bench/hidden.json is een symlink, geen gewoon bestand')
+    expect(t.saved).toMatchObject({ status: 'benchfout', runStatus: 'completed' }) // the run itself was fine
+  })
+
+  it('refuses a hidden.json that is a FIFO without waiting on it: benchfout, and the result is written', async () => {
+    const fifo: DockerStep = {
+      effect: ({ work }) => {
+        mkdirSync(join(work, '.task-bench'))
+        makeFifo(join(work, '.task-bench/hidden.json'), { delayMs: 4000 }) // a read that waits on it is released only after 4 s
+      },
+    }
+    const started = Date.now()
+    const t = await bench({ script: solve, docker: { hidden: [fifo] } })
+    expect(Date.now() - started).toBeLessThan(3000) // a whole run takes about a second; a read that waits on the FIFO adds 4 s or more
+    expect(t.result.status).toBe('benchfout')
+    expect(t.result.benchError).toBe('verborgen toets: .task-bench/hidden.json is een FIFO, geen gewoon bestand')
+    expect(t.saved.status).toBe('benchfout') // bench-result.json is there
+    notCopied(t)
+  })
+
+  it('refuses .task-bench itself as a symlink to a directory outside the work tree, whatever report lies there', async () => {
+    const { dir } = hostSide()
+    const elsewhere = join(dir, 'elsewhere')
+    mkdirSync(elsewhere)
+    const swap: DockerStep = {
+      effect: ({ work }) => {
+        // a forged pass, which would be read as the verdict if the link were followed (the marker proves a copy)
+        writeFileSync(join(elsewhere, 'hidden.json'), JSON.stringify({ ...report(work, ['passed']), marker: MARKER }))
+        symlinkSync(elsewhere, join(work, '.task-bench'))
+      },
+    }
+    const t = await bench({ script: solve, docker: { hidden: [swap] } })
+    notCopied(t)
+    expect(t.result.status).toBe('benchfout') // not geslaagd
+    expect(t.result.benchError).toBe('verborgen toets: .task-bench is een symlink, geen gewone map')
+  })
+
+  it('removes a .task-bench symlink that the model run left, without touching what it pointed at', async () => {
+    const { dir } = hostSide()
+    const elsewhere = join(dir, 'elsewhere')
+    mkdirSync(elsewhere)
+    writeFileSync(join(elsewhere, 'bewaar.txt'), 'blijft staan')
+    const leave: DockerStep = { effect: ({ work }) => symlinkSync(elsewhere, join(work, '.task-bench')) } // as the model's code could
+    const seen: { atStart?: boolean } = {}
+    const hidden: DockerStep = { onStart: ({ work }) => (seen.atStart = existsSync(join(work, '.task-bench'))) } // no report: vitest died
+    const t = await bench({ script: [writeZ(), call('run_tests'), say()], docker: { verify: [leave, {}], hidden: [hidden] } })
+    expect(seen.atStart).toBe(false) // the link is gone before the hidden container starts…
+    expect(readFileSync(join(elsewhere, 'bewaar.txt'), 'utf8')).toBe('blijft staan') // …and its target is as it was
+    expect(t.result.status).toBe('verborgen_tests_rood') // no report, so no pass; the run is judged, not failed
+  })
+})
+
 describe('runTaskBench — secrets', () => {
-  /** Everything the run wrote except the clone: the clone holds the repository, not the run. */
-  const runText = (runDir: string) =>
-    allFiles(runDir)
-      .filter((f) => !f.startsWith(join(runDir, 'ws') + sep))
-      .map((f) => readFileSync(f, 'utf8'))
-      .join('\n')
   /** Collects what the run prints to stdout and stderr, until `restore()`. */
   const spyOnOutput = () => {
     const chunks: string[] = []

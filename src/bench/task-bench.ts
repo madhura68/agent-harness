@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { z } from 'zod'
 import type { Manifest, ModelSpecSchema } from '../manifest.js'
@@ -11,7 +11,7 @@ import { buildScript, containerName, runInContainer, type ContainerDeps } from '
 import { isGreen, verifyText } from '../worker/task-impl.js'
 import { createTaskTools, type VerifyRun } from '../worker/task-tools.js'
 import type { BenchCase } from './case.js'
-import { BENCH_DIR, evaluateHidden, HIDDEN_REPORT, hiddenCheckScript, type HiddenResult } from './hidden-check.js'
+import { BENCH_DIR, evaluateHidden, hiddenCheckScript, readHiddenReport, type HiddenReportRead, type HiddenResult } from './hidden-check.js'
 import { createRetryingClient, type RetryRecord } from './retry-client.js'
 import { BENCH_SYSTEM_PROMPT, benchTaskPrompt } from './task-prompt.js'
 import { AdminChangedError, assertAdminUnchanged, capturePatch, createWorkspace, restoreForHiddenCheck, snapshotAdmin, type Workspace } from './workspace.js'
@@ -137,26 +137,29 @@ export function createContainerRunner(o: { id: string; task: TaskConfig; trace: 
  * The hidden test run (spec §4.1 step 5): vitest with the JSON reporter on exactly `files`, in a verify container. The caller has put
  * `__tests__/` and the runner config back (`restoreForHiddenCheck`). `.task-bench` is removed first, so that the report can only
  * come from this container: a file the model run left there could otherwise be read as the verdict when vitest dies before it writes.
- * `hidden` is the verdict on whatever the container left (no usable report is a failed check); whether the container itself ran is
- * `run.runnerError`, and the caller must look at that first. `reportText` is the report as it was written, when there is one.
+ * The report is read with `readHiddenReport`, which refuses whatever the container made of the path (a link, a FIFO): `report` says
+ * what it found, and an `unsafe` one has no verdict (`hidden` is then only what no usable report gives). `hidden` is the verdict on
+ * whatever plain report the container left, and no report is a failed check. Whether the container itself ran is `run.runnerError`;
+ * the caller must look at that first, and then at `report`.
  */
 async function runHiddenCheck(o: {
   containers: ContainerRunner
   work: string
   files: string[]
   signal: AbortSignal
-}): Promise<{ run: VerifyRun; hidden: HiddenResult; reportText?: string }> {
+}): Promise<{ run: VerifyRun; report: HiddenReportRead; hidden: HiddenResult }> {
   rmSync(join(o.work, BENCH_DIR), { recursive: true, force: true })
   const run = await o.containers.run({ worktree: o.work, kind: 'verify', source: 'hidden_check', script: buildScript([hiddenCheckScript(o.files)]), signal: o.signal })
-  let reportText: string | undefined
+  const report = readHiddenReport(o.work)
   let json: unknown
-  try {
-    reportText = readFileSync(join(o.work, HIDDEN_REPORT), 'utf8')
-    json = JSON.parse(reportText)
-  } catch {
-    // No usable report: evaluateHidden says so.
+  if (report.kind === 'report') {
+    try {
+      json = JSON.parse(report.text)
+    } catch {
+      // No usable report: evaluateHidden says so.
+    }
   }
-  return { run, hidden: evaluateHidden({ exitCode: run.exitCode, json, work: o.work, files: o.files }), ...(reportText !== undefined ? { reportText } : {}) }
+  return { run, report, hidden: evaluateHidden({ exitCode: run.exitCode, json, work: o.work, files: o.files }) }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -334,7 +337,12 @@ export async function runTaskBench(o: {
       benchError = `verborgen toets: ${check.run.runnerError}`
       return
     }
-    if (check.reportText !== undefined) writeFileSync(join(trace.dir, 'hidden-vitest.json'), check.reportText)
+    if (check.report.kind === 'unsafe') {
+      // The container made a link or a FIFO of the report: no verdict can come from it, and nothing of it is copied.
+      benchError = `verborgen toets: ${check.report.why}`
+      return
+    }
+    if (check.report.kind === 'report') writeFileSync(join(trace.dir, 'hidden-vitest.json'), check.report.text) // what was read from the checked descriptor
     hidden = check.hidden
   }
 

@@ -1,10 +1,11 @@
 import { execFile } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
-import { evaluateHidden, hiddenCheckScript } from '../src/bench/hidden-check.js'
+import { BENCH_DIR, evaluateHidden, HIDDEN_REPORT, hiddenCheckScript, MAX_HIDDEN_REPORT_BYTES, readHiddenReport } from '../src/bench/hidden-check.js'
+import { makeFifo } from './helpers.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -236,5 +237,168 @@ describe('evaluateHidden', () => {
     const json = report(fileResult(`${WORK}/${B}`, ['passed']))
     expect(evaluateHidden({ exitCode: 0, json, work: WORK, files: [B] }).pass).toBe(true)
     expect(evaluateHidden({ exitCode: 0, json, work: `${WORK}/sub`, files: [B] }).pass).toBe(false)
+  })
+})
+
+// The container that runs the hidden tests runs model-written code with the work tree mounted writable, so whatever it leaves at
+// `.task-bench/hidden.json` is the model's doing: a symlink to a file of the host, a FIFO, a directory. The bench reads that path on
+// the host after the container is gone, and it must never follow, wait for, or copy anything but a plain file that lies in the work tree.
+describe('readHiddenReport', () => {
+  const SECRET = 'HOST-SECRET-MARKER-7c1e' // in a host file that must never be read
+
+  /** A work tree, and a host dir outside it that holds `secret.txt` (the SECRET) and a dir `elsewhere/` with a hidden.json of its own. */
+  function setup() {
+    const work = tmp('report-work')
+    const host = tmp('report-host')
+    writeFileSync(join(host, 'secret.txt'), SECRET)
+    mkdirSync(join(host, 'elsewhere'))
+    writeFileSync(join(host, 'elsewhere', 'hidden.json'), JSON.stringify({ testResults: [], marker: SECRET }))
+    return { work, secret: join(host, 'secret.txt'), elsewhere: join(host, 'elsewhere') }
+  }
+  const reportPath = (work: string) => join(work, HIDDEN_REPORT)
+  /** `.task-bench/` as a real directory, as vitest makes it. */
+  const benchDir = (work: string) => mkdirSync(join(work, BENCH_DIR), { recursive: true })
+  /** What a refusal must look like: it names the problem, and nothing of the host file is in it. */
+  function expectUnsafe(read: ReturnType<typeof readHiddenReport>, ...about: string[]) {
+    expect(read.kind).toBe('unsafe')
+    const why = read.kind === 'unsafe' ? read.why : ''
+    for (const word of about) expect(why).toContain(word)
+    expect(JSON.stringify(read)).not.toContain(SECRET)
+  }
+
+  it('reads a plain report as text', () => {
+    const { work } = setup()
+    benchDir(work)
+    const text = JSON.stringify({ testResults: [], naam: 'één test ✓' })
+    writeFileSync(reportPath(work), text)
+    expect(readHiddenReport(work)).toEqual({ kind: 'report', text })
+  })
+
+  it('reads an empty file as an empty report, and a report of exactly the cap in full', () => {
+    const { work } = setup()
+    benchDir(work)
+    writeFileSync(reportPath(work), '')
+    expect(readHiddenReport(work)).toEqual({ kind: 'report', text: '' })
+    writeFileSync(reportPath(work), 'x'.repeat(MAX_HIDDEN_REPORT_BYTES))
+    const read = readHiddenReport(work)
+    expect(read.kind === 'report' && read.text.length).toBe(MAX_HIDDEN_REPORT_BYTES)
+  })
+
+  it('finds nothing when vitest wrote no report: no .task-bench, or no hidden.json in it', () => {
+    const { work } = setup()
+    expect(readHiddenReport(work)).toEqual({ kind: 'none' })
+    benchDir(work)
+    expect(readHiddenReport(work)).toEqual({ kind: 'none' })
+  })
+
+  it('refuses a hidden.json that is a symlink to a file of the host, and reads none of it', () => {
+    const { work, secret } = setup()
+    benchDir(work)
+    symlinkSync(secret, reportPath(work))
+    expectUnsafe(readHiddenReport(work), HIDDEN_REPORT, 'symlink')
+  })
+
+  it('refuses a hidden.json that is a symlink that leads nowhere', () => {
+    const { work } = setup()
+    benchDir(work)
+    symlinkSync(join(work, 'bestaat-niet'), reportPath(work))
+    expectUnsafe(readHiddenReport(work), HIDDEN_REPORT, 'symlink')
+  })
+
+  it('refuses a hidden.json that is a FIFO at once, without waiting for a writer that never comes', () => {
+    const { work } = setup()
+    benchDir(work)
+    makeFifo(reportPath(work))
+    const started = Date.now()
+    expectUnsafe(readHiddenReport(work), HIDDEN_REPORT, 'FIFO')
+    expect(Date.now() - started).toBeLessThan(1000) // makeFifo's writer only comes at 1500 ms
+  })
+
+  it('refuses a hidden.json that is a directory', () => {
+    const { work } = setup()
+    benchDir(work)
+    mkdirSync(reportPath(work))
+    expectUnsafe(readHiddenReport(work), HIDDEN_REPORT, 'map')
+  })
+
+  it('refuses a report over the cap', () => {
+    const { work } = setup()
+    benchDir(work)
+    writeFileSync(reportPath(work), 'x'.repeat(MAX_HIDDEN_REPORT_BYTES + 1))
+    expectUnsafe(readHiddenReport(work), HIDDEN_REPORT, 'te groot')
+  })
+
+  it('refuses .task-bench as a symlink to a directory outside the work tree, and reads the report in that directory not', () => {
+    const { work, elsewhere } = setup()
+    symlinkSync(elsewhere, join(work, BENCH_DIR))
+    expectUnsafe(readHiddenReport(work), BENCH_DIR, 'symlink')
+  })
+
+  it('refuses .task-bench as a plain file, and as a FIFO', () => {
+    const { work } = setup()
+    writeFileSync(join(work, BENCH_DIR), 'geen map')
+    expectUnsafe(readHiddenReport(work), BENCH_DIR, 'gewoon bestand')
+    rmSync(join(work, BENCH_DIR))
+    makeFifo(join(work, BENCH_DIR))
+    expectUnsafe(readHiddenReport(work), BENCH_DIR, 'FIFO')
+  })
+
+  // A container can also make the path impossible to look at: chmod 0 on its own directory shuts out the owner too. Not a plain missing
+  // report (that is the model's doing as much as vitest's), but not something to read or to score either. (root ignores modes.)
+  describe.skipIf(process.getuid?.() === 0)('when the path cannot be looked at', () => {
+    it('refuses a .task-bench that cannot be entered', () => {
+      const { work } = setup()
+      benchDir(work)
+      writeFileSync(reportPath(work), '{}')
+      chmodSync(join(work, BENCH_DIR), 0)
+      try {
+        expectUnsafe(readHiddenReport(work), HIDDEN_REPORT, 'kon niet worden onderzocht')
+      } finally {
+        chmodSync(join(work, BENCH_DIR), 0o755) // so that the cleanup can remove it
+      }
+    })
+
+    it('refuses a work tree whose .task-bench cannot be looked at', () => {
+      const { work } = setup()
+      benchDir(work)
+      chmodSync(work, 0)
+      try {
+        expectUnsafe(readHiddenReport(work), BENCH_DIR, 'kon niet worden onderzocht')
+      } finally {
+        chmodSync(work, 0o755)
+      }
+    })
+  })
+
+  // The look at the path (lstat) and the open are two moments. These tests make the first one believe that all is well, as if the
+  // path had been swapped in between, and show that the open and the checks on the descriptor refuse it on their own.
+  describe('when the path is swapped after the first look', () => {
+    const believingItIsPlain = (work: string, secret: string) => {
+      const plain = lstatSync(secret) // the Stats of a small regular file
+      return { lstatSync: (path: string) => (path === reportPath(work) ? plain : lstatSync(path)) }
+    }
+
+    it('does not follow a symlink: the open refuses it (O_NOFOLLOW)', () => {
+      const { work, secret } = setup()
+      benchDir(work)
+      symlinkSync(secret, reportPath(work))
+      expectUnsafe(readHiddenReport(work, believingItIsPlain(work, secret)), HIDDEN_REPORT, 'niet veilig worden geopend')
+    })
+
+    it('does not wait on a FIFO: the open does not block (O_NONBLOCK), and the descriptor says it is no file', () => {
+      const { work, secret } = setup()
+      benchDir(work)
+      makeFifo(reportPath(work))
+      const started = Date.now()
+      expectUnsafe(readHiddenReport(work, believingItIsPlain(work, secret)), HIDDEN_REPORT, 'FIFO')
+      expect(Date.now() - started).toBeLessThan(1000) // makeFifo's writer only comes at 1500 ms
+    })
+
+    it('does not read a file that has outgrown the cap: the descriptor has the size', () => {
+      const { work, secret } = setup()
+      benchDir(work)
+      writeFileSync(reportPath(work), 'x'.repeat(MAX_HIDDEN_REPORT_BYTES + 1))
+      expectUnsafe(readHiddenReport(work, believingItIsPlain(work, secret)), HIDDEN_REPORT, 'te groot')
+    })
   })
 })
