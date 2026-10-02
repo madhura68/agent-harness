@@ -1,6 +1,6 @@
 # M7 — task-bench: Qwen 3.8 voor een 96 GB-machine op echt werk — implementatieplan
 
-_Status: draft, revisie 1 (2026-10-02). Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: draft, revisie 2 (2026-10-02). Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -60,8 +60,16 @@ _Status: draft, revisie 1 (2026-10-02). Een technisch GO autoriseert geen ceremo
   - uitvoer naar `~/m7-runs/task-bench-<datum>/` (`$R`), en een kopie op de Mac in `~/Development/m7-runs/task-bench-<datum>/` (`$M`);
   - de Ollama-config, de productieconfig en het model van de worker niet wijzigen.
 - **Host-git in de bench:**
-  - Elke git-aanroep op de host gebruikt `SAFE_GIT_CONFIG` uit `src/worker/host-git.ts` en altijd expliciet `--git-dir=<gitdir>` en `--work-tree=<work>`.
-  - De gitdir staat buiten de map die in een container wordt gemount. Zo kan testcode in een container geen hooks of config planten die git op de host uitvoert.
+  - Elke git-aanroep op de host gebruikt `SAFE_GIT_CONFIG` uit `src/worker/host-git.ts`.
+  - **De clone is de enige uitzondering:** `git <SAFE_GIT_CONFIG> clone --no-checkout --separate-git-dir <gitdir> <url> <work>`, zonder globale `--git-dir`/`--work-tree`. Met die twee faalt de clone ("work already exists"; nagebootst in plan-ronde 1).
+  - Elke andere aanroep krijgt expliciet `--git-dir=<gitdir>` en `--work-tree=<work>`.
+  - De gitdir (ook die van submodules, onder `<gitdir>/modules/`) staat buiten de map die in een container wordt gemount.
+  - **De scan is de eigenlijke controle,** zoals `host-git.ts:10-16` zegt. De `.git`-verwijzing van een submodule (bijvoorbeeld `work/vendor/scrum4me-shared/.git`) staat wél in de mount.
+    - Daarom neemt de bench met `snapshotGitAdmin(work)` een momentopname direct na `createWorkspace`, vóór de eerste container.
+    - Vóór elke host-git-aanroep na een container vergelijkt hij met `diffGitAdmin`. Elk verschil is een benchfout, met de paden, en daarna draait er geen host-git meer.
+- **Stoppen:** `harness task-bench` (ook met `--check-case`) vangt SIGINT en SIGTERM af.
+  - Het breekt modelverzoeken, de wachttijd van de herhaling en de containers af, en wacht tot alle containers zijn opgeruimd.
+  - Daarna schrijft het `bench-result.json` (status `benchfout`, `benchError: "afgebroken"`) en stopt het.
 - **Forgejo is de forge, nooit `gh`.**
   - Geen merge zonder JP.
   - Nooit `git branch -D`, nooit een kale `git stash`, geen `--force` bij `git worktree remove`.
@@ -87,6 +95,9 @@ Alleen de namen en vier punten zijn anders voor M7:
   - Het run-script leest het bestand één keer in met `export OPENROUTER_API_KEY="$(cat /run/user/1000/m7-openrouter.key)"`.
   - Na Herstellen: `ssh max2 'rm -f /run/user/1000/m7-openrouter.key'`. Dat is een tijdelijke kopie van een geheim die M7 zelf maakte.
   - Daarna `test ! -e` als controle.
+- **Eindvoorwaarde:**
+  - Na de voorwaarde van M6 (de sessie is weg en `pgrep -s "$sid"` geeft 1) moet ook `docker ps -aq --filter name=^harness-` leeg zijn, vóór Herstellen.
+  - Niet leeg: niet herstellen, en JP. Containers zijn kinderen van dockerd, niet van de tmux-sessie.
 - **Taakconfig-controle per venster:** het `task`-blok van `/etc/agent-harness/worker.json` moet gelijk zijn aan `llm-bench/task_bench/task-config.json`. Python vergelijkt beide als JSON-objecten. Wijken ze af, dan stoppen en JP.
 - **Nachtvenster:** een vangnet volgens het voorbeeld `llm-bench/results/refiner-precisie-2026-10-01/q8-docs-vangnet.sh` in max2.
   - Het doet niets tot 20 minuten vóór het einde van het venster. Leeft de run dan nog, dan Afbreken en Herstellen.
@@ -102,9 +113,10 @@ Alleen de namen en vier punten zijn anders voor M7:
    - Verwacht: alleen netwerkfouten, 408, 429 en 5xx, of een foutbody met zo'n code, worden herhaald, hooguit 3 keer, binnen de deadline, nooit na een afgebroken signaal, en alleen op de gehoste route.
    - Ongeldige JSON, tool- of schemafouten en rode tests worden nooit herhaald.
    - Gedekt in Taak 2.
-3. **Een container die niet aantoonbaar stopt, of host-git na een container.**
+3. **Een container die niet aantoonbaar stopt, een stop van buiten, of host-git na een container.**
    - Verwacht: de run stopt als benchfout en er start geen container meer.
-   - Host-git leest nooit een `.git` in de werkmap: de gitdir staat erbuiten, met `SAFE_GIT_CONFIG`.
+   - Bij SIGINT of SIGTERM wacht de bench tot de containers zijn opgeruimd.
+   - Host-git draait niet zolang de scan van de git-administratie een verschil toont, ook niet bij een herschreven `.git`-verwijzing van een submodule.
    - Gedekt in Taak 3 en Taak 4.
 4. **Een sleutel die lekt.**
    - Verwacht: met een dummywaarde in `OPENROUTER_API_KEY` staat die waarde nergens in stdout, stderr, de trace, de resultaat-JSON of het patchbestand van de bench, en ook niet in de uitvoer van de driver.
@@ -268,6 +280,7 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
 - Produces:
   - `type Workspace = { work: string; gitdir: string }`;
   - `createWorkspace(o: { repoUrl: string; commit: string; dir: string }): Promise<Workspace>`, die `<dir>/work` en `<dir>/gitdir` maakt;
+  - `snapshotAdmin(ws: Workspace): Promise<GitAdminSnapshot>` en `assertAdminUnchanged(ws: Workspace, snap: GitAdminSnapshot): Promise<void>`. Die tweede gooit `AdminChangedError` met de paden van `diffGitAdmin`. Beide gebruiken `snapshotGitAdmin(ws.work)` en `diffGitAdmin` uit `host-git.ts`;
   - `capturePatch(ws: Workspace, base: string): Promise<{ patch: string; empty: boolean }>`;
   - `restoreForHiddenCheck(ws: Workspace, ref: string): Promise<void>`;
   - `hiddenCheckScript(files: string[]): string`;
@@ -276,10 +289,16 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
 
 - [ ] **Eerst de tests.** Ze maken in een tijdelijke map een fixture-repo met `git init`. Die heeft een commit A (`src/x.ts`, `__tests__/a.test.ts`, `vitest.config.ts`) en een commit B, die `src/y.ts`, `__tests__/b.test.ts` en een gewijzigde `__tests__/a.test.ts` toevoegt.
   - **`createWorkspace`** (clone vanaf `file://…`):
+    - de clone gebruikt precies de bootstrap-argv uit de Global Constraints, zonder globale `--git-dir`/`--work-tree`. De test legt de argv vast via een te vervangen `execFile`;
     - `work/.git` is een bestand en geen map, met de gitdir buiten `work`;
     - HEAD staat op A;
-    - een submodule in de fixture wordt op de gitlink van A gezet.
-  - **Host-git:** elke host-git-aanroep loopt via `SAFE_GIT_CONFIG` en `--git-dir`/`--work-tree`. Toets dat met een hook die een bestand zou maken:
+    - een submodule in de fixture wordt op de gitlink van A gezet, met haar admin onder `gitdir/modules/`.
+  - **De scan van de git-administratie:**
+    - `snapshotAdmin` direct na `createWorkspace`;
+    - daarna herschrijft de test de `.git`-verwijzing van de submodule in `work/…/` naar een andere gitdir met een hook;
+    - `assertAdminUnchanged` gooit `AdminChangedError` met dat pad;
+    - een ongewijzigde werkruimte geeft geen fout.
+  - **Host-git:** elke host-git-aanroep na de clone loopt via `SAFE_GIT_CONFIG` en `--git-dir`/`--work-tree`. Toets dat met een hook die een bestand zou maken:
     - zet `gitdir/hooks/post-checkout`;
     - zet ook een kwaadaardig `work/.git`-bestand dat naar een andere gitdir wijst;
     - na `capturePatch` en `restoreForHiddenCheck` bestaat het hook-bestand niet, en is de echte gitdir gebruikt.
@@ -298,11 +317,13 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
     - één `skipped`, `pending` of `todo` geeft `false`;
     - een verborgen bestand dat niet in `testResults` staat geeft `false`, met als reden "niet gedraaid";
     - een bestand zonder `assertionResults` (bijvoorbeeld een importfout) geeft `false`;
-    - exit 0 met ontbrekende of onleesbare JSON geeft `false`.
+    - exit 0 met ontbrekende of onleesbare JSON geeft `false`;
+    - een `work` via een symlink, terwijl de JSON het echte pad noemt (zoals vitest doet), geeft wel `pass: true`.
   - **`hiddenCheckScript(['__tests__/b.test.ts'])`** is `npx vitest run --reporter=json --outputFile=.task-bench/hidden.json '__tests__/b.test.ts'`, met elk pad shell-veilig gequote.
 - [ ] De tests falen.
-- [ ] **De implementatie.** Elke host-git-aanroep gaat via `execFile('git', [...SAFE_GIT_CONFIG, '--git-dir', ws.gitdir, '--work-tree', ws.work, ...args])`, ook als argv en nooit via een shell.
-  - **Clone:** `git clone --no-checkout --separate-git-dir <dir>/gitdir <repoUrl> <dir>/work`, daarna `checkout --detach <commit>` en `submodule update --init --recursive`.
+- [ ] **De implementatie.** Elke host-git-aanroep na de clone gaat via `execFile('git', [...SAFE_GIT_CONFIG, '--git-dir', ws.gitdir, '--work-tree', ws.work, ...args], { cwd: ws.work })`, als argv en nooit via een shell.
+  - **Clone (bootstrap):** `execFile('git', [...SAFE_GIT_CONFIG, 'clone', '--no-checkout', '--separate-git-dir', <dir>/gitdir, repoUrl, <dir>/work])`. Daarna, met de expliciete opties: `checkout --detach <commit>` en `submodule update --init --recursive`.
+  - **Scan:** `snapshotAdmin` en `assertAdminUnchanged` zijn dunne laagjes over `snapshotGitAdmin(ws.work)` en `diffGitAdmin`. Wie ze aanroept, staat in Taak 4 en 5.
   - **Patch:** `add -A -- . ':(exclude).task-bench'`, daarna `diff --cached --binary <base>`.
   - **Terugzetten** (exact, spec §4.1 stap 5):
 
@@ -312,14 +333,14 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
 // 3. if (keep.length > 0) await git(ws, ['checkout', ref, '--', ...keep])
 ```
 
-  - **`evaluateHidden`:** zoek per verborgen bestand de `testResults`-regel waarvoor `path.relative(work, name) === file`. Geslaagd als `exitCode === 0` en voor elk bestand geldt: `ran`, minstens één assertie, alles `passed`.
+  - **`evaluateHidden`:** zoek per verborgen bestand de `testResults`-regel waarvoor `path.relative(realpathSync(work), realpathSync(name)) === file`. Een naam die niet bestaat, valt terug op de naam zelf. Vitest meldt echte paden; dat is nagemeten met vitest 5.0.2 in plan-ronde 1. Geslaagd als `exitCode === 0` en voor elk bestand geldt: `ran`, minstens één assertie, alles `passed`.
 - [ ] `npm run verify` is groen. Commit: `feat(bench): werkruimte buiten de containermount en verborgen toets (M7)`.
 
 ### Taak 4: `harness task-bench`
 
 **Files:**
 - Create: `src/bench/task-bench.ts`
-- Modify: `src/cli.ts` (USAGE, `cliArgsConfig.options`, `switch`)
+- Modify: `src/cli.ts` (USAGE, `cliArgsConfig.options`, `switch`, de signaalafhandeling); `src/trace.ts` (`TraceEvent` krijgt `{ type: 'model_retry'; attempt: number; kind: string; status?: number; bodyCode?: number }`, gelijk aan `RetryRecord`)
 - Test: `__tests__/bench-task-bench.test.ts`, `__tests__/cli.test.ts` (USAGE en argumentfouten)
 
 **Interfaces:**
@@ -332,7 +353,7 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
   - `type ModelSpec = z.infer<typeof ModelSpecSchema>`;
   - `type BenchStatus = 'geslaagd' | 'verborgen_tests_rood' | 'verify_rood' | 'limiet' | 'geen_wijzigingen' | 'benchfout'`;
   - `type BenchDeps = { containerDeps?: ContainerDeps; createClient?: (m: ModelSpec & { apiKey?: string }) => ModelClient; sleep?: (ms: number, signal: AbortSignal) => Promise<void> }`. Tests zetten hier een nep-`spawn` en een nep-`sleep`; standaard gelden de echte `docker` en `createModelClient`;
-  - `runTaskBench(o: { case: BenchCase; model: ModelSpec; label: string; task: TaskConfig; out: string; apiKey?: string; retryTransient: boolean; deps?: BenchDeps }): Promise<BenchResult>`;
+  - `runTaskBench(o: { case: BenchCase; model: ModelSpec; label: string; task: TaskConfig; out: string; apiKey?: string; retryTransient: boolean; signal?: AbortSignal; deps?: BenchDeps }): Promise<BenchResult>`. `signal` is de stop van buiten;
   - `mapStatus(…): BenchStatus` (code hieronder);
   - `BenchResult`, geschreven naar `<out>/<runId>/bench-result.json`: `{ caseId, label, runId, model: {name, baseUrl}, status, runStatus, error?: {code, message}, gate: {reds, lastTail?}, hidden?: HiddenResult, usage: RunResult['usage'], providers: string[], retries: RetryRecord[], patchBytes: number, durationMs, benchError?: string }`;
   - CLI: `harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]`. Exit 0 als `bench-result.json` geschreven is, ook bij elke status; anders 1.
@@ -357,6 +378,12 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
     - een fout in de container van de verborgen toets (`runnerError`) geeft `benchfout`.
   - **Herhaling:** met `retryTransient: true` geeft de nep-server eerst 503 en dan een antwoord. De run gaat door, en `retries` heeft één record. Met `false` eindigt dezelfde run op `MODEL_ERROR` en dus `benchfout`.
   - **Aanbieders:** `providers` bevat het `provider`-veld van elke respons, in volgorde.
+  - **Stop van buiten:**
+    - een `signal` dat afbreekt terwijl een nep-container loopt, eindigt met `benchfout` en `benchError: "afgebroken"`, nadat de container is opgeruimd. Daarna start er geen container meer;
+    - een afbreking tijdens de wachttijd van een herhaling geeft hetzelfde, zonder nieuw modelverzoek;
+    - `bench-result.json` bestaat in beide gevallen.
+  - **De scan:** een nep-prepare herschrijft de `.git`-verwijzing van de submodule. Dat geeft een benchfout met dat pad, en `capturePatch` en `restoreForHiddenCheck` worden niet aangeroepen. Toets dat met een te vervangen git-functie.
+  - **Het trace-event:** `trace.jsonl` heeft na een herhaling een `model_retry`-regel, zonder sleutel.
   - **Geheimen:** met `apiKey` gelijk aan een dummywaarde komt die waarde niet voor in `bench-result.json`, `trace.jsonl`, `patch.diff`, stdout of stderr. De manifest in de trace heeft geen `apiKey`.
   - **CLI:**
     - `task-bench` zonder `--case` geeft een gebruiksfout met exit 1;
@@ -365,7 +392,7 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
 - [ ] De tests falen.
 - [ ] **De implementatie** van `runTaskBench`, in deze volgorde:
   1. `runId = \`${case.id}-${label}-${hex8}\``, met `hex8` uit 4 willekeurige bytes. `containerName` krijgt `hex8`, want die gebruikt de eerste 8 tekens.
-  2. `trace = openTrace(out, runId)`, de werkruimte in `join(trace.dir, 'ws')`, en `recipe = findRecipe(task, case.repo_url)`. Geen recept geeft een benchfout.
+  2. `trace = openTrace(out, runId)`, de werkruimte in `join(trace.dir, 'ws')`, en `recipe = findRecipe(task, case.repo_url)`. Geen recept geeft een benchfout. Direct na `createWorkspace` volgt `snap = await snapshotAdmin(ws)`, vóór de eerste container. `inner` is een `AbortController` gekoppeld aan `o.signal`.
   3. **Containers** zoals in `runTaskJob` (`src/worker/task-impl.ts` r. 232-262):
      - een `inFlight`-set en `settleContainers()`;
      - een `uncertain`-vlag die `inner.abort()` doet en elke volgende container weigert;
@@ -374,10 +401,13 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
   5. De gate is een letterlijke kopie van `afterAnswer` uit `runTaskJob` (r. 337-345), met de geëxporteerde `isGreen` en `verifyText`.
   6. De modelclient is `createModelClient({ ...model, apiKey })`, gewikkeld in `createRetryingClient` als `retryTransient` aan staat. `onRetry` schrijft een `trace.event({ type: 'model_retry', … })` en vult `retries`.
   7. `runManifest(manifest, { client, trace, connectRegistry: async () => createTaskTools({ root: ws.work, runVerify: (s) => runVerify('run_tests', s) }), signal: inner.signal, afterAnswer })`.
-  8. `settleContainers()`. `uncertain` geeft een benchfout.
-  9. `capturePatch` naar `<trace.dir>/patch.diff`.
-  10. Als de run `completed` is en de patch niet leeg: `restoreForHiddenCheck`, een verify-container met `hiddenCheckScript(case.hidden_tests)`, `.task-bench/hidden.json` lezen, kopiëren naar `<trace.dir>/hidden-vitest.json`, en `evaluateHidden`.
-  11. `mapStatus` (hieronder), daarna `bench-result.json` schrijven.
+  8. `settleContainers()`. `uncertain` geeft een benchfout, en een afgebroken `o.signal` ook (`benchError: "afgebroken"`).
+  9. `assertAdminUnchanged(ws, snap)`, daarna `capturePatch` naar `<trace.dir>/patch.diff`. Bij `AdminChangedError` volgt een benchfout, zonder verdere host-git.
+  10. Als de run `completed` is en de patch niet leeg:
+      - `assertAdminUnchanged` en `restoreForHiddenCheck`;
+      - een verify-container met `hiddenCheckScript(case.hidden_tests)`;
+      - `.task-bench/hidden.json` lezen, kopiëren naar `<trace.dir>/hidden-vitest.json`, en `evaluateHidden`.
+  11. `mapStatus` (hieronder), daarna `bench-result.json` schrijven. Dat gebeurt ook op elk pad dat een benchfout geeft.
 
   **De statusmapping** (een kwetsbaar contract):
 
@@ -398,6 +428,7 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
   **De CLI:**
   - Lees `--case` met `BenchCaseSchema`, `--model-config` met `ModelSpecSchema` zonder `apiKey` (een `apiKey` in het bestand is een fout), en `--task-config` met `TaskConfigSchema`.
   - `readApiKey(values['api-key-env'])` vóór er iets start.
+  - **Signalen:** net als `cmdWorker` (`cli.ts:209-210`) een `AbortController` met `process.once('SIGINT', …)` en `process.once('SIGTERM', …)`. Het signaal gaat als `signal` naar `runTaskBench` of `checkCase`, en de CLI wacht op hun afronding voordat hij stopt.
   - Druk één regel af: `<status> — <runId> → <pad naar bench-result.json>`.
 - [ ] `npm run verify` is groen. Commit: `feat(bench): harness task-bench (M7)`.
 
@@ -409,7 +440,7 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
 
 **Interfaces:**
 - Produces:
-  - `checkCase(o: { case: BenchCase; task: TaskConfig; out: string; deps?: BenchDeps }): Promise<CaseCheck>`;
+  - `checkCase(o: { case: BenchCase; task: TaskConfig; out: string; signal?: AbortSignal; deps?: BenchDeps }): Promise<CaseCheck>`;
   - `CaseCheck`, geschreven naar `<out>/<case.id>-check-<hex8>/case-check.json`: `{ caseId, ok: boolean, baseVerifyGreen, hiddenOnBase: HiddenResult, hiddenOnRef: HiddenResult, refChangesRunnerConfig: boolean, hiddenMatchesRef: boolean, lines, problems: string[] }`;
   - CLI: `harness task-bench --check-case --case <json> --task-config <json> --out <dir>`. Er is geen model en geen sleutel. Exit 0 bij `ok`, anders 1.
 
@@ -417,12 +448,23 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
   - een geldige case (verify groen op A, b-test rood op A, groen op B) geeft `ok: true`;
   - een rode verify op A geeft `false`, met als probleem "verify rood op base_commit";
   - een verborgen test die al slaagt op A geeft `false`, met als probleem "verborgen test slaagt al op base_commit";
+  - een verborgen toets op A die niet echt faalt, geeft `false`, met als probleem "verborgen toets op base_commit zonder echte testfout":
+    - een `runnerError`;
+    - een time-out;
+    - een `exitCode` van `null`;
+    - geen enkel verborgen bestand met status `failed` in de JSON;
+  - een herschreven `.git`-verwijzing van een submodule na prepare geeft `false`, met het pad en zonder verdere host-git;
   - een `ref_commit` die `vitest.config.ts` of `package.json` wijzigt geeft `false`, met als probleem "ref_commit wijzigt de runnerconfig";
   - `hidden_tests` die niet gelijk zijn aan de `*.test.ts` onder `__tests__/` die `ref_commit` toevoegt of wijzigt, gaan op `false`.
 - [ ] De tests falen.
 - [ ] **De implementatie:**
-  - **Werkruimte 1 op `base_commit`:** prepare, verify. Daarna `restoreForHiddenCheck(ws, ref)` en de verborgen toets; die moet zakken.
-  - **Werkruimte 2 op `ref_commit`:** prepare en de verborgen toets; die moet slagen.
+  - **Werkruimte 1 op `base_commit`:**
+    - eerst `snapshotAdmin`;
+    - dan prepare en verify;
+    - dan `assertAdminUnchanged` en `restoreForHiddenCheck(ws, ref)`;
+    - dan de verborgen toets. Die moet echt falen: `exitCode` niet `null`, geen time-out, geen `runnerError`, en minstens één verborgen bestand met status `failed` (ook een importfout telt).
+  - **Werkruimte 2 op `ref_commit`:** `snapshotAdmin`, prepare, `assertAdminUnchanged`, en de verborgen toets. Die moet slagen (`evaluateHidden(...).pass`).
+  - **Signalen:** zoals in Taak 4. Na een afbreking schrijft hij een `case-check.json` met `ok: false` en `problems: ["afgebroken"]`.
   - **Vanuit werkruimte 1:**
     - `diff --name-only base ref` levert de gewijzigde paden: die bepalen `refChangesRunnerConfig` en `hiddenMatchesRef`;
     - `diff --shortstat base ref` levert de omvang (`lines`).
@@ -456,14 +498,21 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
   4. **De run** in tmux, in een script dat de sleutel inleest: `node …/cli.js task-bench --case <case> --model-config $R/model-qwen3.8-openrouter.json --task-config $R/task-config.json --label qwen3.8-openrouter --out $R/proef --api-key-env OPENROUTER_API_KEY --retry-transient`.
   5. Wachten, Herstellen, de sleutel verwijderen, de dienststand na.
 - [ ] **Controle op de Mac** na `rsync -a max2:m7-runs/task-bench-<datum>/ "$M/"`:
-  - `bench-result.json` bestaat, en de status is een van de zes;
-  - elke `providers`-waarde is een aanbieder die in `endpoints-proef.json` met `bf16` of `fp16` staat;
+  - `case-check.json` van stap 1 heeft `ok: true`. Daarmee draaide de verborgen toets met echte containers: echt falend op `base_commit`, slagend op `ref_commit`, en met de `__tests__/` en de runnerconfig van `ref_commit`;
+  - `bench-result.json` bestaat;
+  - `providers` heeft minstens één waarde, en elke waarde is een aanbieder die in `endpoints-proef.json` met `bf16` of `fp16` staat;
   - `retries` is geteld;
-  - `hidden-vitest.json` bestaat als de run `completed` was;
   - `check_key.py --env OPENROUTER_API_KEY "$M"` geeft `with_key=0` en exit 0.
+- [ ] **Wanneer is de proef geslaagd?** Spec §5 criterium 2 vraagt ook dat de verborgen toets in de proef draaide, op het pad van het model.
+  - Dat is zo als de run `completed` eindigde met een niet-lege patch, zodat `hidden-vitest.json` bestaat.
+  - De status mag dan `geslaagd` of `verborgen_tests_rood` zijn: de proef toetst het pad, niet het model.
+  - Eindigt de run op `limiet`, `verify_rood`, `geen_wijzigingen` of `benchfout`, dan is criterium 2 niet gehaald. Bewijs en kosten blijven bewaard, de diensten worden hersteld, en M7 stopt voor JP. JP kiest een andere proeftaak, of accepteert het bewijs van stap 1.
 - [ ] **Melden aan JP:** de status, de kosten (`usage.costUsd`), de tijd, de modelbeurten, de herhalingen en de aanbieders.
   - Kost de run meer dan $1,00, dan stopt M7 voor JP's besluit.
-  - De kosten openen het grootboek: `$R/ledger.jsonl` krijgt `{"run": "<runId>", "cost_usd": <x>}`.
+  - **Het grootboek** `$R/ledger.jsonl` krijgt:
+    - de run: `{"id": "<runId>", "kind": "run", "cost_usd": <x>}`;
+    - de probe van stap 3: `{"id": "probe-qwen3.8-openrouter-<ts>", "kind": "probe", "cost_usd": <som>}`, met de som van `usage.cost` over de antwoorden in `probe.json`.
+    - Een ontbrekend bedrag wordt `null`: in het totaal telt het als 0, en het rapport noemt het.
 
 ## Increment 2 — de takenset en de driver
 
@@ -493,7 +542,9 @@ Werkplek: de Mac, worktree `~/Development/max2-m7` op branch `feat/m7-task-bench
     - een eerste benchfout draait één keer opnieuw;
     - een tweede benchfout op dezelfde case geeft exit 3, met de case-id in de melding, en de volgende cases draaien niet.
   - **Grootboek:**
-    - elke run voegt `{"run", "label", "case", "cost_usd"}` toe aan `--ledger`, en een ontbrekend bedrag telt als 0;
+    - elke run voegt `{"id", "kind": "run", "label", "case", "cost_usd"}` toe aan `--ledger`;
+    - elke probe voegt `{"id", "kind": "probe", "label", "cost_usd"}` toe, met de som van `usage.cost` uit `probe.json`. Dat gebeurt vóór de volgende betaalde run;
+    - een ontbrekend bedrag wordt `null`: het telt als 0 in het totaal, en `score.py` noemt het aantal;
     - staat het totaal (`math.fsum`) op $14 of meer, dan start er geen run meer: exit 4;
     - het grootboek van de proef telt mee.
   - **Probe en endpointlijst:**
@@ -529,7 +580,7 @@ def verdict(h, g):
 ```
 
   **`run.py`:**
-  - Per label: probe (en voor OpenRouter eerst de endpointlijst).
+  - Per label: probe, met de `extraBody` van het label. Voor OpenRouter komt daarvóór de endpointlijst. De probekosten gaan in het grootboek.
   - Daarna per case in de volgorde van `cases.jsonl`:
     - hervatten of overslaan;
     - de grootboekstop;
@@ -657,4 +708,43 @@ De ceremonie voor dit plan volgt pas na JP's akkoord.
 
 ## Review record
 
-_Nog geen rondes._
+### Ronde 1 (2026-10-02, rev 1 `d7428d7` → rev 2)
+
+Reviewers: `mac:claude` (0 BLOCKER, 1 MAJOR, 3 MINOR, NO-GO) en `mac:codex` (0 BLOCKER, 3 MAJOR, 2 MINOR, NO-GO). Alle bevindingen zijn tegen de tree gecontroleerd en overgenomen.
+
+**De vijf toevoegingen buiten de spec:** beide reviewers vinden ze nodig, of verantwoord:
+- `ModelError.detail`;
+- de aparte gitdir;
+- de probe per label;
+- de losse clone;
+- het selectievenster op max2.
+
+Geen enkele taak hoeft weg. `verdict` haalt bij beide de telling 104/33/23/9.
+
+**MAJOR's:**
+1. **De clone faalde zoals geschreven** (codex, nagebootst). Met globale `--git-dir`/`--work-tree` geeft `git clone` exit 128 ("work already exists"). Fix: de clone is een smalle uitzondering met `SAFE_GIT_CONFIG` en `--separate-git-dir`, zonder die twee opties. Alle volgende aanroepen hebben ze wel (Global Constraints, Taak 3).
+2. **De scan van de git-administratie ontbrak** (claude).
+   - `host-git.ts:10-16` noemt de scan de eigenlijke controle. De `.git`-verwijzing van een submodule (scrum4me-mcp: `vendor/scrum4me-shared`) staat in de mount.
+   - Fix: `snapshotAdmin` direct na de clone, en `assertAdminUnchanged` vóór elke host-git na een container. Een verschil is een benchfout zonder verdere host-git.
+   - Tests in Taak 3, 4 en 5, en Review Focus 3 aangepast.
+3. **Stoppen van buiten was niet aangesloten** (codex MAJOR, claude MINOR 2). Fix:
+   - `task-bench` en `--check-case` vangen SIGINT en SIGTERM af, zoals `cmdWorker`;
+   - het signaal gaat naar `runTaskBench` en `checkCase`; die ruimen de containers op en schrijven een resultaat met `afgebroken`;
+   - de Vensterprocedure heeft als extra eindvoorwaarde dat `docker ps -aq --filter name=^harness-` leeg is (Taak 4, 5).
+4. **De proef kon slagen zonder dat de verborgen toets op het pad van het model draaide** (codex).
+   - Fix in Taak 6: de proef is geslaagd met `case-check.json ok`, minstens één 16-bit-respons, en een `completed` run met een niet-lege patch, dus met `hidden-vitest.json`.
+   - Anders blijft het bewijs bewaard, wordt er hersteld, en kiest JP.
+
+**MINOR's:**
+- **Echte paden** (claude): `evaluateHidden` vergelijkt `realpathSync`, want vitest meldt echte paden; nagemeten met vitest 5.0.2. Plus een test met een symlink.
+- **Een echte testfout op base** (claude): `--check-case` eist op `base_commit` echt falende tests, niet alleen "niet groen". Plus een test.
+- **Het trace-event** (codex): `src/trace.ts` krijgt de variant `model_retry` in `TraceEvent` (Taak 4).
+- **Probekosten** (codex, claude): die gaan in het grootboek, met `null` voor een ontbrekend bedrag (Taak 6, 7).
+
+**Omvang:** geen nieuw onderdeel. Er komen bij:
+- de scan, met hergebruik van bestaande functies;
+- de signaalafhandeling, naar het patroon van de worker;
+- een strengere voorwaarde voor de proef;
+- vier verduidelijkingen.
+
+Het eerste resultaat en de praktijkproef blijven in increment 1.
