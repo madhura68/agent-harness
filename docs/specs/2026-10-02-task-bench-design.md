@@ -2,7 +2,7 @@
 title: "Agent-harness M7 — Qwen 3.8 voor een 96 GB-machine op echt werk (task-bench)"
 status: draft
 last_updated: 2026-10-02
-revision: 2
+revision: 3
 ---
 
 # Agent-harness M7 — Qwen 3.8 voor een 96 GB-machine op echt werk (task-bench)
@@ -16,7 +16,8 @@ Vervolg op [M5](2026-09-30-model-comparison-refiner-design.md) en [M6](2026-10-0
 **Vraag van M7.** Kan Qwen 3.8, zoals hij op een machine van 96 GB zou draaien, ons echte werk aan? En kan hij meer dan wat max2 nu al lokaal doet?
 - Van Qwen 3.8 staan op OpenRouter twee modellen met open gewichten: `qwen/qwen3.8-27b` (dense) en `qwen/qwen3.8-2.4t-a95b`. Het tweede past niet op 96 GB. Flash, Max en Omni zijn alleen via de API te gebruiken.
 - "Qwen 3.8 op 96 GB" is dus de 27B op volle precisie: BF16 is ongeveer 55 GB, plus cache. Dat past niet in 64 GB, wel ruim in 96 GB.
-- Het gehoste `qwen/qwen3.8-27b` staat in M7 voor die machine. Gehost is een bovengrens: in M5 kwam het gehoste model door de zeef van de promptverfijner, en in M6 zakte dezelfde 27B lokaal op Q8 (§6).
+- Het gehoste `qwen/qwen3.8-27b` staat in M7 voor die machine. Het draait via een route op 16-bit (BF16 of FP16), zodat de precisie gelijk is aan wat die machine zou draaien (§4.3).
+- Gehost blijft een bovengrens. In M5 kwam het gehoste model door de zeef van de promptverfijner, toen nog bij aanbieders met een onbekende precisie. In M6 zakte dezelfde 27B lokaal op Q8 (§6).
 
 **Echt werk** betekent hier: Scrum4Me-taken uitvoeren zoals de productieworker dat doet (`TASK_IMPLEMENTATION`, het M3-pad). Het model schrijft code in een repo, tot de verify-gate van die repo groen is.
 
@@ -99,7 +100,11 @@ Alle besluiten zijn van JP, uit de brainstorm van 2026-10-02.
 - **Docker op max2:** `janpeter` (uid 1000) zit in de docker-groep, en `node:24-bookworm` staat er al.
 - **De harness telt kosten:** `runManifest` telt `usage.cost` op tot `costUsd` per run. Er is geen kostengrens in de lus.
 - **Uit M5 en M6:** het gehoste `qwen/qwen3.8-27b` kwam in M5 door de zeef van de promptverfijner, met en zonder docs. gsq kwam alleen zonder docs door. De lokale Q8 zakte in M6 met docs (12/15 afgerond); de missers liepen vast op de docs-tools.
-- **OpenRouter:** `qwen/qwen3.8-27b` kost volgens de lijst $0,42 per miljoen invoertokens en $3 per miljoen uitvoertokens. Per aanbieder loopt dat op tot ongeveer $0,99 en $4,35. De sleutel heeft een limiet van $20, waarvan $0,92 gebruikt is.
+- **OpenRouter:** `qwen/qwen3.8-27b` staat in de modellijst op $0,42 per miljoen invoertokens en $3 per miljoen uitvoertokens. Prijs en precisie hangen af van de aanbieder. Volgens de publieke endpointlijst van 2026-10-02:
+  - de meeste aanbieders draaien FP8, FP4 of een onbekende precisie;
+  - op 16-bit staan er twee: DeepInfra (BF16, $0,15 in en $1,88 uit per miljoen tokens, met tools en reasoning) en Cerebras (FP16, zonder tools);
+  - in M5 liep het gehoste model via Reka en Wafer, allebei met een onbekende precisie.
+  - De sleutel heeft een limiet van $20, waarvan $0,92 gebruikt is.
 - **Kandidaten** (grof filter, telling van 2026-10-02): op `origin/main` raken sinds 2026-08-01 40 commits in agent-harness en ongeveer 70 in scrum4me-mcp zowel `src/` als tests, zonder wijziging aan `package.json`, de lockfile of Prisma, en met 20–400 gewijzigde regels. De selectie legt haar eigen bron-pin en filter vast (§4.2).
 - **De M3-spike** haalde 7 van 9 kleine taken met gsq (M3 §10).
 
@@ -121,7 +126,7 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
   3. De modellus met de gate.
   4. De diff van de clone tegen `base_commit` als patch vastleggen.
   5. **De verborgen toets, buiten het zicht van het model:**
-     - Zet de hele map `__tests__/` en de runnerconfig (`vitest.config.*`, `package.json`, `tsconfig*.json`) terug naar hun stand in `ref_commit`.
+     - Zet de hele map `__tests__/` en de runnerconfig (`vitest.config.*`, `package.json`, `tsconfig*.json`) exact terug naar hun stand in `ref_commit`. Bestanden die het model daar toevoegde, verdwijnen ook.
      - Draai `hidden_test_command` met de JSON-reporter van vitest in de verify-container.
      - Geslaagd als de exitcode 0 is, én de JSON laat zien dat elk bestand uit `hidden_tests` draaide met minstens één test en zonder falende of overgeslagen tests.
      - Zo kan een aanpassing van het model aan tests of runnerconfig de toets niet omzeilen.
@@ -138,7 +143,8 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
     - Is de tweede poging ook een benchfout, dan stopt de driver en beslist JP. Een onvolledige set telt nooit als 12 geldige runs.
     - Kosten en bewijs van elke poging blijven bewaard.
 - **De resultaat-JSON** bevat verder:
-  - de case-id, het model, de status en de ruwe eindstatus van `runManifest`;
+  - de case-id, het model, de status, en de ruwe eindstatus van `runManifest` met de foutmelding (gemaskeerd);
+  - per respons de aanbieder;
   - modelbeurten, toolaanroepen en toolfouten;
   - tokens in en uit, `costUsd` en de wandtijd;
   - de staart van de laatste gate-uitvoer en de vitest-JSON van de verborgen toets.
@@ -170,7 +176,12 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
 ### 4.3 Modellen en instellingen
 
 - `gsq-lokaal`: `qwen3.8-gsq-rco:27b-iq3_s-text` op `http://127.0.0.1:11434/v1`, zonder extra instellingen, zoals de productieworker.
-- `qwen3.8-openrouter`: `qwen/qwen3.8-27b` op `https://openrouter.ai/api/v1`, met `provider: {data_collection: "deny", require_parameters: true}` en `reasoning: {effort: "medium"}`, zoals de docs-variant in M5. Temperatuur en seed blijven op de standaard, net als bij de worker.
+- `qwen3.8-openrouter`: `qwen/qwen3.8-27b` op `https://openrouter.ai/api/v1`.
+  - Met `provider: {data_collection: "deny", require_parameters: true, quantizations: ["bf16", "fp16"]}` en `reasoning: {effort: "medium"}`, zoals de docs-variant in M5 maar nu op 16-bit.
+  - Met tools en `require_parameters` blijft nu alleen DeepInfra (BF16) over.
+  - Het rapport legt per respons de aanbieder vast, en bij het begin van elk venster een kopie van de publieke endpointlijst als bewijs van de precisie.
+  - Is er geen toegestane route, dan geeft OpenRouter een fout. Dat wordt een benchfout (§4.1), nooit een terugval naar een lagere of onbekende precisie.
+  - Temperatuur en seed blijven op de standaard, net als bij de worker.
 - Beide krijgen de limieten uit §3. Eén run per taak. Gehost is niet herhaalbaar, dus één run is een steekproef; dat noemt het rapport.
 
 ### 4.4 Driver en scorer (llm-bench, repo max2)
@@ -206,11 +217,13 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
 
 ### 4.6 Budget
 
-- **Per run (schatting):** bij de lijstprijs kost een run hooguit ongeveer 40 × 65.536 tokens invoer en 80.000 tokens uitvoer: $1,10 + $0,24 = $1,34.
-  - Dat is een schatting, geen harde grens. Aanbieders rekenen tot ongeveer $0,99/M in en $4,35/M uit, samen ongeveer $2,94 per run. En `fitContext` schat tokens op tekens.
-  - Een eigen kostengrens in de lus voegt daar weinig aan toe en komt er niet.
-- **Eén grootboek:** de proef, alle runs en alle herhalingen tellen samen. Het run-script start geen run meer bij $14 of meer. Eén lopende run kan daar nog overheen, met hooguit ongeveer $2,94; samen blijft dat onder de $19,08. De limiet van de sleutel ($20) is de harde grens.
-- **Na de proef:** kost de praktijkproef meer dan $1,25, dan stopt M7 voor JP's besluit. 12 runs passen dan niet meer veilig in het budget.
+- **Per run (schatting):** op de 16-bit-route (DeepInfra: $0,15/M in, $1,88/M uit) kost een run bij de vaste limieten (40 × 65.536 tokens in, 80.000 uit) ongeveer $0,39 + $0,15 = $0,54.
+  - Dat is een schatting, geen grens: prijzen kunnen veranderen, en `fitContext` schat tokens op tekens.
+  - Een eigen kostengrens in de lus komt er niet.
+- **Eén grootboek:** de proef, alle runs en alle herhalingen tellen samen. Het run-script start geen run meer bij $14 of meer.
+  - $14 plus één lopende run is de behoudende planning.
+  - De limiet van de sleutel ($20) is de enige harde grens.
+- **Na de proef:** kost de praktijkproef meer dan $1,00, dan stopt M7 voor JP's besluit. $14 moet ruimte laten voor 13 gehoste runs plus één herhaling.
 
 ### 4.7 Volgorde
 
@@ -223,7 +236,7 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
    - De PR in agent-harness; JP merget.
    - Op max2 de worktree `~/Development/agent-harness-m7` met `npm ci` en een build.
    - Eén taak met de hand gekozen en gecontroleerd volgens §4.2.
-   - Op JP's go een venster van ongeveer een uur: die taak met `qwen3.8-openrouter`.
+   - Op JP's go een venster van ongeveer een uur: die taak met `qwen3.8-openrouter`, op de 16-bit-route. De proef controleert dat elke respons van een aanbieder op 16-bit kwam.
 2. **Increment 2: takenset en driver.** De selectie van 12 taken, met bewijs. JP keurt goed, en de set wordt bevroren. Driver en scorer met tests, als PR in max2.
 3. **Increment 3:** op JP's go `qwen3.8-openrouter` op alle 12 taken, in een venster van ongeveer 3 uur.
 4. **Increment 4:** op JP's go `gsq-lokaal` op alle 12 taken, in een nachtvenster (tot 40 minuten per taak).
@@ -237,6 +250,7 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
 - elke benchfout en herhaling apart, met de reden;
 - de tellingen, het oordeel en de betekenis volgens §1, met de grensgevallen;
 - kosten per run en in totaal (het grootboek), tijd per run, modelbeurten en toolfouten;
+- per gehoste run de aanbieder per respons, en de endpointlijst bij het begin van elk venster;
 - de verschillen met productie (§4.1) en de kanttekeningen (§6);
 - per venster de dienststand vooraf en achteraf, en elke afgebroken run met de reden;
 - de commits: de bench in agent-harness, de driver in max2, de worker-checkout, en `ollama --version`.
@@ -248,7 +262,10 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
    - Twee uitzonderingen: de doc-tools-bijzin en het blok `## Product` vallen weg.
    - Unittests tonen dat er geen naam van een doc-tool in de prompts staat, en dat de verborgen toets een aangepaste runnerconfig of een weggehaalde test niet als geslaagd telt.
    - De trace van de praktijkproef laat de lus zien.
-2. De praktijkproef draaide één taak met `qwen3.8-openrouter` door de bench. Er is een resultaat-JSON, met kosten en tijd, en de verborgen toets draaide met de `__tests__/` en de runnerconfig van `ref_commit`.
+2. De praktijkproef draaide één taak met `qwen3.8-openrouter` door de bench.
+   - Er is een resultaat-JSON, met kosten en tijd.
+   - Elke respons kwam van een aanbieder op 16-bit.
+   - De verborgen toets draaide met de `__tests__/` en de runnerconfig van `ref_commit`.
 3. De takenset telt 12 taken (6 per repo). Elke taak heeft het bewijs voor de criteria 2 en 3 uit §4.2, met de bron-pin. JP keurde de lijst goed vóór increment 3.
 4. Beide modellen draaiden alle 12 taken geldig. Elke run eindigde in een van de modelstatussen uit §4.1, na hooguit één herhaling bij een benchfout.
 5. Het rapport bevat wat §4.8 noemt, en geeft het oordeel volgens §1. De totale kosten bleven binnen §4.6.
@@ -258,13 +275,14 @@ Een nieuw subcommando in agent-harness: `harness task-bench --case <json> --mode
 ## 6. Risico's en open punten
 
 - **Kleine aantallen.** Bij 12 taken scheelt één taak 8 procentpunt. Daarom de grens: een uitslag vlak bij een drempel is onbeslist, geen bewijs. Meer taken is dan JP's keuze.
-- **Gehost ≠ lokaal.** In M5 kwam gehost door de zeef, en in M6 zakte de lokale Q8. Een positief oordeel is een kandidaat voor een proef op echte hardware, geen koopadvies.
+- **Gehost ≠ lokaal.** In M5 kwam gehost door de zeef, bij aanbieders met een onbekende precisie, en in M6 zakte de lokale Q8. M7 legt de gehoste precisie vast op 16-bit (§4.3), maar engine en template blijven anders dan op een Mac. Een positief oordeel is een kandidaat voor een proef op echte hardware, geen koopadvies.
+- **Eén aanbieder op 16-bit.** Met tools blijft alleen DeepInfra over. Valt die weg of verandert hij van precisie, dan worden het benchfouten en een stop voor JP, geen run op een andere precisie.
 - **Gehost is niet herhaalbaar.** Eén run per taak is een steekproef; een tweede run past niet in het budget.
 - **Storingen bij aanbieders.** Een 429 of 5xx eindigt een run meteen als `MODEL_ERROR`, want de modelclient herhaalt niet. §4.1 maakt daar een benchfout van, met één herhaling en daarna een stop voor JP. Zo bepaalt een storing het oordeel niet.
 - **Verborgen tests kunnen te streng zijn,** als ze toevallige details van de oude oplossing toetsen. Criterium 4 in §4.2 beperkt dat. Het rapport toont bij elk `verborgen_tests_rood` de falende tests, zodat JP het kan beoordelen.
 - **Lekken.** De commits zijn van augustus tot oktober 2026 en staan in privérepo's, dus de kans dat ze in de training van Qwen 3.8 zaten is klein. De docs-store van nu valt weg (§4.1), en criterium 5 sluit plannen uit die de oplossing al bevatten.
 - **Geen doc-tools** maakt de bench iets strenger dan productie, voor beide modellen gelijk.
-- **Kosten.** Ongeveer $1,34 per run bij de lijstprijs, en tot ongeveer $2,94 bij de duurste aanbieder (§4.6). De praktijkproef meet de echte kosten vóór de rest.
+- **Kosten.** Ongeveer $0,54 per run op de 16-bit-route bij de vaste limieten (§4.6), als schatting. De praktijkproef meet de echte kosten vóór de rest.
 - **Doorlooptijd.** gsq kan tot 40 minuten per taak nemen, dus 12 taken tot 8 uur. De worker ligt in elk venster stil.
 - **Bench in een eigen worktree** op max2. Een build daar raakt de productieworker niet. De containers delen wel de npm-cache van de worker; in een venster draait de worker niet.
 
@@ -303,3 +321,28 @@ Reviewers: `mac:claude` (0 BLOCKER, 2 MAJOR, 5 MINOR, NO-GO) en `mac:codex` (0 B
 **Eigen correctie:** de containernamen beginnen met `harness-<8 tekens>-`, niet met `harness-bench-`.
 
 **Omvang:** geen nieuw onderdeel. Er komen bij: een promptoptie, een statusmapping, de terugzet-stap en de JSON-controle in de verborgen toets, de submodule-stap, twee exports en een kleiner kostenplafond. Het eerste resultaat en de praktijkproef blijven gelijk.
+
+### Ronde 2 (2026-10-02, rev 2 `005d6ce` → rev 3)
+
+Reviewers: `mac:claude` (0 BLOCKER, 0 MAJOR, 1 MINOR, GO) en `mac:codex` (0 BLOCKER, 1 MAJOR, 1 MINOR, NO-GO). Beide zagen de fixes van ronde 1 als gehouden. Codex noemde alleen de kostenzin "deels gehouden".
+
+**Het eindregel-besluit:** beide reviewers steunen de gekozen regel uit ronde 1: één herhaling bij een benchfout, en daarna een stop voor JP.
+- Claude vroeg er wel bij dat de resultaat-JSON de (gemaskeerde) foutmelding naast de ruwe eindstatus bewaart. Bij gsq kan een herhaalde `MODEL_ERROR` namelijk ook modelgedrag zijn. Dat is overgenomen in §4.1.
+
+**MAJOR van codex: de gehoste precisie lag niet vast.** De publieke endpointlijst van `qwen/qwen3.8-27b` toont FP4, FP8, FP16, BF16 en onbekend. De spec las het gehoste model als de 27B op volle precisie. Fix:
+- `quantizations: ["bf16", "fp16"]` in het provider-blok (§4.3), wat met tools nu alleen DeepInfra (BF16) laat;
+- per respons de aanbieder, en een kopie van de endpointlijst per venster;
+- geen terugval naar een lagere of onbekende precisie;
+- de proef controleert de route (§4.7, criterium 2).
+- §1, §3 en §6 noemen nu ook dat het gehoste model in M5 via aanbieders met een onbekende precisie liep.
+
+**MINOR's:**
+- **Kosten** (codex): $14 plus één run is nu een behoudende planning, en de sleutellimiet van $20 de enige harde grens.
+  - Met de 16-bit-route (DeepInfra $0,15/M in, $1,88/M uit) daalt de schatting naar ongeveer $0,54 per run.
+- **Drempel van de proef** (claude): van $1,25 naar $1,00. $14 moet 13 gehoste runs plus één herhaling dekken.
+
+**Kleinere punten, ook verwerkt:**
+- "terug naar ref_commit" is exact: bestanden die het model toevoegde, verdwijnen (codex);
+- per respons de aanbieder in de resultaat-JSON.
+
+**Omvang:** geen nieuw onderdeel. Er komen bij: een precisiefilter in de modelconfig, bewijs van aanbieder en precisie, en een lagere drempel voor de proef. Het eerste resultaat en de praktijkproef blijven gelijk.
