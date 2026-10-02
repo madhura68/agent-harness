@@ -9,6 +9,7 @@ import {
   capturePatch,
   createWorkspace,
   git,
+  isRunnerConfig,
   restoreForHiddenCheck,
   snapshotAdmin,
   type ExecFileFn,
@@ -444,6 +445,22 @@ describe('capturePatch', () => {
   })
 })
 
+describe('isRunnerConfig', () => {
+  it.each(['vitest.config.ts', 'vitest.config.mts', 'package.json', 'package-lock.json', '.npmrc', 'tsconfig.json', 'tsconfig.build.json'])(
+    'takes %s for runner configuration',
+    (name) => {
+      expect(isRunnerConfig(name)).toBe(true)
+    },
+  )
+
+  it.each(['package-lock.json.bak', 'package-lock.jsonl', 'my-package-lock.json', '.npmrc.local', '.npmrcx', 'x.npmrc', 'npmrc', 'sub/package-lock.json', 'sub/.npmrc'])(
+    'does not take %s for runner configuration',
+    (name) => {
+      expect(isRunnerConfig(name)).toBe(false)
+    },
+  )
+})
+
 describe('restoreForHiddenCheck', () => {
   it('puts the whole __tests__ directory back to the state of the ref: changed, added and missing files', async () => {
     const { repo, ws } = await setup('a')
@@ -474,6 +491,43 @@ describe('restoreForHiddenCheck', () => {
     for (const gone of ['vitest.config.mts', 'tsconfig.extra.json', 'tsconfig.json', 'package.json']) {
       expect(existsSync(join(ws.work, gone)), gone).toBe(false)
     }
+  })
+
+  // What the dependencies are installed from. The hidden check installs them again from the ref (runTaskBench), so the model must not be
+  // the one who chooses the lockfile or the registry.
+  it('puts package-lock.json and .npmrc back too: a changed lockfile is the lockfile of the ref again, and an .npmrc the ref does not have is gone', async () => {
+    const { repo, ws } = await setup('a')
+    write(ws, 'package-lock.json', '{ "lockfileVersion": 3, "forged": true }\n') // changed; the fixture has a lockfile at A and at B
+    write(ws, '.npmrc', 'registry=https://registry.invalid/\n') // added, and the ref has none
+
+    await restoreForHiddenCheck(ws, repo.b)
+
+    expect(read(ws, 'package-lock.json')).toBe(repo.at.b['package-lock.json'])
+    expect(existsSync(join(ws.work, '.npmrc'))).toBe(false)
+  })
+
+  it('brings back a package-lock.json and an .npmrc that the ref has, also when the model deleted the one and made a link of the other', async () => {
+    await createBenchRepo() // stubs the env for the setup commit below
+    const origin = benchTmp('npm-files')
+    await fixtureGit(origin, ['init', '-q'])
+    writeFileSync(join(origin, 'package-lock.json'), '{ "lockfileVersion": 3 }\n')
+    writeFileSync(join(origin, '.npmrc'), 'ignore-scripts=true\n')
+    await fixtureGit(origin, ['add', '-A'])
+    await fixtureGit(origin, ['commit', '-q', '-m', 'npm files'])
+    const commit = await fixtureGit(origin, ['rev-parse', 'HEAD'])
+    const ws = await createWorkspace({ repoUrl: `file://${origin}`, commit, dir: benchTmp('ws') })
+    const outside = benchTmp('outside')
+    writeFileSync(join(outside, 'target'), 'blijft staan\n')
+    rmSync(join(ws.work, 'package-lock.json'))
+    rmSync(join(ws.work, '.npmrc'))
+    symlinkSync(join(outside, 'target'), join(ws.work, '.npmrc'))
+
+    await restoreForHiddenCheck(ws, commit)
+
+    expect(read(ws, 'package-lock.json')).toBe('{ "lockfileVersion": 3 }\n')
+    expect(lstatSync(join(ws.work, '.npmrc')).isSymbolicLink()).toBe(false)
+    expect(read(ws, '.npmrc')).toBe('ignore-scripts=true\n')
+    expect(readFileSync(join(outside, 'target'), 'utf8')).toBe('blijft staan\n') // what the link pointed at is as it was
   })
 
   it('brings back what the model deleted', async () => {

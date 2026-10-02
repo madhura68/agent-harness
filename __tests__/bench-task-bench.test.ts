@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join, sep } from 'node:path'
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BenchCase } from '../src/bench/case.js'
@@ -222,7 +222,7 @@ describe('runTaskBench — statuses', () => {
     expect(restoreForHiddenCheck).not.toHaveBeenCalled()
   })
 
-  it('is geslaagd when the hidden check passes, after the tests of the ref are back and in a verify container of its own', async () => {
+  it('is geslaagd when the hidden check passes, after the tests of the ref are back, the dependencies are installed again, and in a verify container of its own', async () => {
     const seen: { tests?: boolean; work?: boolean } = {}
     const hidden: DockerStep = {
       onStart: ({ work }) => {
@@ -242,12 +242,16 @@ describe('runTaskBench — statuses', () => {
 
     const last = t.docker.runs.at(-1)
     expect(last).toMatchObject({ purpose: 'hidden', script: buildScript([hiddenCheckScript(['__tests__/b.test.ts'])]) })
-    expect(last?.name).toBe(`harness-${hex8Of(t.result)}-verify-3`)
+    expect(last?.name).toBe(`harness-${hex8Of(t.result)}-verify-4`)
+    // between the gate and the hidden check: the prepare of the recipe once more, as a container of its own
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare', 'hidden'])
+    expect(t.docker.runs[2]).toMatchObject({ name: `harness-${hex8Of(t.result)}-prepare-3`, script: buildScript(['npm ci']) })
     const containerEvents = readTrace(t.runDir).filter((e) => e.type === 'container')
     expect(containerEvents.map((e) => [e.kind, e.source, e.n])).toEqual([
       ['prepare', 'prepare', 1],
       ['verify', 'gate', 2],
-      ['verify', 'hidden_check', 3],
+      ['prepare', 'reinstall', 3],
+      ['verify', 'hidden_check', 4],
     ])
     expect(t.result.hidden).toEqual(
       evaluateHidden({ exitCode: 0, json: report(last?.work ?? '', ['passed']), work: last?.work ?? '', files: ['__tests__/b.test.ts'] }),
@@ -537,7 +541,7 @@ describe('runTaskBench — a provider error inside a 200', () => {
     expect(t.result).toMatchObject({ status: 'geslaagd', runStatus: 'completed' })
     expect(t.result.retries).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004 }])
     expect(t.model.requests).toHaveLength(3)
-    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'hidden']) // one gate run: for the answer, not for the error
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare', 'hidden']) // one gate run: for the answer, not for the error
     expect(outcomesOfGate(t.runDir)).toEqual(['accept'])
     expect(readTrace(t.runDir).filter((e) => e.type === 'model_retry')).toEqual([
       expect.objectContaining({ type: 'model_retry', attempt: 1, kind: 'finish_other', costUsd: 0.0004 }),
@@ -695,14 +699,24 @@ describe('runTaskBench — a stop from outside', () => {
     const t = await bench({ signal: stop.signal, script: [writeZ(), say()], docker: { hidden: [hangsUntil(stop)] } })
     expect(t.result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
     expect(t.saved.hidden).toBeUndefined()
-    expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-verify-3`])
-    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'hidden'])
+    expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-verify-4`])
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare', 'hidden'])
   })
 
-  // The scan and the restore cannot be aborted, and a stop can come in the time they take. No container starts after a stop: a hidden
-  // check that started anyway would be killed at once, and a kill that is not provably done is a benchfout of its own ("niet aantoonbaar
-  // gestopt") instead of afgebroken.
-  it('starts no hidden-check container once the stop has come, also when it came while the work tree was being made ready for it', async () => {
+  it('stops during the reinstall that comes before the hidden check: the container is killed, no hidden container starts, and it is no failed reinstall', async () => {
+    const stop = new AbortController()
+    const t = await bench({ signal: stop.signal, script: [writeZ(), say()], docker: { prepare: [{}, hangsUntil(stop)] } })
+    expect(t.result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' }) // not "herinstallatie … faalde"
+    expect(t.saved).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
+    expect(t.saved.hidden).toBeUndefined()
+    expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-prepare-3`])
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare'])
+  })
+
+  // The scan and the restore cannot be aborted, and a stop can come in the time they take. No container starts after a stop, the
+  // reinstall before the hidden check no more than the hidden check itself: a container that started anyway would be killed at once, and
+  // a kill that is not provably done is a benchfout of its own ("niet aantoonbaar gestopt") instead of afgebroken.
+  it('starts no reinstall or hidden-check container once the stop has come, also when it came while the work tree was being made ready for them', async () => {
     const stop = new AbortController()
     const t = await start({ signal: stop.signal, script: [writeZ(), say()] })
     const restore = vi.mocked(restoreForHiddenCheck)
@@ -719,7 +733,7 @@ describe('runTaskBench — a stop from outside', () => {
     expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
     expect(result.hidden).toBeUndefined()
     expect(JSON.parse(readFileSync(join(t.out, result.runId, 'bench-result.json'), 'utf8'))).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
-    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // no hidden container was started…
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // no reinstall and no hidden container was started…
     expect(t.docker.kills()).toEqual([]) // …so none had to be killed
   })
 
@@ -823,6 +837,198 @@ describe('runTaskBench — the hidden check cannot be forged', () => {
     expect(t.result.hidden?.pass).toBe(false)
     expect(t.result.hidden?.reason).toContain('vitest-JSON ontbreekt of is onleesbaar')
     expect(fileText(t.runDir, 'patch.diff')).not.toContain('.task-bench')
+  })
+})
+
+// The hidden check runs vitest from node_modules, and node_modules is in the work tree that the model can write to (the task tools
+// refuse only paths with a .git segment). A model that rewrites the entry point of vitest decides what the hidden check reports. So the
+// hidden check does not trust the node_modules that the model run left: the lockfile and .npmrc of the ref go back with the rest of the
+// runner configuration, and the recipe's prepare (npm ci, which removes node_modules first) runs again before the hidden container.
+describe('runTaskBench — the dependencies are installed afresh before the hidden check', () => {
+  const VITEST_ENTRY = 'node_modules/vitest/vitest.mjs'
+  const solve = [writeZ(), say()]
+  const entryOf = (work: string): string | undefined => (existsSync(join(work, VITEST_ENTRY)) ? readFileSync(join(work, VITEST_ENTRY), 'utf8') : undefined)
+
+  /** `npm ci`: it removes node_modules and installs what the lockfile says, the real vitest among it. */
+  const npmCi: DockerStep = {
+    effect: ({ work }) => {
+      rmSync(join(work, 'node_modules'), { recursive: true, force: true })
+      mkdirSync(join(work, 'node_modules/vitest'), { recursive: true })
+      writeFileSync(join(work, VITEST_ENTRY), 'REAL vitest\n')
+    },
+  }
+  /**
+   * The hidden container runs whatever vitest entry point the work tree has. The real one fails the hidden test: src/y.ts, which it
+   * imports, does not exist. A forged one prints a valid-looking report of a pass without running anything.
+   */
+  const vitestOfTheTree = (seen: { entry?: string } = {}): DockerStep => {
+    const step: DockerStep = {
+      onStart: ({ work }) => {
+        seen.entry = entryOf(work)
+      },
+      effect: ({ work }) => {
+        const forged = entryOf(work)?.startsWith('FORGED') === true
+        step.code = forged ? 0 : 1
+        writeReport(work, report(work, [forged ? 'passed' : 'failed']))
+      },
+    }
+    return step
+  }
+  /** What the model does with its write_file tool. */
+  const writes = (path: string, content: string, id: string): FakeTurn => call('write_file', { path, content }, id)
+
+  it('does not let a vitest entry point that the model wrote decide the hidden check: it is installed again before the hidden container starts', async () => {
+    const seen: { atGate?: string } = {}
+    const atHidden: { entry?: string } = {}
+    const t = await bench({
+      script: [writes(VITEST_ENTRY, 'FORGED vitest: always reports a pass\n', 'forge'), ...solve],
+      docker: {
+        prepare: [npmCi, npmCi],
+        verify: [{ onStart: ({ work }) => (seen.atGate = entryOf(work)) }], // the premise: the forgery is in the tree when the model is done
+        hidden: [vitestOfTheTree(atHidden)],
+      },
+    })
+    expect(t.result).toMatchObject({ status: 'verborgen_tests_rood', runStatus: 'completed', hidden: { pass: false } }) // not geslaagd, whatever the forged vitest reports
+    expect(seen.atGate).toBe('FORGED vitest: always reports a pass\n')
+    expect(atHidden.entry).toBe('REAL vitest\n') // gone and installed again by the container that came before the hidden one
+    // the order of the containers is the point: the prepare of the recipe again, then the hidden check
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare', 'hidden'])
+    expect(t.docker.runs.map((r) => r.name)).toEqual(['prepare-1', 'verify-2', 'prepare-3', 'verify-4'].map((n) => `harness-${hex8Of(t.result)}-${n}`))
+    expect(t.docker.runs[2].script).toBe(buildScript(['npm ci'])) // the commands of the recipe, nothing of the model's
+  })
+
+  it('puts package-lock.json and .npmrc back to the ref before the reinstall: the model cannot choose what is installed', async () => {
+    const seen: { lock?: string; npmrc?: boolean; restores?: number } = {}
+    const reinstall: DockerStep = {
+      onStart: ({ work }) => {
+        seen.lock = readFileSync(join(work, 'package-lock.json'), 'utf8')
+        seen.npmrc = existsSync(join(work, '.npmrc'))
+        seen.restores = vi.mocked(restoreForHiddenCheck).mock.calls.length
+      },
+    }
+    const t = await bench({
+      script: [writes('.npmrc', 'registry=https://registry.invalid/\n', 'npmrc'), writes('package-lock.json', '{ "forged": true }\n', 'lock'), ...solve],
+      docker: { prepare: [{}, reinstall], hidden: [hiddenPasses] },
+    })
+    expect(fileText(t.runDir, 'patch.diff')).toContain('+++ b/.npmrc') // the premise: the model did write them, and the patch was taken before the restore
+    expect(seen).toEqual({ lock: t.repo.at.b['package-lock.json'], npmrc: false, restores: 1 }) // the ref has no .npmrc; the restore ran before the reinstall
+    expect(t.result.status).toBe('geslaagd')
+    expect(vi.mocked(restoreForHiddenCheck)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(capturePatch)).toHaveBeenCalledTimes(1) // and no host git follows the reinstall
+  })
+
+  describe('a reinstall that does not succeed', () => {
+    it.each([
+      ['is red', { code: 1, out: 'npm ERR! ECONNRESET' }, 'exitcode 1\nnpm ERR! ECONNRESET'],
+      ['cannot run at all', { code: null, errorMessage: 'spawn docker ENOENT' }, 'docker-proces eindigde zonder exitcode: spawn docker ENOENT\n'],
+    ] as const)('is a benchfout of the bench when it %s, and no hidden container starts', async (_what, step, text) => {
+      const t = await bench({ script: solve, docker: { prepare: [{}, step], hidden: [hiddenPasses] } })
+      expect(t.result).toMatchObject({ status: 'benchfout', runStatus: 'completed' }) // the model run itself was fine
+      expect(t.result.benchError).toBe(`herinstallatie vóór de verborgen toets faalde: ${text}`)
+      expect(t.saved).toMatchObject({ status: 'benchfout', benchError: t.result.benchError })
+      expect(t.result.hidden).toBeUndefined()
+      expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare']) // no hidden container
+      expect(existsSync(join(t.runDir, 'hidden-vitest.json'))).toBe(false)
+    })
+
+    it('is a benchfout of the bench when it runs into its timeout', async () => {
+      const t = await bench({
+        script: solve,
+        docker: { prepare: [{}, { hang: true }], hidden: [hiddenPasses] },
+        tune: (task) => {
+          task.prepareTimeoutSeconds = 0.05 // the first prepare is done long before
+        },
+      })
+      expect(t.result.status).toBe('benchfout')
+      expect(t.result.benchError).toBe('herinstallatie vóór de verborgen toets faalde: timeout\n')
+      expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'prepare'])
+      expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-prepare-3`]) // and the container is cleaned up
+    })
+  })
+
+  it('has nothing to install when the recipe has no prepare commands, and goes straight to the hidden check', async () => {
+    const repo = await createBenchRepo()
+    const t = await bench({ script: solve, task: { recipes: [{ repoUrl: repo.url, prepare: [], verify: 'npm test' }] }, docker: { hidden: [hiddenPasses] } })
+    expect(t.result.status).toBe('geslaagd')
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['verify', 'hidden'])
+  })
+})
+
+// Spec §4.1: a container that failed outside the model is a benchfout. A verify container that cannot run at all (the docker binary is
+// not there, the docker process ends without an exit code) says nothing about the work of the model. Counted as a red verify, an outage
+// of the bench host becomes three red gate runs and a verdict on the model (verify_rood). The worker does count it as red, and
+// runTaskJob does not change: this is one of the deliberate differences (see bench-worker-parity.test.ts).
+describe('runTaskBench — a verify container that fails outside the model', () => {
+  const REASON = 'docker-proces eindigde zonder exitcode: spawn docker ENOENT'
+  const dockerGone: DockerStep = { code: null, errorMessage: 'spawn docker ENOENT' } // what a missing docker binary looks like
+  const fault = `verify-container: ${REASON}`
+  const limitsOf = (maxToolErrors: number) => ({ limits: { maxTurns: 10, maxOutputTokens: 20000, maxWallSeconds: 60, maxToolErrors } })
+  const quickTimeout = (task: TaskConfig) => {
+    task.verifyTimeoutSeconds = 0.05 // only for a test that needs a time-out: any other container is done long before
+  }
+
+  it('ends the run at the first gate run that cannot run, as a benchfout and not as verify_rood after three, and runs no gate again', async () => {
+    const t = await bench({ script: [say('een'), say('twee'), say('drie')], docker: { verify: [dockerGone, dockerGone, dockerGone] } })
+    expect(t.result).toMatchObject({
+      status: 'benchfout',
+      benchError: fault,
+      runStatus: 'failed',
+      error: { code: 'HARNESS_ERROR', message: 'aborted' }, // the bench aborted the run itself, as for a container that is not provably stopped
+      gate: { reds: 0, lastTail: `${REASON}\n` }, // not a red verify, so not counted; the tail says what the gate saw
+    })
+    expect(t.saved).toMatchObject({ status: 'benchfout', benchError: fault })
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // one gate run
+    expect(t.model.requests).toHaveLength(1) // and the model is not asked again
+    expect(outcomesOfGate(t.runDir)).toEqual([])
+    expect(capturePatch).not.toHaveBeenCalled() // no host git after a container that failed
+    expect(restoreForHiddenCheck).not.toHaveBeenCalled()
+    expect(existsSync(join(t.runDir, 'patch.diff'))).toBe(false)
+  })
+
+  it('counts the red verifies before the one that cannot run, and not that one', async () => {
+    const t = await bench({ script: [say('een'), say('twee'), say('drie')], docker: { verify: [{ code: 1, out: 'FAIL a.test.ts' }, dockerGone, {}] } })
+    expect(t.result).toMatchObject({ status: 'benchfout', benchError: fault, gate: { reds: 1, lastTail: `${REASON}\n` } })
+    expect(outcomesOfGate(t.runDir)).toEqual(['retry']) // the red one was sent back; the one that could not run was not judged
+    expect(t.model.requests).toHaveLength(2)
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify', 'verify'])
+  })
+
+  it('does the same for a run_tests that cannot run: the run ends there, and the model does not get a tool error to work around', async () => {
+    const t = await bench({ script: [call('run_tests'), say(), say()], docker: { verify: [dockerGone] } })
+    expect(t.result).toMatchObject({ status: 'benchfout', benchError: fault, gate: { reds: 0 } })
+    expect(t.result.gate.lastTail).toBeUndefined() // that is the tail of the gate, and no gate ran
+    expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // the gate that the next answer would have run never starts
+    expect(t.model.requests).toHaveLength(1)
+    expect(capturePatch).not.toHaveBeenCalled()
+  })
+
+  it('is a benchfout even when the tool error of that run_tests is one more than the model may make: that is no limiet', async () => {
+    const t = await bench({ script: [call('run_tests'), say()], task: limitsOf(0), docker: { verify: [dockerGone] } })
+    expect(t.result).toMatchObject({ status: 'benchfout', benchError: fault, runStatus: 'failed', error: { code: 'TOO_MANY_TOOL_ERRORS' } })
+  })
+
+  it('keeps a verify that runs into its timeout a red verify: the code of the model made it, not the bench', async () => {
+    const t = await bench({ script: [say('een'), say('twee'), say('drie')], docker: { verify: [{ hang: true }, { hang: true }, { hang: true }] }, tune: quickTimeout })
+    expect(t.result).toMatchObject({ status: 'verify_rood', error: { code: 'VERIFY_FAILED' }, gate: { reds: 3, lastTail: 'timeout\n' } })
+    expect(t.result.benchError).toBeUndefined()
+  })
+
+  it('keeps a run_tests that runs into its timeout a tool result for the model, and the run goes on', async () => {
+    const t = await bench({ script: [call('run_tests'), say()], docker: { verify: [{ hang: true }] }, tune: quickTimeout })
+    expect(t.result).toMatchObject({ status: 'geen_wijzigingen', runStatus: 'completed' }) // the gate after the next answer is green; nothing was written
+    expect(t.result.benchError).toBeUndefined()
+    expect(t.model.requests).toHaveLength(2)
+  })
+
+  it('is no fault when the deadline of the run aborts the gate container: that stays a limiet', async () => {
+    const t = await bench({
+      script: [say()],
+      task: { limits: { maxTurns: 10, maxOutputTokens: 20000, maxWallSeconds: 1, maxToolErrors: 3 } },
+      docker: { verify: [{ hang: true }] }, // killed by the deadline; the kill is provable, so nothing is uncertain
+    })
+    expect(t.result).toMatchObject({ status: 'limiet', runStatus: 'timed_out' })
+    expect(t.result.benchError).toBeUndefined()
+    expect(t.docker.kills()).toEqual([`harness-${hex8Of(t.result)}-verify-2`])
   })
 })
 

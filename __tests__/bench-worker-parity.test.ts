@@ -20,6 +20,9 @@ import { readTrace } from './helpers.js'
 // a bench that measures another gate than the worker measures nothing. So this file runs the REAL runTaskJob and the REAL runTaskBench
 // through the same scripted model and the same fake docker, and compares what each of them did. When the gate text, the way red runs are
 // counted, or the handling of a container that cannot be stopped changes in one of them and not in the other, a test here fails.
+//
+// One difference is deliberate, and its test says so instead of comparing: a verify container that cannot run at all. The worker counts it
+// as a red verify; the bench ends the run as a benchfout at the first one (spec §4.1: a container that failed outside the model).
 
 type Fake = Awaited<ReturnType<typeof startFakeModelServer>>
 const servers: Fake[] = []
@@ -181,14 +184,32 @@ describe('the gate of the bench is the gate of the worker', () => {
     expect(bench.result.runStatus).toBe('completed')
   })
 
-  it('with a verify that fails to run: the same reason in the retry message', async () => {
-    const { worker, bench } = await bothWays({ script: [say('eerste'), say('tweede')], docker: { verify: [{ code: null }, {}] } })
-    expect(bench.observed).toEqual(worker.observed)
-    expect(worker.observed.conversation[1].at(-1)).toEqual({
-      role: 'user',
-      content: 'Verify faalt (poging 1 van 3): docker-proces eindigde zonder exitcode\n',
-    })
-    expect(worker.observed.gate).toEqual(['retry', 'accept'])
+  // The intended divergence. Up to the first verify that cannot run the two do the same; then the worker goes on (it counts a red verify,
+  // sends the reason to the model as a retry message, and ends on VERIFY_FAILED after maxVerifyRepairs of them) and the bench stops.
+  it('with a verify that cannot run, the one intended divergence: the worker ends on VERIFY_FAILED after three, the bench on a benchfout at the first', async () => {
+    const cannotRun: DockerStep = { code: null, errorMessage: 'spawn docker ENOENT' } // what a missing docker binary looks like
+    const reason = 'docker-proces eindigde zonder exitcode: spawn docker ENOENT'
+    const { worker, bench } = await bothWays({ script: [say('eerste'), say('tweede'), say('derde')], docker: { verify: [cannotRun, cannotRun, cannotRun] } })
+
+    // the worker: three red verifies, the reason in the retry message of the first
+    expect(worker.observed.started.filter(([purpose]) => purpose === 'verify')).toHaveLength(3)
+    expect(worker.observed.conversation[1].at(-1)).toEqual({ role: 'user', content: `Verify faalt (poging 1 van 3): ${reason}\n` })
+    expect(worker.observed.gate).toEqual(['retry', 'retry', 'fail'])
+    expect(worker.observed.runEnd).toEqual({ type: 'run_end', status: 'failed', error: { code: 'VERIFY_FAILED', message: `verify 3× rood: ${reason}\n` } })
+    expect(worker.outcome).toBe('failed')
+
+    // the bench: the first one ends the run, which it aborts itself, and the result says benchfout with the cause
+    expect(bench.result).toMatchObject({ status: 'benchfout', benchError: `verify-container: ${reason}`, gate: { reds: 0 } })
+    expect(bench.observed.started.filter(([purpose]) => purpose === 'verify')).toHaveLength(1)
+    expect(bench.observed.gate).toEqual([])
+    expect(bench.observed.conversation).toHaveLength(1) // the model was asked once
+    expect(bench.observed.runEnd).toEqual({ type: 'run_end', status: 'failed', error: { code: 'HARNESS_ERROR', message: 'aborted' } })
+
+    // …and up to that point the two are the same: the first request, the prepare and the first verify, with the same results
+    expect(bench.observed.conversation[0]).toEqual(worker.observed.conversation[0])
+    expect(bench.observed.maxTokens[0]).toEqual(worker.observed.maxTokens[0])
+    expect(bench.observed.started).toEqual(worker.observed.started.slice(0, 2))
+    expect(bench.observed.containerEvents).toEqual(worker.observed.containerEvents.slice(0, 2))
   })
 
   it('with a verify that runs into its timeout: the same "timeout" in the retry message, and the container is cleaned up', async () => {

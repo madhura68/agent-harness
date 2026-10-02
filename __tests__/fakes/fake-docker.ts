@@ -14,6 +14,11 @@ export type DockerRun = {
 export type DockerStep = {
   /** Exit code of the `docker run` CLI; `null` is "no exit code" (the CLI ended by a signal). Default 0. */
   code?: number | null
+  /**
+   * What `errorMessage()` of the child says, for a `code` of `null`: the reason that the process could not run at all, as the real
+   * spawn wrapper reports it (a missing docker binary is "spawn docker ENOENT"). The container runner puts it in its `runnerError`.
+   */
+  errorMessage?: string
   /** What the container prints. */
   out?: string
   /** The container never ends by itself: a `docker kill` of its name (or `kill()` on the child) ends it. */
@@ -68,7 +73,7 @@ function fakeChild(step: DockerStep, run?: DockerRun): FakeChild {
     if (step.delayMs) setTimeout(settle, step.delayMs)
     else setImmediate(settle)
   }
-  return { stdout, stderr, done, kill: () => finish(null) }
+  return { stdout, stderr, done, kill: () => finish(null), errorMessage: () => step.errorMessage }
 }
 
 function parseRun(args: string[]): DockerRun {

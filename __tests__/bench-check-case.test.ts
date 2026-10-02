@@ -427,16 +427,22 @@ describe('checkCase — B, the ref commit', () => {
 
 describe('checkCase — the diff between A and B, from real git', () => {
   it.each([
-    ['vitest.config.ts', { 'vitest.config.ts': "import { defineConfig } from 'vitest/config'\n\nexport default defineConfig({ test: {} })\n" }],
-    ['package.json', { 'package.json': '{ "name": "origin", "version": "2" }\n' }],
-  ])('is not ok when B changes %s, and still measures B in lines', async (_name, change) => {
     // B replaces one line of the file (1 line in, 1 out) on top of the 11 lines of the standard B
+    ['vitest.config.ts', { 'vitest.config.ts': "import { defineConfig } from 'vitest/config'\n\nexport default defineConfig({ test: {} })\n" }, 13],
+    ['package.json', { 'package.json': '{ "name": "origin", "version": "2" }\n' }, 13],
+    // A has neither of these: B adds a file of one line. The hidden check installs the dependencies again from the lockfile and the
+    // .npmrc of B (runTaskBench), so a B that changes them changes what is installed: no new dependency (criterion 6).
+    ['package-lock.json', { 'package-lock.json': '{ "lockfileVersion": 3 }\n' }, 12],
+    ['.npmrc', { '.npmrc': 'registry=https://registry.invalid/\n' }, 12],
+  ])('is not ok when B changes %s, and still measures B in lines', async (_name, change, lines) => {
     const t = await check({ origin: await originWith(change) })
-    expect(t.result).toMatchObject({ ok: false, refChangesRunnerConfig: true, hiddenMatchesRef: true, lines: 13, problems: ['ref_commit wijzigt de runnerconfig'] })
+    expect(t.result).toMatchObject({ ok: false, refChangesRunnerConfig: true, hiddenMatchesRef: true, lines, problems: ['ref_commit wijzigt de runnerconfig'] })
   })
 
   it('is not bothered by config-like files below the root', async () => {
-    const t = await check({ origin: await originWith({ 'sub/package.json': '{}\n', 'packages/a/tsconfig.json': '{}\n', 'tsconfig.d/x.json': '{}\n', 'package-lock.json': '{}\n' }) })
+    const t = await check({
+      origin: await originWith({ 'sub/package.json': '{}\n', 'packages/a/tsconfig.json': '{}\n', 'tsconfig.d/x.json': '{}\n', 'sub/package-lock.json': '{}\n', 'packages/a/.npmrc': 'a=b\n' }),
+    })
     expect(t.result).toMatchObject({ ok: true, refChangesRunnerConfig: false })
   })
 
@@ -519,12 +525,25 @@ describe('analyseRefDiff', () => {
   })
 
   it.each(['A', 'M', 'D', 'T'])('sees a change of status %s to the runner config of the root', (status) => {
-    for (const name of ['vitest.config.ts', 'vitest.config.mts', 'package.json', 'tsconfig.json', 'tsconfig.build.json']) {
+    for (const name of ['vitest.config.ts', 'vitest.config.mts', 'package.json', 'package-lock.json', '.npmrc', 'tsconfig.json', 'tsconfig.build.json']) {
       expect(analyse(nul(status, name)).refChangesRunnerConfig, `${status} ${name}`).toBe(true)
     }
   })
 
-  it.each(['sub/package.json', 'packages/a/vitest.config.ts', 'tsconfig/x.json', 'tsconfig.d/x.json', 'package-lock.json', 'package.json.bak', 'src/vitest.config.ts', 'xtsconfig.json'])(
+  it.each([
+    'sub/package.json',
+    'packages/a/vitest.config.ts',
+    'tsconfig/x.json',
+    'tsconfig.d/x.json',
+    'sub/package-lock.json',
+    'sub/.npmrc',
+    'package-lock.json.bak',
+    '.npmrc.bak',
+    'x.npmrc',
+    'package.json.bak',
+    'src/vitest.config.ts',
+    'xtsconfig.json',
+  ])(
     'does not take %s for the runner config',
     (path) => {
       expect(analyse(nul('M', path)).refChangesRunnerConfig).toBe(false)

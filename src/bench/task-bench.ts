@@ -75,8 +75,11 @@ export function mapStatus(r: { benchError?: string; run?: RunResult; patchEmpty?
 // Containers: the bookkeeping of runTaskJob (src/worker/task-impl.ts), as a piece of its own.
 // ---------------------------------------------------------------------------------------------------
 
-/** What a container is for; it shows in the `container` event of the trace. */
-export type ContainerSource = 'prepare' | 'run_tests' | 'gate' | 'hidden_check'
+/**
+ * What a container is for; it shows in the `container` event of the trace. `reinstall` is the prepare of the recipe once more, right
+ * before the hidden check (see `runTaskBench`).
+ */
+export type ContainerSource = 'prepare' | 'run_tests' | 'gate' | 'hidden_check' | 'reinstall'
 
 export type ContainerRunner = {
   /** Runs one container on the work tree `worktree`: a `prepare` or `verify` container with this script, which `signal` stops. Never starts one after an uncertain cleanup. */
@@ -138,7 +141,8 @@ export function createContainerRunner(o: { id: string; task: TaskConfig; trace: 
 
 /**
  * The hidden test run (spec §4.1 step 5): vitest with the JSON reporter on exactly `files`, in a verify container. The caller has put
- * `__tests__/` and the runner config back (`restoreForHiddenCheck`). `.task-bench` is removed first, so that the report can only
+ * `__tests__/` and the runner config back (`restoreForHiddenCheck`), and, for a work tree that a model has written to, has installed
+ * the dependencies again (vitest is run from `node_modules`). `.task-bench` is removed first, so that the report can only
  * come from this container: a file the model run left there could otherwise be read as the verdict when vitest dies before it writes.
  * The report is read with `readHiddenReport`, which refuses whatever the container made of the path (a link, a FIFO): `report` says
  * what it found, and an `unsafe` one has no verdict (`hidden` is then only what no usable report gives). `hidden` is the verdict on
@@ -197,6 +201,15 @@ function withDroppedCost(usage: RunResult['usage'], costs: Array<number | undefi
  * patch, the hidden check with the tests of `ref_commit`. The result is in `<out>/<runId>/bench-result.json` on every path, also
  * when the bench itself failed or was stopped. Only a run dir that cannot be made throws.
  *
+ * The hidden check does not trust what the model run left in the work tree. `__tests__/` and the runner config (the lockfile and the
+ * `.npmrc` among it) go back from `ref_commit`, and the dependencies are installed again by the prepare of the recipe, in a container of
+ * its own (`reinstall`) before the hidden container: vitest is run from `node_modules`, and the model can write there like anywhere in
+ * the work tree. `checkCase` does not do this; it has no model run in its work trees.
+ *
+ * A verify container that cannot run at all (`runnerError`: docker did not start, or its process ended without an exit code) is a failure
+ * of the bench, not a red verify: the run is aborted and ends as a `benchfout` (`verify-container: <cause>`), where the worker counts
+ * it as one more red verify. A verify that times out stays red, because the code of the model can cause that.
+ *
  * `signal` is a stop from outside. It aborts the model request, the wait before a retry and every container, and waits until the
  * containers are cleaned up. The run is then a `benchfout` with `benchError: "afgebroken"`, and is never scored.
  *
@@ -241,12 +254,18 @@ export async function runTaskBench(o: {
   const providers: string[] = []
   // The cost of the answer that was dropped on the last attempt: no retry follows it, so it is on the error and not in `retries`.
   let droppedLastUsd = undefined as number | undefined
+  // The `runnerError` of the first verify container that failed outside the model (see `runVerify`).
+  let verifyFault = undefined as string | undefined
 
-  /** Why the run has to end now, whatever else is going on: a container that was not provably stopped, or a stop from outside. */
+  /**
+   * Why the run has to end now, whatever else is going on: a container that was not provably stopped, a stop from outside, or a verify
+   * container that failed outside the model. In that order: a stop explains the others, and an uncertain container comes before all.
+   */
   const stopReason = (): string | undefined => {
     const name = containers.uncertain()
     if (name) return `container ${name} niet aantoonbaar gestopt`
-    return o.signal?.aborted ? STOPPED : undefined
+    if (o.signal?.aborted) return STOPPED
+    return verifyFault === undefined ? undefined : `verify-container: ${verifyFault}`
   }
   const interrupted = (): void => {
     const reason = stopReason()
@@ -273,6 +292,16 @@ export async function runTaskBench(o: {
     const runVerify = async (source: 'run_tests' | 'gate', signal: AbortSignal): Promise<VerifyRun> => {
       const verified = await container('verify', source, buildScript([recipe.verify]), signal)
       if (source === 'gate' && !containers.uncertain() && !signal.aborted) lastTail = verifyText(verified)
+      // A verify container that could not run at all (`runnerError`: docker did not start, or its process ended without an exit code)
+      // says nothing about the work of the model. Spec §4.1 makes a container that failed outside the model a benchfout, so this is not a
+      // red verify, however often it happens (the worker does count it as red; `runTaskJob` stays as it is). The run is aborted here, so
+      // that nothing else starts, and `stopReason` ends it as that benchfout once the containers have settled; the first cause is kept.
+      // Not this: a stop or the deadline (the abort path of a container reports `afgebroken` and has an aborted signal), a container
+      // that was not provably stopped (`uncertain()`, its own end), and a time-out (no `runnerError`: the code of the model can be slow).
+      if (verified.runnerError !== undefined && !signal.aborted && !containers.uncertain()) {
+        verifyFault ??= verified.runnerError
+        inner.abort()
+      }
       return verified
     }
 
@@ -311,6 +340,9 @@ export async function runTaskBench(o: {
     const afterAnswer = async (_answer: string, signal: AbortSignal): Promise<AfterAnswerResult> => {
       const verified = await runVerify('gate', signal)
       if (isGreen(verified)) return { kind: 'accept' }
+      // Not a red verify, so not counted and not sent back to the model. `runVerify` has aborted the run, which drops this call; should it
+      // not, this ends the run on HARNESS_ERROR, a benchfout as well, and never on VERIFY_FAILED.
+      if (verifyFault !== undefined) throw new BenchFault(`verify-container: ${verifyFault}`)
       reds++
       const text = verifyText(verified)
       // N = maxVerifyRepairs red gate runs end the job: attempts 1..N-1 get a retry, the N-th is final.
@@ -344,7 +376,8 @@ export async function runTaskBench(o: {
     patch = { bytes: Buffer.byteLength(captured.patch), empty: captured.empty }
     if (ended.status !== 'completed' || captured.empty) return
 
-    // The hidden check, out of the model's sight: the tests and runner config of ref_commit go back first.
+    // The hidden check, out of the model's sight: the tests and runner config of ref_commit go back first. The runner config includes
+    // package.json, the lockfile and .npmrc, which is what the dependencies are installed from just below.
     interrupted()
     await assertAdminUnchanged(ws, snap)
     await restoreForHiddenCheck(ws, c.ref_commit)
@@ -352,6 +385,15 @@ export async function runTaskBench(o: {
     // during them. A container that started anyway is killed at once, and a kill that is not provably done would be reported as a
     // benchfout of its own ("niet aantoonbaar gestopt") instead of afgebroken.
     interrupted()
+    // The hidden check runs vitest from node_modules, which is part of the work tree that the model could write to. So it does not use
+    // that one: the prepare of the recipe runs again on the restored files, in a prepare container of its own (npm ci removes
+    // node_modules first, so what the model put there is gone). No host git follows this container, so it needs no scan. An empty
+    // prepare list has nothing to run (buildScript([]) would end in a dangling &&), and then nothing was ever installed either.
+    if (recipe.prepare.length > 0) {
+      const reinstall = await container('prepare', 'reinstall', buildScript(recipe.prepare), inner.signal)
+      interrupted() // a reinstall that the stop killed is no failed reinstall, and no hidden container starts after a stop
+      if (!isGreen(reinstall)) throw new BenchFault(`herinstallatie vóór de verborgen toets faalde: ${verifyText(reinstall)}`)
+    }
     const check = await runHiddenCheck({ containers, work: ws.work, files: c.hidden_tests, signal: inner.signal })
     interrupted()
     if (check.run.runnerError) {
@@ -554,6 +596,10 @@ type Opened = { ws: Workspace; snap: GitAdminSnapshot }
  *    `ref_commit` put back, then the hidden tests. They must fail for real (`failsForReal`), not merely not pass.
  * 3. On `ref_commit`: prepare, the scan, and the hidden tests. They must pass.
  *
+ * Unlike `runTaskBench`, the hidden tests run here without installing the dependencies again: no model has run in these work trees,
+ * each of them was installed fresh by the prepare from the lockfile of its own commit, and a `ref_commit` that changes the lockfile or
+ * the `.npmrc` (which would make the two differ) is a problem of its own (`refChangesRunnerConfig`, criterion 6).
+ *
  * Every finding goes to `problems`; the result is in `<out>/<caseId>-check-<hex8>/case-check.json` on every path, and `ok` means
  * there is no problem. What cannot be judged because the bench itself failed (no recipe, a clone that fails, a red prepare, a
  * rewritten git administration) is a problem too, and ends the check there. Only a dir that cannot be made throws. The two clones
@@ -659,6 +705,7 @@ export async function checkCase(o: { case: BenchCase; task: TaskConfig; out: str
 
     await assertAdminUnchanged(base.ws, base.snap) // before the one host git that follows a container
     await restoreForHiddenCheck(base.ws, c.ref_commit)
+    // No reinstall here, unlike runTaskBench: no model ran in this work tree (see the doc comment above).
     const onBase = await hiddenCheck(base)
     interrupted() // the uncertain flag first: what was read from an uncertain container is thrown away
     hiddenOnBase = recorded(onBase)
