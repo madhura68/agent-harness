@@ -33,9 +33,11 @@ export type BenchDeps = {
  * `<out>/<runId>/bench-result.json`. `runStatus` is the raw end status of `runManifest`, or `not_run` when the bench failed before the
  * model loop started. `error` is the end error of that run (masked by the model client). `hidden` is the verdict of the hidden check,
  * and absent when that did not run or its container failed. `durationMs` is the wall time of the whole bench run: clone, prepare,
- * model loop and hidden check. `providers` lists the `provider` of the responses that named one, in order. `usage` is what the run
- * itself counted, plus the `costUsd` of the answers that the retry client dropped (see `retries`): they were paid for, and the run
- * never saw them. The ledger reads this file, so its `usage.costUsd` has to be the whole bill.
+ * model loop and hidden check. `providers` lists the `provider` of every response that named one, in the order the responses came: the
+ * answers that were used, and the ones that the retry client dropped (the provider of a dropped answer is also on its `retries`
+ * record). Spec §5 criterion 2 rests on it: every response has to come from a 16-bit provider. `usage` is what the run itself counted,
+ * plus the `costUsd` of the answers that the retry client dropped (see `retries`): they were paid for, and the run never saw them.
+ * The ledger reads this file, so its `usage.costUsd` has to be the whole bill.
  */
 export type BenchResult = {
   caseId: string
@@ -325,6 +327,8 @@ export async function runTaskBench(o: {
           sleep: o.deps?.sleep,
           onRetry: (r) => {
             retries.push(r)
+            // A dropped answer is a response too: who served it is evidence (spec §5 criterion 2), and this is the moment it arrived.
+            if (r.provider) providers.push(r.provider)
             trace.event({ type: 'model_retry', ...r })
           },
         })
@@ -332,7 +336,11 @@ export async function runTaskBench(o: {
     const client: ModelClient = {
       async complete(messages, options) {
         const res = await retrying.complete(messages, options).catch((err: unknown) => {
-          if (err instanceof UnusableAnswerError && err.costUsd !== undefined) droppedLastUsd = (droppedLastUsd ?? 0) + err.costUsd
+          // The answer that was dropped for good has no record: its cost and its provider are on the error, and only then (see UnusableAnswerError).
+          if (err instanceof UnusableAnswerError) {
+            if (err.costUsd !== undefined) droppedLastUsd = (droppedLastUsd ?? 0) + err.costUsd
+            if (err.provider) providers.push(err.provider)
+          }
           throw err
         })
         if (res.provider) providers.push(res.provider)

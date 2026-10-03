@@ -548,17 +548,20 @@ describe('runTaskBench — transient model failures', () => {
 // the choice (finish_reason "error"). The model client turns that finish reason into 'other'. It is a provider failure, not an answer:
 // scored as one, it would run the gate on an untouched tree and end the run as geen_wijzigingen, a verdict on a model that never answered.
 describe('runTaskBench — a provider error inside a 200', () => {
-  const providerError = (cost = 0.0004): FakeTurn => ({
+  const providerError = (cost = 0.0004, provider?: string): FakeTurn => ({
     body: {
       id: 'gen-1',
       object: 'chat.completion',
       model: 'fake-model',
       choices: [{ index: 0, error: { code: 502, message: 'Provider disconnected unexpectedly' }, message: { role: 'assistant', content: '' }, finish_reason: 'error' }],
       usage: { prompt_tokens: 100, completion_tokens: 0, cost },
+      ...(provider !== undefined ? { provider } : {}),
     },
   })
   /** A turn of the model that costs `cost`. */
   const paid = (turn: FakeTurn, cost: number): FakeTurn => ({ body: { ...(turn.body as object), usage: { prompt_tokens: 10, completion_tokens: 5, cost } } })
+  /** The turn as served by `provider`: OpenRouter names who served the request in the top-level `provider` of the response. */
+  const from = (provider: string, turn: FakeTurn): FakeTurn => ({ body: { ...(turn.body as object), provider } })
   const noWait = { sleep: async () => undefined }
 
   it('retries it, runs the gate on the answer that follows and not on the error, and counts what the dropped answer cost', async () => {
@@ -655,6 +658,104 @@ describe('runTaskBench — a provider error inside a 200', () => {
     expect(t.model.requests).toHaveLength(1)
     expect(t.docker.runs.map((r) => r.purpose)).toEqual(['prepare', 'verify']) // the loop took it for an answer and ran the gate
     expect(t.result.usage.costUsd).toBeCloseTo(0.0004, 10) // counted by the loop itself
+  })
+
+  // Spec §5 criterion 2: every response came from a 16-bit provider. The evidence is `providers`, so it has to list the provider of every
+  // response, in the order the responses came, the answers that the retry client dropped included. Each response is listed exactly once.
+  describe('the provider of the answers that were dropped', () => {
+    it('lists it in `providers` and in its record and trace event, in arrival order: Provider-A "other", then Provider-B, and the run goes on', async () => {
+      const t = await bench({
+        retryTransient: true,
+        script: [from('Provider-A', providerError(0.0004)), from('Provider-B', paid(writeZ(), 0.001)), from('Provider-B', paid(say(), 0.0005))],
+        docker: { hidden: [hiddenPasses] },
+        deps: noWait,
+      })
+      expect(t.result).toMatchObject({ status: 'geslaagd', runStatus: 'completed' }) // the run went on with the answer of Provider-B
+      expect(t.result.providers).toEqual(['Provider-A', 'Provider-B', 'Provider-B']) // one entry per response, the dropped one first
+      expect(t.saved.providers).toEqual(t.result.providers)
+      expect(t.result.retries).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004, provider: 'Provider-A' }])
+      expect(readTrace(t.runDir).filter((e) => e.type === 'model_retry')).toEqual([
+        expect.objectContaining({ type: 'model_retry', attempt: 1, kind: 'finish_other', costUsd: 0.0004, provider: 'Provider-A' }),
+      ])
+    })
+
+    it('lists all four when four of them from different providers end the run, the last one from the error and not from a record', async () => {
+      const t = await bench({
+        retryTransient: true,
+        script: [
+          from('Provider-A', providerError()),
+          from('Provider-B', providerError()),
+          from('Provider-C', providerError()),
+          from('Provider-D', providerError()),
+          from('Provider-E', say()), // never asked for
+        ],
+        deps: noWait,
+      })
+      expect(t.result).toMatchObject({ status: 'benchfout', runStatus: 'failed', error: { code: 'MODEL_ERROR' } })
+      expect(t.model.requests).toHaveLength(4)
+      expect(t.result.providers).toEqual(['Provider-A', 'Provider-B', 'Provider-C', 'Provider-D'])
+      expect(t.result.retries.map((r) => r.provider)).toEqual(['Provider-A', 'Provider-B', 'Provider-C']) // the fourth has no retry, so no record
+      expect(t.saved.providers).toEqual(['Provider-A', 'Provider-B', 'Provider-C', 'Provider-D'])
+    })
+
+    it('keeps the order of arrival across a retry: an answer that was used, a dropped one, and the answer after it', async () => {
+      const t = await bench({
+        retryTransient: true,
+        script: [
+          from('Provider-A', call('list_files', {}, 'lf')),
+          from('Provider-B', providerError()),
+          from('Provider-C', say()),
+        ],
+        deps: noWait,
+      })
+      expect(t.result.runStatus).toBe('completed')
+      expect(t.result.providers).toEqual(['Provider-A', 'Provider-B', 'Provider-C'])
+    })
+
+    it('lists only the provider that answered after an HTTP 503: a failure without a response has none', async () => {
+      const t = await bench({ retryTransient: true, script: [overloaded, from('Provider-B', say())], deps: noWait })
+      expect(t.result.retries).toStrictEqual([{ attempt: 1, kind: 'http', status: 503 }])
+      expect(t.result.providers).toEqual(['Provider-B'])
+    })
+
+    it('adds nothing for a dropped answer that names no provider, and leaves the key out of its record', async () => {
+      const t = await bench({ retryTransient: true, script: [providerError(0.0004), from('Provider-B', say())], deps: noWait })
+      expect(t.result.retries).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004 }])
+      expect(t.result.providers).toEqual(['Provider-B'])
+      expect(readTrace(t.runDir).filter((e) => e.type === 'model_retry').every((e) => !('provider' in e))).toBe(true)
+    })
+
+    it('lists it once when the stop comes during the wait before the retry: the record has it, and the error it ends in does not say it again', async () => {
+      const stop = new AbortController()
+      let waiting!: () => void
+      const inWait = new Promise<void>((resolve) => (waiting = resolve))
+      const t = await start({
+        signal: stop.signal,
+        retryTransient: true,
+        script: [from('Provider-A', providerError(0.0004))],
+        deps: {
+          // like the real wait: it ends with an error when the signal fires
+          sleep: (_ms, signal) =>
+            new Promise<void>((_resolve, reject) => {
+              waiting()
+              signal.addEventListener('abort', () => reject(new Error('afgebroken')), { once: true })
+            }),
+        },
+      })
+      const running = t.run()
+      await inWait
+      stop.abort()
+      const result = await running
+      expect(result).toMatchObject({ status: 'benchfout', benchError: 'afgebroken' })
+      expect(result.retries).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004, provider: 'Provider-A' }])
+      expect(result.providers).toEqual(['Provider-A'])
+    })
+
+    it('lists the provider of the answer once on the local route, where nothing is dropped and the loop takes it for an answer', async () => {
+      const t = await bench({ retryTransient: false, script: [from('Provider-A', providerError()), from('Provider-B', say())] })
+      expect(t.result).toMatchObject({ runStatus: 'completed', retries: [] })
+      expect(t.result.providers).toEqual(['Provider-A'])
+    })
   })
 })
 

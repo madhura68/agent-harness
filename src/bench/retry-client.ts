@@ -6,9 +6,11 @@ import type { CompleteResult } from '../types.js'
  * One retry of a model request, as the trace and the result file record it. `attempt` numbers the retries from 1: the first
  * failure that is retried is attempt 1. `kind` is the kind of the failure (`network`, `http`, `error_body`) or `finish_other`, for an
  * answer that came back whole but cannot be used (see `UnusableAnswerError`). `status` and `bodyCode` are there when the failure had
- * one. `costUsd` is there when the dropped answer reported what it cost: it was paid for, and the run loop never sees it.
+ * one. `costUsd` is there when the dropped answer reported what it cost: it was paid for, and the run loop never sees it. `provider` is
+ * there when the dropped answer named who served it (`CompleteResult.provider`): the run loop never sees that either, and the evidence
+ * has to list the provider of every response, the dropped ones included. A failure without a response has none.
  */
-export type RetryRecord = { attempt: number; kind: string; status?: number; bodyCode?: number; costUsd?: number }
+export type RetryRecord = { attempt: number; kind: string; status?: number; bodyCode?: number; costUsd?: number; provider?: string }
 
 // Spec §4.1: up to three retries, with a wait that grows. The wait is bound by the run: the signal of the call stops it.
 const MAX_RETRIES = 3
@@ -46,11 +48,11 @@ export function isTransient(err: unknown, signal: AbortSignal): boolean {
  * answer, that would end a run on a model that never answered. It is final for the retrying client (`isTransient` is false for it),
  * and it is what `runManifest` ends on as MODEL_ERROR when the retries run out.
  *
- * `costUsd` is what the answer cost, and only when no retry record carries it: an answer that is dropped for a retry has its cost in
- * the record, and one that is dropped for good (no retry left, or a stop) has no record, so the error says it.
+ * `costUsd` is what the answer cost and `provider` who served it, and only when no retry record carries them: an answer that is dropped
+ * for a retry has both in the record, and one that is dropped for good (no retry left, or a stop) has no record, so the error says it.
  */
 export class UnusableAnswerError extends ModelError {
-  constructor(readonly costUsd?: number) {
+  constructor(readonly costUsd?: number, readonly provider?: string) {
     super('model answer unusable: finish_reason other (OpenRouter reports a provider error that way)', { kind: 'invalid' })
   }
 }
@@ -61,8 +63,8 @@ export class UnusableAnswerError extends ModelError {
  * shorter). Every retry gets the same messages and options, so also the same signal. `onRetry` is called once per
  * retry, before the wait. `sleep` is a test seam; the default is a real timer that the signal cuts short.
  *
- * An answer with finish reason 'other' counts as a temporary failure too (kind `finish_other`, with its cost in the record), and
- * takes its retries from the same budget. It is never handed on: it is retried, or, when the retries run out or the signal is
+ * An answer with finish reason 'other' counts as a temporary failure too (kind `finish_other`, with its cost and provider in the
+ * record), and takes its retries from the same budget. It is never handed on: it is retried, or, when the retries run out or the signal is
  * aborted, it ends the call as an `UnusableAnswerError`. The other finish reasons pass as they are.
  *
  * A stop during the wait ends the call with the failure that was being retried, without another request. When the
@@ -110,10 +112,15 @@ export function createRetryingClient(
         if (res.finishReason !== 'other') return res
 
         const costUsd = typeof res.usage.costUsd === 'number' ? res.usage.costUsd : undefined
-        // Dropped for good: no record follows, so the error carries the cost.
-        if (options.signal.aborted || retry >= maxRetries) throw new UnusableAnswerError(costUsd)
-        // Dropped for a retry: the record carries the cost, and so the error that a stop during the wait turns it into does not.
-        await retryAfter(retry, { kind: 'finish_other', ...(costUsd !== undefined ? { costUsd } : {}) }, new UnusableAnswerError())
+        const provider = res.provider || undefined // an empty string names nobody (the model client never sets one, a stand-in might)
+        // Dropped for good: no record follows, so the error carries the cost and the provider.
+        if (options.signal.aborted || retry >= maxRetries) throw new UnusableAnswerError(costUsd, provider)
+        // Dropped for a retry: the record carries them, and so the error that a stop during the wait turns it into does not.
+        await retryAfter(
+          retry,
+          { kind: 'finish_other', ...(costUsd !== undefined ? { costUsd } : {}), ...(provider !== undefined ? { provider } : {}) },
+          new UnusableAnswerError(),
+        )
       }
     },
   }

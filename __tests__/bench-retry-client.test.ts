@@ -342,12 +342,13 @@ describe('createRetryingClient', () => {
 // partial output. That is a provider failure and no answer, so it is retried like any other temporary failure.
 describe('createRetryingClient — an answer with finish reason "other"', () => {
   const live = new AbortController().signal
-  const dropped = (costUsd?: number): CompleteResult => ({
+  const dropped = (costUsd?: number, provider?: string): CompleteResult => ({
     message: { content: '', toolCalls: [] },
     finishReason: 'other',
     usage: { source: 'provider_reported', inputTokens: 100, outputTokens: 3, ...(costUsd !== undefined ? { costUsd } : {}) },
     model: 'm',
     durationMs: 1,
+    ...(provider !== undefined ? { provider } : {}),
   })
   const MESSAGE = 'model answer unusable: finish_reason other (OpenRouter reports a provider error that way)'
 
@@ -360,6 +361,28 @@ describe('createRetryingClient — an answer with finish reason "other"', () => 
     expect(calls).toHaveLength(2)
     expect(records).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004 }])
     expect(waits).toEqual([2000])
+  })
+
+  // The evidence has to list the provider of every response (spec §5 criterion 2: every response came from a 16-bit provider), the ones
+  // that are dropped included. A failure without a response (a network error, an HTTP status) has none.
+  it('puts the provider of a dropped answer in its record, next to its cost, and leaves it out when the answer named none', async () => {
+    const { inner } = scriptedInner([dropped(0.0004, 'Provider-A'), dropped(undefined, 'Provider-B'), dropped(0.001), http(503), answer])
+    const records: RetryRecord[] = []
+    await createRetryingClient(inner, { onRetry: (r) => records.push(r), sleep: instantSleep().sleep, maxRetries: 4 }).complete(msgs, opts())
+    // toStrictEqual: a provider the answer did not name is absent from the record, not a key without a value
+    expect(records).toStrictEqual([
+      { attempt: 1, kind: 'finish_other', costUsd: 0.0004, provider: 'Provider-A' },
+      { attempt: 2, kind: 'finish_other', provider: 'Provider-B' },
+      { attempt: 3, kind: 'finish_other', costUsd: 0.001 },
+      { attempt: 4, kind: 'http', status: 503 },
+    ])
+  })
+
+  it('treats an empty provider as none, like the rest of the bench does: no key in the record', async () => {
+    const { inner } = scriptedInner([dropped(0.001, ''), answer])
+    const records: RetryRecord[] = []
+    await createRetryingClient(inner, { onRetry: (r) => records.push(r), sleep: instantSleep().sleep }).complete(msgs, opts())
+    expect(records).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.001 }])
   })
 
   it('keeps a cost of 0 (a free model reports it) and leaves the cost out when the dropped answer reported none', async () => {
@@ -403,19 +426,31 @@ describe('createRetryingClient — an answer with finish reason "other"', () => 
     expect(waits).toEqual([2000, 8000, 30000])
   })
 
+  it('gives up with the provider of the last answer on the error and the providers of the others in their records, each named once', async () => {
+    const { inner } = scriptedInner([dropped(0.001, 'Provider-A'), dropped(0.002, 'Provider-B'), dropped(0.003, 'Provider-C'), dropped(0.004, 'Provider-D'), answer])
+    const records: RetryRecord[] = []
+    const err = await modelError(createRetryingClient(inner, { onRetry: (r) => records.push(r), sleep: instantSleep().sleep }).complete(msgs, opts()))
+    expect(err).toBeInstanceOf(UnusableAnswerError)
+    expect(records.map((r) => r.provider)).toEqual(['Provider-A', 'Provider-B', 'Provider-C'])
+    expect((err as UnusableAnswerError).provider).toBe('Provider-D') // no retry follows it, so no record has its provider
+    expect((err as UnusableAnswerError).costUsd).toBe(0.004)
+  })
+
   it('takes its retries from the same budget as every other temporary failure', async () => {
-    const { inner, calls } = scriptedInner([http(503), dropped(0.001), http(503), dropped(0.002), answer])
+    const { inner, calls } = scriptedInner([http(503), dropped(0.001, 'Provider-A'), http(503), dropped(0.002, 'Provider-B'), answer])
     const records: RetryRecord[] = []
     const err = await modelError(createRetryingClient(inner, { onRetry: (r) => records.push(r), sleep: instantSleep().sleep }).complete(msgs, opts()))
     expect(err).toBeInstanceOf(UnusableAnswerError)
     expect((err as UnusableAnswerError).costUsd).toBe(0.002)
+    expect((err as UnusableAnswerError).provider).toBe('Provider-B')
     expect(calls).toHaveLength(4)
     expect(records.map((r) => r.kind)).toEqual(['http', 'finish_other', 'http'])
+    expect(records.map((r) => r.provider)).toEqual([undefined, 'Provider-A', undefined]) // a failure without a response has no provider
   })
 
   it('does not retry it once the signal is aborted: it ends with the ModelError and the cost, without a record or a wait', async () => {
     const controller = new AbortController()
-    const inner: ModelClient = { complete: async () => { controller.abort(); return dropped(0.001) } }
+    const inner: ModelClient = { complete: async () => { controller.abort(); return dropped(0.001, 'Provider-A') } }
     const records: RetryRecord[] = []
     const { waits, sleep } = instantSleep()
     const err = await modelError(
@@ -423,6 +458,7 @@ describe('createRetryingClient — an answer with finish reason "other"', () => 
     )
     expect(err).toBeInstanceOf(UnusableAnswerError)
     expect((err as UnusableAnswerError).costUsd).toBe(0.001)
+    expect((err as UnusableAnswerError).provider).toBe('Provider-A') // dropped for good, so no record: the error says who served it
     expect(records).toEqual([])
     expect(waits).toEqual([])
   })
@@ -432,17 +468,18 @@ describe('createRetryingClient — an answer with finish reason "other"', () => 
     it.each([
       ['a wait that rejects', (stop: () => void) => async () => { stop(); throw new DOMException('The operation was aborted', 'AbortError') }],
       ['a wait that just returns', (stop: () => void) => async () => { stop() }],
-    ])('ends with the ModelError, without a new call, and counts the cost once, in the record, with %s', async (_label, makeSleep) => {
+    ])('ends with the ModelError, without a new call, and counts the cost and the provider once, in the record, with %s', async (_label, makeSleep) => {
       const controller = new AbortController()
-      const { inner, calls } = scriptedInner([dropped(0.001), answer])
+      const { inner, calls } = scriptedInner([dropped(0.001, 'Provider-A'), answer])
       const records: RetryRecord[] = []
       const client = createRetryingClient(inner, { onRetry: (r) => records.push(r), sleep: makeSleep(() => controller.abort()) })
       const err = await modelError(client.complete(msgs, { signal: controller.signal, maxTokens: 64 }))
       expect(err).toBeInstanceOf(UnusableAnswerError)
       expect(err.message).toBe(MESSAGE)
       expect(calls).toHaveLength(1)
-      expect(records).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.001 }]) // announced before the wait, as for every retry
+      expect(records).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.001, provider: 'Provider-A' }]) // announced before the wait, as for every retry
       expect((err as UnusableAnswerError).costUsd).toBeUndefined() // the record has it: the error does not say it a second time
+      expect((err as UnusableAnswerError).provider).toBeUndefined() // and neither who served it
     })
   })
 })
@@ -471,13 +508,14 @@ describe('createRetryingClient around the real model client', () => {
   })
 
   // The body OpenRouter documents for a provider that fails after the answer has begun: HTTP 200, no top-level error, the error in the choice.
-  const providerFailure = (cost?: number) => ({
+  const providerFailure = (cost?: number, provider?: string) => ({
     body: {
       id: 'gen-1',
       object: 'chat.completion',
       model: 'fake-model',
       choices: [{ index: 0, error: { code: 502, message: 'Provider disconnected unexpectedly' }, message: { role: 'assistant', content: '' }, finish_reason: 'error' }],
       usage: { prompt_tokens: 100, completion_tokens: 3, ...(cost !== undefined ? { cost } : {}) },
+      ...(provider !== undefined ? { provider } : {}),
     },
   })
 
@@ -490,13 +528,29 @@ describe('createRetryingClient around the real model client', () => {
     expect(records).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004 }])
   })
 
+  it('names the provider that served the dropped answer, as the top-level provider of the response says it', async () => {
+    fake = await startFakeModelServer([providerFailure(0.0004, 'Provider-A'), { body: { ...completion({ content: 'pong' }), provider: 'Provider-B' } }])
+    const records: RetryRecord[] = []
+    const r = await retrying(fake.baseUrl, records).complete(msgs, opts())
+    expect(r.provider).toBe('Provider-B') // the answer that is used names its own
+    expect(records).toStrictEqual([{ attempt: 1, kind: 'finish_other', costUsd: 0.0004, provider: 'Provider-A' }])
+  })
+
   it('gives up on four of them in a row with a ModelError, and no answer comes out of it', async () => {
-    fake = await startFakeModelServer([providerFailure(0.001), providerFailure(0.001), providerFailure(0.001), providerFailure(0.001), { body: completion({ content: 'pong' }) }])
+    fake = await startFakeModelServer([
+      providerFailure(0.001, 'Provider-A'),
+      providerFailure(0.001, 'Provider-B'),
+      providerFailure(0.001, 'Provider-C'),
+      providerFailure(0.001, 'Provider-D'),
+      { body: completion({ content: 'pong' }) },
+    ])
     const records: RetryRecord[] = []
     const err = await modelError(retrying(fake.baseUrl, records).complete(msgs, opts()))
     expect(err).toBeInstanceOf(UnusableAnswerError)
+    expect((err as UnusableAnswerError).provider).toBe('Provider-D')
     expect(fake.requests).toHaveLength(4)
     expect(records.map((r) => r.attempt)).toEqual([1, 2, 3])
+    expect(records.map((r) => r.provider)).toEqual(['Provider-A', 'Provider-B', 'Provider-C'])
   })
 
   it('does not retry an HTTP 401', async () => {
