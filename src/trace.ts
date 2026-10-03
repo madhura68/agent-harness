@@ -12,7 +12,11 @@ export type TraceEvent =
   | { type: 'tool_result'; callId: string; ok: boolean; errorCode?: ErrorCode; truncated: boolean; sha256: string; bytes: number }
   | { type: 'after_answer'; turn: number; outcome: 'accept' | 'retry' | 'fail' }
   // Written by the Task 11 task handler on the same trace as the run (prepare/verify containers around the gate).
-  | { type: 'container'; kind: 'prepare' | 'verify'; source: 'prepare' | 'run_tests' | 'gate'; n: number; exitCode: number | null; timedOut: boolean; durationMs: number; outputBytes: number }
+  // `hidden_check` is the container of the task-bench's hidden test run, and `clean_install` the prepare container that installs the
+  // dependencies on a pristine tree right before it; only the bench has them (src/bench/task-bench.ts).
+  | { type: 'container'; kind: 'prepare' | 'verify'; source: 'prepare' | 'run_tests' | 'gate' | 'hidden_check' | 'clean_install'; n: number; exitCode: number | null; timedOut: boolean; durationMs: number; outputBytes: number }
+  // The task-bench retried a model request after a temporary failure (src/bench/retry-client.ts); the fields are those of its RetryRecord.
+  | { type: 'model_retry'; attempt: number; kind: string; status?: number; bodyCode?: number; costUsd?: number; provider?: string }
   | { type: 'run_end'; status: RunStatus; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 // Exact spec §4.

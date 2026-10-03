@@ -208,6 +208,15 @@ describe('expandEnv / resolveServerEnv', () => {
   })
 })
 
+describe('a key that the model block does not know', () => {
+  // `harness task-bench` reads its model config strictly (cli.ts, ModelSpecSchema.strict()). The shared schema must stay as it is: a
+  // manifest or a worker config with a key it does not know loads today, and run and worker are not to change with task-bench.
+  it('is dropped by the manifest, not refused', () => {
+    const file = write({ ...answer, model: { ...answer.model, extra_body: { provider: { data_collection: 'deny' } } } })
+    expect(loadManifest(file).model).toStrictEqual(answer.model)
+  })
+})
+
 describe('model.reasoningEffort in a manifest', () => {
   it('accepts a known effort and rejects an unknown one', async () => {
     const { ManifestSchema } = await import('../src/manifest.js')

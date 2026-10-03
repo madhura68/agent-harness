@@ -1,3 +1,4 @@
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -46,4 +47,17 @@ export function bodyWithKeyAt(offset: number, build: (payload: string) => string
   const body = build('.'.repeat(offset - start) + DUMMY_KEY)
   if (body.indexOf(DUMMY_KEY) !== offset) throw new Error(`key starts at ${body.indexOf(DUMMY_KEY)}, expected ${offset}`)
   return body
+}
+
+/**
+ * A FIFO at `path`, for a test of code that must never wait on it. A FIFO that nobody writes to makes a reader wait for ever, and such
+ * a wait blocks the whole test worker (a timer cannot fire), so a regression would hang the suite instead of failing a test. So a
+ * writer opens the FIFO (read-write, which does not wait for a reader) after `delayMs` and holds it for `holdMs`: code that opens the
+ * FIFO and waits is released at `delayMs` and sees an empty read after `holdMs`, so a test that times the call fails on it. Code that
+ * does not wait on the FIFO is done long before `delayMs`, and one that does not open it at all is not affected.
+ */
+export function makeFifo(path: string, { delayMs = 1500, holdMs = 1000 } = {}): void {
+  execFileSync('mkfifo', [path])
+  const script = `sleep ${delayMs / 1000}; exec 3<>"$1"; sleep ${holdMs / 1000}`
+  spawn('sh', ['-c', script, 'sh', path], { stdio: 'ignore', detached: true }).unref()
 }

@@ -832,3 +832,29 @@ Beide namen de drie fixes van ronde 2 na:
 **Omvang:** geen nieuw onderdeel, alleen een controle en een test. Het eerste resultaat en de praktijkproef blijven in increment 1.
 
 **Volgende stap:** de ceremonie en de uitvoering wachten op JP. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering.
+
+### Bij de uitvoering (2026-10-02, increment 1, PR #31)
+
+Na de eindreview van de code en de review op PR #31 wijkt de bouw op vier punten af van de tekst hierboven. Zo bepaalt een storing of een geknoeide installatie het oordeel niet:
+
+1. **Fout in de choice van OpenRouter.** Een 200-antwoord met `finish_reason: "error"` (`'other'` na normalisatie) telt op de gehoste route als storing. Het wordt herhaald binnen hetzelfde budget van 3 herhalingen. Daarna volgt `MODEL_ERROR`, dus `benchfout`. De kosten van weggegooide antwoorden staan in `usage.costUsd`. Uit de eindreview, conform spec §4.1 en §6.
+2. **Weigeringen.** `task-bench` weigert `--extra-body-file` en onbekende sleutels in `--model-config`. Anders gaan verzoeken zonder het provider-blok weg: zonder de 16-bit-pin en zonder `data_collection: deny`. Uit de eindreview.
+3. **Runnerfout in verify.** Een verify-container die niet start (`runnerError`), via de gate of via `run_tests`, eindigt als `benchfout`, niet als `verify_rood`. Dat volgt spec §4.1: een container faalde buiten het model om. Dit is een bewust verschil met `runTaskJob`, en de pariteitstest legt het vast. Uit review #31.
+4. **Dependencies buiten modelcontrole.** Uit review #31, op JP's besluit "optie b", uitgevoerd volgens uitspraak R23:
+   - De terug te zetten runnerconfig omvat ook de rootbestanden `package-lock.json`, `npm-shrinkwrap.json` en `.npmrc`. `--check-case` laat een `ref_commit` die ze wijzigt afvallen (criterium 6).
+   - Op het modelpad komen de dependencies vóór de verborgen toets uit een schone installatie. De bench maakt een tweede clone op `ref_commit` (`<run>/ws-deps`) en draait daar de prepare van het recept, met netwerk maar zonder één modelbestand.
+   - Daarna vervangt die `node_modules` de `node_modules` van de werkmap. Ook de Prisma-client van scrum4me-mcp verhuist mee, want die staat onder `node_modules/.prisma/client`.
+   - Een aangepaste `node_modules` of een installscript van het model kan het rapport zo niet meer vervalsen.
+   - Na de start van het model draait geen container met netwerk meer op de werkmap.
+   - Code van het model die zelf getest wordt, blijft wel ongeïsoleerd.
+   - `--check-case` installeert niet opnieuw, want daar draait geen model.
+   - Dit breidt de terugzetset van spec §4.1 stap 5 en het criterium-6-filter uit. Elke run met een patch kost een extra clone plus prepare.
+   - Kopieën en scans van run-mappen slaan `ws*/` over (dus ook `ws-deps/`).
+
+**Bekende restpunten** (geaccepteerd; ze staan ook in het commentaar van `task-bench.ts`):
+- Code van het model die zelf getest wordt, is niet geïsoleerd. Er is ook geen afweer tegen een model dat bewust rapporten vervalst; zo'n model kent de verborgen toets niet.
+- `vite.config.*` en `vitest.workspace.*` worden niet teruggezet. Beide repo's hebben een `vitest.config.ts`, en die gaat voor.
+- Een recept zonder prepare-stappen krijgt geen schone installatie. Beide huidige recepten draaien `npm ci`.
+- De schone installatie draait na de betaalde modelrun. Faalt de forge of de registry, dan wordt het een benchfout, en de driver herhaalt die één keer.
+- Wijzigingen in een submodule vallen buiten de patch. Taak 11 markeert ze aan de hand van de trace (uitspraak R12).
+- De Prisma-client na het verplaatsen is lokaal bewezen op scrum4me-mcp `4f0bdb1` (Prisma 7.8). De uitslag van de suite is identiek, en de client bevat geen absolute paden.

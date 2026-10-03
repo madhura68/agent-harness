@@ -27,14 +27,23 @@ export type CompleteOptions = { signal: AbortSignal; maxTokens: number; tools?: 
 export type ModelClient = { complete(messages: ChatMessage[], options: CompleteOptions): Promise<CompleteResult> }
 
 /**
- * A ModelError holds its own message, which is masked, and nothing else. It takes no `cause` on purpose: the error a
+ * What kind of failure a ModelError is, for a caller that wants to react to it (retry, say) without reading message text.
+ * It is fixed from the HTTP status and the `error.code` of the body before the message is cut and masked, and it holds a
+ * fixed kind and two numbers only: no piece of the response, so nothing in it can echo the API key.
+ * `status` is the HTTP status of the response (absent when there was none); `bodyCode` is the numeric `error.code` of a
+ * 200 whose body is an error object (absent when that code is no number).
+ */
+export type ModelErrorDetail = { kind: 'network' | 'aborted' | 'http' | 'error_body' | 'invalid'; status?: number; bodyCode?: number }
+
+/**
+ * A ModelError holds its own masked message and a `detail`, and nothing else. It takes no `cause` on purpose: the error a
  * library throws can quote the response body (JSON.parse) or the URL (undici), so it can carry the API key, and
  * util.inspect or console.error would print the whole chain. Masking a cause is no fix either: JSON.parse quotes only
  * the start of the body, a part of the key that maskKey does not recognise.
  */
 export class ModelError extends Error {
   readonly code = 'MODEL_ERROR' as const
-  constructor(message: string) {
+  constructor(message: string, readonly detail?: ModelErrorDetail) {
     super(message)
     this.name = 'ModelError'
   }
@@ -165,31 +174,39 @@ export function createModelClient(opts: ModelClientOptions): ModelClient {
         status = res.status
         text = await res.text()
       } catch (err) {
-        const reason = options.signal.aborted ? 'aborted (deadline)' : err instanceof Error ? err.message : String(err)
-        throw new ModelError(`model request failed: ${maskKey(reason, opts.apiKey)}`)
+        const aborted = options.signal.aborted
+        const reason = aborted ? 'aborted (deadline)' : err instanceof Error ? err.message : String(err)
+        throw new ModelError(`model request failed: ${maskKey(reason, opts.apiKey)}`, { kind: aborted ? 'aborted' : 'network' })
       }
       const durationMs = now() - requestStart
       // Mask first, cut second: excerpt() keeps 200 characters, and a key that straddles the cut would leave a prefix
       // maskKey can no longer match. Errors use this copy; a good answer is still parsed from the raw text.
       const maskedText = maskKey(text, opts.apiKey)
+      // Every detail below is read from the status or the parsed body, never from maskedText or its excerpt.
       if (status < 200 || status >= 300) {
-        throw new ModelError(`model HTTP ${status}: ${excerpt(maskedText)}`)
+        throw new ModelError(`model HTTP ${status}: ${excerpt(maskedText)}`, { kind: 'http', status })
       }
       let json: { error?: unknown; choices?: unknown; usage?: unknown; model?: unknown; system_fingerprint?: unknown; provider?: unknown }
       try {
         json = JSON.parse(text)
       } catch {
-        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(maskedText)}`)
+        throw new ModelError(`model HTTP ${status}: invalid JSON: ${excerpt(maskedText)}`, { kind: 'invalid', status })
       }
       if (json === null || typeof json !== 'object') {
-        throw new ModelError(`model HTTP ${status}: unexpected body: ${excerpt(maskedText)}`)
+        throw new ModelError(`model HTTP ${status}: unexpected body: ${excerpt(maskedText)}`, { kind: 'invalid', status })
       }
       if (json.error) {
-        throw new ModelError(`model HTTP ${status}: error body: ${excerpt(maskedText)}`)
+        // Only a number counts as the code: anything else would be text of the response, and the detail holds none.
+        const bodyCode = (json.error as { code?: unknown }).code
+        throw new ModelError(`model HTTP ${status}: error body: ${excerpt(maskedText)}`, {
+          kind: 'error_body',
+          status,
+          ...(typeof bodyCode === 'number' ? { bodyCode } : {}),
+        })
       }
       const choice = Array.isArray(json.choices) ? json.choices[0] : undefined
       if (!choice || typeof choice !== 'object') {
-        throw new ModelError(`model HTTP ${status}: no choices: ${excerpt(maskedText)}`)
+        throw new ModelError(`model HTTP ${status}: no choices: ${excerpt(maskedText)}`, { kind: 'invalid', status })
       }
       const message = (choice as { message?: { content?: unknown; tool_calls?: unknown; reasoning?: unknown; reasoning_content?: unknown } }).message ?? {}
       const finish = (choice as { finish_reason?: unknown }).finish_reason
