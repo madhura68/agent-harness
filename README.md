@@ -107,3 +107,9 @@ Ontwerp en plan: [docs/specs/2026-09-30-model-comparison-refiner-design.md](docs
 Volgt op M5. Test of qwen3.8-27b lokaal op hogere precisie (Q8, Q4) kan evenaaren wat gehost kan met docs, ter ondersteuning van een Mac-koopbesluit. Draait de docs-variant van de M5-bank op max2 tegen Ollama, vergelijkt de uitkomst met gsq (3-bit lokaal) en gehost (M5), en geeft het oordeel: door (kandidaat Q4 op Mac, of Q8 met 48 GB), gezakt (kies Q8 met ~48 GB), of onbeslist (extra seeds nodig of geen lokale route aangetoond).
 
 Ontwerp en plan: [docs/specs/2026-10-01-local-precision-refiner-design.md](docs/specs/2026-10-01-local-precision-refiner-design.md), [docs/plans/M6-local-precision-refiner.md](docs/plans/M6-local-precision-refiner.md).
+
+## Task-bench (M7)
+
+Volgt op M5 en M6. Test of Qwen 3.8 (`qwen/qwen3.8-27b` op 16-bit via OpenRouter, naast `gsq-lokaal` op max2) echt werk aankan, ter ondersteuning van een aankoopbesluit voor een 96 GB-machine. Het geplande subcommando `harness task-bench` voert 12 oude, afgeronde Scrum4Me-taken uit zoals de productieworker en toetst de uitkomst met de verborgen tests van de echte oplossing. Status: spec en plan zijn reviewed; de implementatie is nog niet gebouwd.
+
+Ontwerp en plan: [docs/specs/2026-10-02-task-bench-design.md](docs/specs/2026-10-02-task-bench-design.md), [docs/plans/M7-task-bench.md](docs/plans/M7-task-bench.md).
