@@ -110,6 +110,6 @@ Ontwerp en plan: [docs/specs/2026-10-01-local-precision-refiner-design.md](docs/
 
 ## Task-bench (M7)
 
-Volgt op M5 en M6. Test of Qwen 3.8 (`qwen/qwen3.8-27b` op 16-bit via OpenRouter, naast `gsq-lokaal` op max2) echt werk aankan, ter ondersteuning van een aankoopbesluit voor een 96 GB-machine. Het geplande subcommando `harness task-bench` voert 12 oude, afgeronde Scrum4Me-taken uit zoals de productieworker en toetst de uitkomst met de verborgen tests van de echte oplossing. Status: spec en plan zijn reviewed; de implementatie is nog niet gebouwd.
+Volgt op M5 en M6. Test of Qwen 3.8 (`qwen/qwen3.8-27b` op 16-bit via OpenRouter, naast `gsq-lokaal` op max2) echt werk aankan, ter ondersteuning van een aankoopbesluit voor een 96 GB-machine. Het subcommando `harness task-bench` voert 12 oude, afgeronde Scrum4Me-taken uit zoals de productieworker en toetst de uitkomst met de verborgen tests van de echte oplossing. Met `harness task-bench --check-case` bewijs je per case dat de verborgen toets op `base_commit` faalt en op `ref_commit` slaagt. Status: increment 1 (Taak 1–5, het subcommando en `--check-case`) is gebouwd en gemerged (PR #31); de build en de runs op max2 volgen apart.
 
 Ontwerp en plan: [docs/specs/2026-10-02-task-bench-design.md](docs/specs/2026-10-02-task-bench-design.md), [docs/plans/M7-task-bench.md](docs/plans/M7-task-bench.md).
