@@ -80,6 +80,32 @@ Het image heeft één architectuur (linux/amd64). Op een arm64-Mac draait het ge
 - **Herkenbare upstreamfout.** De excerpt van een OpenRouter-fout luidt `litellm.AuthenticationError: AuthenticationError: OpenrouterException - {…}. Received Model Group=…`. Een fout van OpenRouter is dus te onderscheiden van een fout van LiteLLM zelf, zoals de `RouterRateLimitError` hierboven. Dat is nodig voor de negatieve controle (plan §6 punt 2).
 - **Kosten op een fout.** Bij een fout geeft LiteLLM `x-litellm-response-cost: 0`. `meet.mjs` maakt daar bron `none` van.
 - **Logs.** De nepsleutels stonden niet in de uitvoer en niet in `docker logs` (grep exit 1). De drie kanaries stonden ook niet in de logs (exit 1, op het foutpad). `meting.json` bevatte geen velden `messages` of `content`.
+- **Generale repetitie (zelfde avond).** `manifesten`, daarna `harness probe` en `harness run` (`run-qwen3.8-or.json`, `--api-key-env LITELLM_MASTER_KEY`) via de proxy op `127.0.0.1:4001` naar LiteLLM. De keten werkte tot OpenRouter (401 op de nepsleutel). De proxy logde vijf regels (vier van de probe, één van de run) met `bron: none`. De mappen heetten `runs/probe-qwen3.8-or` en `runs/m45-qwen3-8-or`. De nepsleutels stonden niet in de proefmap en niet in `docker logs` (grep exit 1), en de proxy stopte op SIGTERM met exit 0.
+
+## Aanroepen van `meet.mjs` (proxy, manifesten, opzoeken)
+
+`meet` staat hierboven. De drie andere modi gebruiken alleen Node-built-ins, lopen vanuit de clone en overschrijven of verwijderen nooit een bestand: bestaat een uitvoerbestand al, dan is dat exit 2 (kies een nieuwe naam). Exit 0: elke aanvraag kreeg een HTTP-antwoord (ook 4xx en 5xx); 1: een aanvraag kreeg geen antwoord; 2: een sleutel, optie of modus ontbreekt of deugt niet.
+
+```bash
+# opnameproxy tussen de harness (baseUrl http://127.0.0.1:4001/v1) en LiteLLM; draait tot SIGTERM of SIGINT
+node meet.mjs proxy --listen 127.0.0.1:4001 --upstream http://127.0.0.1:4000 --log <map>/antwoorden.jsonl
+
+# de runmanifesten van beide configuraties en de probe-velden van de lokale; <W> is de gebouwde checkout (dist/ bestaat)
+node meet.mjs manifesten --uit <map> --repo <W>
+
+# aanbieder en kosten van de hosted antwoorden bij OpenRouter (omgeving: OPENROUTER_API_KEY)
+node meet.mjs opzoeken --in <map>/meting.json --in <map>/antwoorden.jsonl --out <map>/opzoeking.json
+```
+
+- **`proxy`** luistert alleen op `127.0.0.1`, stuurt elke aanvraag door en geeft het antwoord ongewijzigd terug; alleen `accept-encoding: identity` is anders. Start hem in de achtergrond (`setsid nohup node meet.mjs proxy … > proxy.out 2>&1 &`) en stop hem met `kill -TERM <pid>`; SIGHUP stopt hem niet, een request dat nog loopt krijgt 2 s. Per `POST …/chat/completions` komt één JSON-regel in het log, zonder aanvraagheaders en zonder inhoud: `tijd`, `model`, `http_status`, de twee kostenheaders, `body_usage_cost`, `provider`, `id`, `bedrag` en `bron` (`provider_reported`, `litellm_computed` of `none`), `finish_reason`, `reasoning_tokens` en `toolcalls`. Een gecomprimeerde body wordt niet gelezen: `bron: niet_leesbaar`, geen bedrag. Geeft LiteLLM geen antwoord, dan krijgt de client een 502 en komt er een regel met `http_status: null` en `fout` (een foutcode, `timeout`, of `client_verbroken` als de client wegging).
+- **`manifesten`** leest `gsq-lokaal.json` en `run-extra-or.json` uit `<map>` en schrijft `run-gsq-lokaal.json`, `run-qwen3.8-or.json` en `probe-extra-gsq.json` ernaast. Beide manifesten zijn de docs-run van M5 (`model-comparison.md`, "Eerste run met docs") via de proxy, met id `m45-gsq-lokaal` en `m45-qwen3-8-or` (het schema staat geen punt toe), zonder `apiKey` (die komt via `--api-key-env`) en zonder `provider`-blok (dat zet LiteLLM). `probe-extra-gsq.json` is voor `harness probe --extra-body-file`: het `extraBody` van de lokale configuratie plus `reasoning_effort`.
+- **`opzoeken`** zoekt elk `qwen3.8-or`-antwoord met een `gen-`-id op (minstens 10 s na het antwoord) en haalt één keer de endpointlijst van `qwen/qwen3.8-27b` op. Het oordeel per antwoord is een BF16-consistentiecontrole tegen die lijst, geen gemeten precisie per antwoord: `bf16 volgens endpointlijst`, `precisie niet eenduidig aangetoond`, `niet in BF16-lijst`, of `niet gemeten …` als een opzoeking of de lijst mislukte. Een antwoord zonder `gen-`-id krijgt `aanbieder niet gemeten via OpenRouter`.
+
+`gsq-lokaal.json` zijn de modelinstellingen van de productieworker, geschreven in het venster. Alle drie de sleutels moeten er staan; `reasoningEffort` en `extraBody` zijn `null` als de worker ze niet heeft, en `extraBody` mag geen `provider` bevatten. `name` (de Ollama-modelnaam) wordt gelezen maar niet in een manifest gezet: daar staat de configuratienaam `gsq-lokaal`.
+
+```json
+{ "name": "qwen3.8-gsq-rco:27b-iq3_s-text", "reasoningEffort": "none", "extraBody": { "top_p": 0.95 } }
+```
 
 ## Proef increment 1
 
