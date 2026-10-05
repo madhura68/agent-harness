@@ -14,10 +14,10 @@ import { connectStdioClient, connectStdioRegistry, createRegistryView } from './
 import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
 import { checkRunLogs } from './worker/check-run-logs.js'
-import { loadWorkerConfig, TaskConfigSchema, workerMcpEnv } from './worker/config.js'
+import { loadWorkerConfig, TaskConfigSchema, workerMcpEnv, type WorkerConfig } from './worker/config.js'
 import { createControlChannel } from './worker/control.js'
 import { capDocArgs } from './worker/doc-tools.js'
-import { collectSecretValues, workerSecretSources } from './worker/redact.js'
+import { collectSecretEntries, collectSecretValues, workerSecretSources } from './worker/redact.js'
 import { openRunLog } from './worker/run-log.js'
 import { runWorker } from './worker/worker.js'
 
@@ -26,7 +26,7 @@ const USAGE = `harness — agent-harness v0
 Usage:
   harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>] [--extra-body-file <json>]
   harness run <manifest.json> --out <dir> [--skip-probe] [--api-key-env <VAR>]
-  harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe]
+  harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe] [--api-key-env <VAR>]
   harness check-run-logs --config <worker.json> --dir <run-logs-dir>
   harness doc-server --dir <docset-dir> --product-id <id>
   harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]
@@ -61,7 +61,7 @@ export const cliArgsConfig = {
 
 type Values = ReturnType<typeof parseArgs<typeof cliArgsConfig>>['values']
 
-class UsageError extends Error {}
+export class UsageError extends Error {}
 
 function readApiKey(varName: string | undefined): string | undefined {
   if (!varName) return undefined
@@ -200,11 +200,43 @@ function harnessVersion(): string {
   return `agent-harness@${typeof pkg.version === 'string' ? pkg.version : '0'}`
 }
 
+/**
+ * The model block that `harness worker` gives its model client. Without --api-key-env that is the block as loaded. With it, the
+ * key is the value of that variable and beats a model.apiKey in the config, as in `harness run`. The block passed in stays as it
+ * is, so the key reaches the client and nothing else.
+ *
+ * The worker masks secrets in a run-log by what process.env holds (workerSecretSources): the value of a variable with a
+ * secret-like name, from 8 characters up. `harness check-run-logs` picks its secrets the same way and counts a shorter one as a
+ * hit. A key under another name would stand unmasked and unchecked wherever the model or a tool repeats it, and a shorter one
+ * unmasked, so both are refused. The checks call the redaction's own functions, because a copy of its name pattern or its
+ * minimum length could drift away from it.
+ */
+export function resolveWorkerModel(model: WorkerConfig['model'], apiKeyEnv: string | undefined, env: Record<string, string | undefined>): WorkerConfig['model'] {
+  if (apiKeyEnv === undefined) return model
+  // An empty name (a shell variable that expanded to nothing) is no reason to run without a key.
+  if (apiKeyEnv === '') throw new UsageError('--api-key-env needs the name of an environment variable')
+  const apiKey = env[apiKeyEnv]
+  if (!apiKey) throw new UsageError(`--api-key-env: environment variable ${apiKeyEnv} is not set or empty`)
+  // The entry must carry the variable's own name: a value that is a URL also yields one for its password, named `<NAME> (url-wachtwoord)`.
+  if (!collectSecretEntries({ [apiKeyEnv]: apiKey }).some((entry) => entry.name === apiKeyEnv)) {
+    throw new UsageError(
+      `--api-key-env: ${apiKeyEnv} does not look like a secret name, so the worker's redaction would not mask its value in a run-log; use a name such as MODEL_API_KEY`,
+    )
+  }
+  if (!collectSecretValues({ [apiKeyEnv]: apiKey }).includes(apiKey)) {
+    throw new UsageError(`--api-key-env: the value of ${apiKeyEnv} is shorter than 8 characters, which the worker's redaction does not mask`)
+  }
+  return { ...model, apiKey }
+}
+
 async function cmdWorker(values: Values): Promise<number> {
   if (!values.config) throw new UsageError('worker needs --config')
   rejectExtraBodyFile(values, 'worker')
   const out = values.out ?? 'runs'
   const config = loadWorkerConfig(values.config)
+  // Read before the probe gate and before anything starts, like harness run, so a bad --api-key-env fails with no MCP process.
+  // Only the model client gets the key: `config` keeps the model block as loaded, so the run-log, the manifest and the trace never carry it.
+  const clientModel = resolveWorkerModel(config.model, values['api-key-env'], process.env)
   if (values['skip-probe'] !== true && !passesProbeGate(config.model, out)) return 1
   // Expand ${VAR} before anything starts; the values only travel to the MCP child process.
   const env = workerMcpEnv(config)
@@ -230,7 +262,7 @@ async function cmdWorker(values: Values): Promise<number> {
     const { exitCode, jobs } = await runWorker({
       control: createControlChannel(client),
       registryView: async (signal) => capDocArgs(await createRegistryView(client, config.allow, signal)),
-      modelClient: createModelClient(config.model),
+      modelClient: createModelClient(clientModel),
       config,
       out,
       once: values.once === true,

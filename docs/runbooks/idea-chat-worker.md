@@ -1,7 +1,7 @@
 ---
 title: "IDEA_CHAT-worker op Ollama (max2): recept en praktijkbewijs"
 status: active
-last_updated: 2026-09-27
+last_updated: 2026-10-05
 ---
 
 # IDEA_CHAT-worker op Ollama (max2)
@@ -108,6 +108,26 @@ Opmerkingen bij de uitrol:
 - **Marge criterium 1.** De grens van 300 s is gelijk aan de timerperiode, en T0 viel 8 s na de tick van 17:35. Dat is vrijwel het slechtste geval: de marge is dan alleen de ingestduur (±4 s).
 - **Smoke-stap.** `smoke_ops_dashboard` gaf exit 56: curl kreeg 0,02 s na de recreate een connection reset, en `--retry-connrefused` herhaalt dat niet. De flow eindigt toch met exit 0, en de app draaide (root 307, database ready).
 - **`/api/health` op max2.** Die geeft 503: de check eist ook een ops-agent op dezelfde commit en een mac-heartbeat, en deze flow werkt de ops-agent niet bij.
+
+## Model-sleutel via `--api-key-env`
+
+Staat het model achter een gateway die een sleutel vraagt (zoals LiteLLM met een master key), dan krijgt `harness worker` de **naam** van de omgevingsvariabele met die sleutel. De waarde komt nooit in argv of config:
+
+```bash
+# LITELLM_MASTER_KEY staat al in de omgeving van de shell, niet op deze regel
+npm run dev -- worker --config <worker.json> --out runs --api-key-env LITELLM_MASTER_KEY
+```
+
+**Gedrag.** De waarde gaat mee als `Authorization: Bearer …`. Ze wint van een `model.apiKey` in de config, zoals bij `harness run`, en gaat alleen naar de model-client: de config die het run-log, het manifest en de trace zien, blijft zoals hij geladen is. Zonder de optie verandert er niets.
+
+**Wat de worker weigert.** De optie wordt gelezen direct na het laden van de config, vóór de probe-gate en vóór het MCP-kindproces. Een gebruiksfout volgt (exit 1, de naam van de variabele in de melding, nooit de waarde) als:
+- de variabele niet gezet of leeg is;
+- de naam niet als geheim telt, bijvoorbeeld `LITELLM` (`LITELLM_MASTER_KEY` en `MODEL_API_KEY` wel): dezelfde namen als onder *Controle op geheimen* hierboven;
+- de waarde korter is dan 8 tekens.
+
+**Waarom die twee laatste regels.** De worker maskeert in een run-log de waarden die `process.env` onder een geheimachtige naam bevat, vanaf 8 tekens; `harness check-run-logs` kiest dezelfde geheimen. Staat de sleutel onder een andere naam, dan wordt hij niet gemaskeerd en ook niet gecontroleerd, dus een herhaling door het model of een tool komt ongemerkt in een run-log. Is hij korter, dan wordt hij niet gemaskeerd en geeft `check-run-logs` een treffer (`kort=true`). De controle roept daarom de functies van die redactie zelf aan en bewaart geen eigen patroon of minimumlengte.
+
+**Stand.** Alleen met unittests gedekt (M45, increment 1); een live proef tegen LiteLLM ontbreekt nog.
 
 ## Lokaal draaien (Mac, ontwikkeling)
 
