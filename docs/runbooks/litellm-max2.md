@@ -15,7 +15,7 @@ LiteLLM zet de harness voor één aanroepvorm (`POST /v1/chat/completions`) voor
 | Bestand | Rol |
 |---|---|
 | `deploy/max2/litellm/compose.yml` | Project en container `litellm`, image vastgepind op digest (v1.83.3-stable, dezelfde als Scrum4Us), poort alleen `127.0.0.1:4000`, netwerk `litellm` (bridge `br-litellm`, `172.30.82.0/24`, gateway `172.30.82.1`, niet internal want OpenRouter vraagt egress), `restart: "no"`, `mem_limit 2g`, `pids_limit 512`, `no-new-privileges`, healthcheck op `/health/liveliness` |
-| `deploy/max2/litellm/config.yaml` | De drie configuraties hieronder; `turn_off_message_logging: true`; master key uit de omgeving; geen database, geen callbacks |
+| `deploy/max2/litellm/config.yaml` | De drie configuraties hieronder; `turn_off_message_logging: true`; `router_settings.disable_cooldowns: true` (zie de droge proef); master key uit de omgeving; geen database, geen callbacks |
 | `deploy/max2/litellm/litellm-ollama-bridge.service` | socat op `172.30.82.1:11434` naar de Ollama van de host (`127.0.0.1:11434`), een kopie van `dsh-ollama-bridge.service`. In increment 1 alleen **gestart**, nooit `enable`d |
 | `deploy/max2/litellm/meet.mjs` | Het meetscript van de proef (modi `meet`, `proxy`, `manifesten`, `opzoeken`) |
 
@@ -71,6 +71,15 @@ Op de Mac met Docker Desktop en een tijdelijk envbestand met nepsleutels:
 Het image heeft één architectuur (linux/amd64). Op een arm64-Mac draait het geëmuleerd, met een platformwaarschuwing.
 
 **Uitslag 2026-10-05 (Mac, Docker Desktop 29.8.2, arm64):** readiness na ongeveer 20 s HTTP 200 (`status` healthy, `db` "Not connected", `litellm_version` 1.83.3). `/v1/models` gaf `gsq-lokaal`, `qwen3.8-or` en `qwen3.8-or-neg`, en zonder sleutel 401. De poort stond alleen op `127.0.0.1:4000`, de container werd healthy, en het netwerk was `br-litellm` met `172.30.82.0/24`, gateway `.1`, niet internal. Compose weigerde `config` en `down` zonder `LITELLM_ENV_FILE`. De nepsleutels stonden niet in `docker logs` (grep exit 1). Na `down` waren er geen container en geen netwerk `litellm` meer.
+
+## Droge proef van `meet.mjs` met nepsleutels (Mac, 2026-10-05)
+
+`node deploy/max2/litellm/meet.mjs meet --base-url http://127.0.0.1:4000 --out <map>` tegen de lokale container, met nepsleutels. Ollama is op de Mac niet bereikbaar en OpenRouter weigert de nepsleutel, dus dit toetst alleen de foutpaden.
+
+- **Cooldown van de router.** Zonder instelling gaf de eerste OpenRouter-fout (401) het model 5 s cooldown. De vier volgende denkvormen kregen een 429 van LiteLLM zelf: `RouterRateLimitError: No deployments available for selected model, Try again in 5 seconds`. In het venster zou de negatieve controle daardoor bij voorbaat "niet beslist" zijn: de tweede en derde variant falen dan bij LiteLLM in plaats van bij OpenRouter. Met één deployment per model en zonder fallbacks voegt cooldown niets toe, dus `config.yaml` zet `router_settings.disable_cooldowns: true` (LiteLLM-docs v1.83.3, `routing.md`; standaard `allowed_fails: 3`, `cooldown_time: 5s`). Daarna: denkvormen 401 401 401 401 401, `negative` kaal 401, canary 500/401/401, en geen 429 meer.
+- **Herkenbare upstreamfout.** De excerpt van een OpenRouter-fout luidt `litellm.AuthenticationError: AuthenticationError: OpenrouterException - {…}. Received Model Group=…`. Een fout van OpenRouter is dus te onderscheiden van een fout van LiteLLM zelf, zoals de `RouterRateLimitError` hierboven. Dat is nodig voor de negatieve controle (plan §6 punt 2).
+- **Kosten op een fout.** Bij een fout geeft LiteLLM `x-litellm-response-cost: 0`. `meet.mjs` maakt daar bron `none` van.
+- **Logs.** De nepsleutels stonden niet in de uitvoer en niet in `docker logs` (grep exit 1). De drie kanaries stonden ook niet in de logs (exit 1, op het foutpad). `meting.json` bevatte geen velden `messages` of `content`.
 
 ## Proef increment 1
 

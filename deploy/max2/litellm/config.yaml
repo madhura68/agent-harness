@@ -36,5 +36,11 @@ model_list:
 litellm_settings:
   turn_off_message_logging: true
 
+router_settings:
+  # One deployment per model and no fallbacks, so a cooldown has nothing to route around: after an upstream error it would
+  # only answer the next requests for 5 s with LiteLLM's own 429 ("No deployments available"). That hides real upstream
+  # answers from the measurement (the negative control fails upstream on purpose) and from the harness. Seen on 1.83.3.
+  disable_cooldowns: true
+
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
