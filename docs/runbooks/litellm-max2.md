@@ -1,0 +1,77 @@
+---
+title: "LiteLLM op max2 (M45): bestanden, venster en rooktest"
+status: active
+last_updated: 2026-10-05
+---
+
+# LiteLLM op max2 (M45)
+
+LiteLLM zet de harness voor één aanroepvorm (`POST /v1/chat/completions`) voor een lokale en een gehoste configuratie. In M45 increment 1 is het een **praktijkproef**: LiteLLM draait alleen tijdens een venster op max2, en Scrum4Me verandert niet. De spec en het plan staan in Scrum4Me:
+- `docs/superpowers/specs/2026-10-05-harness-runtime-design.md` (de spec);
+- `docs/plans/M45-harness-runtime-litellm.md` (het plan). De volledige vensterprocedure staat in Taak 3 van dat plan.
+
+## Bestanden
+
+| Bestand | Rol |
+|---|---|
+| `deploy/max2/litellm/compose.yml` | Project en container `litellm`, image vastgepind op digest (v1.83.3-stable, dezelfde als Scrum4Us), poort alleen `127.0.0.1:4000`, netwerk `litellm` (bridge `br-litellm`, `172.30.82.0/24`, gateway `172.30.82.1`, niet internal want OpenRouter vraagt egress), `restart: "no"`, `mem_limit 2g`, `pids_limit 512`, `no-new-privileges`, healthcheck op `/health/liveliness` |
+| `deploy/max2/litellm/config.yaml` | De drie configuraties hieronder; `turn_off_message_logging: true`; master key uit de omgeving; geen database, geen callbacks |
+| `deploy/max2/litellm/litellm-ollama-bridge.service` | socat op `172.30.82.1:11434` naar de Ollama van de host (`127.0.0.1:11434`), een kopie van `dsh-ollama-bridge.service`. In increment 1 alleen **gestart**, nooit `enable`d |
+| `deploy/max2/litellm/meet.mjs` | Het meetscript van de proef (modi `meet`, `proxy`, `manifesten`, `opzoeken`) |
+
+| Configuratie | Route | Bijzonderheden |
+|---|---|---|
+| `gsq-lokaal` | `openai/qwen3.8-gsq-rco:27b-iq3_s-text` via de brug | `api_key: "none"`, `timeout: 600` |
+| `qwen3.8-or` | `openrouter/qwen/qwen3.8-27b` | `extra_body.provider`: `quantizations: ["bf16"]`, `data_collection: "deny"`, `require_parameters: true`, `allow_fallbacks: false` |
+| `qwen3.8-or-neg` | als `qwen3.8-or` | alleen increment 1: `provider: {only: ["bestaat-niet"], allow_fallbacks: false}`. Komt het provider-blok aan, dan faalt elke aanvraag bij OpenRouter (de negatieve controle) |
+
+De container heet `litellm` en nooit iets met het naamvoorvoegsel van de harness-containers: een worker met task-config ruimt zulke containers op bij zijn start.
+
+## Geheimen
+
+`OPENROUTER_API_KEY` en `LITELLM_MASTER_KEY` staan op max2 alleen in `/run/user/1000/m45.env` (tmpfs, modus 0600, via stdin geschreven; zie Taak 3 stap 3 van het plan). Ze komen nooit in argv, logs, traces, resultaten of deze repo. `config.yaml` verwijst er alleen naar met `os.environ/…`.
+
+Elke compose-aanroep heeft `LITELLM_ENV_FILE` nodig, **ook `down`**: zonder variabele weigert compose (`required variable LITELLM_ENV_FILE is missing a value`). In het venster zet `$R/venster.sh` hem.
+
+## Starten en stoppen (in het venster, met `venster.sh` geladen)
+
+Starten:
+
+```bash
+docker compose -f $W/deploy/max2/litellm/compose.yml up -d     # maakt ook netwerk litellm
+sudo -n cp $W/deploy/max2/litellm/litellm-ollama-bridge.service /etc/systemd/system/
+sudo -n systemctl daemon-reload
+sudo -n systemctl start litellm-ollama-bridge                  # start, geen enable
+docker inspect litellm --format '{{.State.Health.Status}}'     # wacht op healthy
+ss -ltnp '( sport = :4000 )'                                   # alleen 127.0.0.1:4000
+```
+
+Stoppen, in deze volgorde (de brug eerst, zodat socat niet blijft hangen):
+
+```bash
+sudo -n systemctl stop litellm-ollama-bridge
+docker compose -f $W/deploy/max2/litellm/compose.yml down \
+  || { docker rm -f litellm; docker network rm litellm; }
+docker ps -aq --filter 'name=^litellm$'                         # leeg
+docker network ls -q --filter 'name=^litellm$'                  # leeg
+systemctl is-active litellm-ollama-bridge                       # exit 3, inactive
+```
+
+Na het venster blijven het image en het unitbestand staan (gestopt, niet geactiveerd). JP beslist daarover voor increment 2.
+
+## Rooktest (lokaal, vóór het venster)
+
+Op de Mac met Docker Desktop en een tijdelijk envbestand met nepsleutels:
+
+1. `LITELLM_ENV_FILE=<tijdelijk> docker compose -f deploy/max2/litellm/compose.yml up -d`.
+2. `curl -s http://127.0.0.1:4000/health/readiness` geeft `litellm_version` 1.83.3 en `db` "Not connected".
+3. `/v1/models`, met de nep-master key via `curl --config`, toont de drie namen.
+4. `LITELLM_ENV_FILE=<tijdelijk> docker compose -f deploy/max2/litellm/compose.yml down`, en ruim het tijdelijke bestand op.
+
+Het image heeft één architectuur (linux/amd64). Op een arm64-Mac draait het geëmuleerd, met een platformwaarschuwing.
+
+**Uitslag 2026-10-05 (Mac, Docker Desktop 29.8.2, arm64):** readiness na ongeveer 20 s HTTP 200 (`status` healthy, `db` "Not connected", `litellm_version` 1.83.3). `/v1/models` gaf `gsq-lokaal`, `qwen3.8-or` en `qwen3.8-or-neg`, en zonder sleutel 401. De poort stond alleen op `127.0.0.1:4000`, de container werd healthy, en het netwerk was `br-litellm` met `172.30.82.0/24`, gateway `.1`, niet internal. Compose weigerde `config` en `down` zonder `LITELLM_ENV_FILE`. De nepsleutels stonden niet in `docker logs` (grep exit 1). Na `down` waren er geen container en geen netwerk `litellm` meer.
+
+## Proef increment 1
+
+Volgt na het venster (plan Taak 4): het verslag met de go/no-go.
