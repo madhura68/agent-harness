@@ -1,0 +1,46 @@
+# LiteLLM config for the M45 trial on max2 (increment 1). Keys only as os.environ/...: the values come from
+# the compose env file (LITELLM_ENV_FILE), never from this repo. No database, no callbacks.
+model_list:
+  # Local: max2's Ollama, reached through litellm-ollama-bridge.service on the litellm network's gateway.
+  - model_name: gsq-lokaal
+    litellm_params:
+      model: openai/qwen3.8-gsq-rco:27b-iq3_s-text
+      api_base: http://172.30.82.1:11434/v1
+      api_key: "none"
+      timeout: 600
+  # Hosted: OpenRouter at BF16, no data collection, no silent fallback. extra_body is merged into every request
+  # of this deployment; the trial measures whether the provider block actually reaches OpenRouter.
+  - model_name: qwen3.8-or
+    litellm_params:
+      model: openrouter/qwen/qwen3.8-27b
+      api_key: os.environ/OPENROUTER_API_KEY
+      timeout: 600
+      extra_body:
+        provider:
+          quantizations: ["bf16"]
+          data_collection: "deny"
+          require_parameters: true
+          allow_fallbacks: false
+  # Increment 1 only: the negative control. If the provider block arrives, OpenRouter finds no provider and
+  # every request must fail upstream.
+  - model_name: qwen3.8-or-neg
+    litellm_params:
+      model: openrouter/qwen/qwen3.8-27b
+      api_key: os.environ/OPENROUTER_API_KEY
+      timeout: 600
+      extra_body:
+        provider:
+          only: ["bestaat-niet"]
+          allow_fallbacks: false
+
+litellm_settings:
+  turn_off_message_logging: true
+
+router_settings:
+  # One deployment per model and no fallbacks, so a cooldown has nothing to route around: after an upstream error it would
+  # only answer the next requests for 5 s with LiteLLM's own 429 ("No deployments available"). That hides real upstream
+  # answers from the measurement (the negative control fails upstream on purpose) and from the harness. Seen on 1.83.3.
+  disable_cooldowns: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

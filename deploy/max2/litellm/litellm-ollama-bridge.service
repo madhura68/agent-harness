@@ -1,0 +1,17 @@
+# /etc/systemd/system/litellm-ollama-bridge.service: a copy of max2's dsh-ollama-bridge.service for the litellm
+# network. M45 increment 1 only starts it during the trial window; it is never enabled.
+[Unit]
+Description=litellm container -> Ollama bridge (172.30.82.1:11434 -> 127.0.0.1:11434)
+After=docker.service ollama.service
+Requires=docker.service
+
+[Service]
+# The gateway address only exists once the litellm network does.
+ExecStartPre=/bin/sh -c 'until ip -4 addr show br-litellm 2>/dev/null | grep -q 172.30.82.1; do sleep 2; done'
+ExecStart=/usr/bin/socat TCP-LISTEN:11434,bind=172.30.82.1,fork,reuseaddr TCP:127.0.0.1:11434
+Restart=always
+RestartSec=5
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
