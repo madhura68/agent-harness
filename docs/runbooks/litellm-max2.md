@@ -107,6 +107,90 @@ node meet.mjs opzoeken --in <map>/meting.json --in <map>/antwoorden.jsonl --out 
 { "name": "qwen3.8-gsq-rco:27b-iq3_s-text", "reasoningEffort": "none", "extraBody": { "top_p": 0.95 } }
 ```
 
-## Proef increment 1
+## Proef increment 1 (2026-10-06)
 
-Volgt na het venster (plan Taak 4): het verslag met de go/no-go.
+Venster op max2 op JP's go, 08:12–08:36 (CEST), op `C` = `37185fc` (de merge van PR #34). De werkmap op max2 is `~/m45-runs/proef-2026-10-06`, de kopie op de Mac `~/Development/m45-runs/proef-2026-10-06`. De ruwe bestanden staan alleen daar, niet in deze repo. `proef.log` eindigt op `exit=0`, dus dit is een geldige proefmap. LiteLLM gaf `litellm_version` 1.83.3 en `db` "Not connected".
+
+### Uitslag per configuratie
+
+| | `gsq-lokaal` (Ollama via de brug) | `qwen3.8-or` (OpenRouter, BF16) |
+|---|---|---|
+| Probe | `reliable`: 4/4 PASS (`a_plain`, `b_single_tool`, `c_two_tools`, `d_nonexistent_tool`) | `reliable`: `b`, `c` en `d` PASS. `a_plain` FAIL door de deadline van 120 s (de proxy logde `client_verbroken`), zie ontwerpinput 6. Met de uit-vorm (`reasoning_effort: "none"`) als `--extra-body-file` |
+| Run (M5-docs-run) | `completed`: 3 beurten, 2 toolcalls, 0 toolfouten, 12,6 s, tokens 4122/405 | `completed`: 3 beurten, 2 toolcalls, 0 toolfouten, 54,2 s, tokens 4993/322, `costUsd` 0,0013527 |
+| Antwoord | "5 stappen", met de laatste stap letterlijk (bron `specs/probe-design`) | idem |
+
+### Kosten per gehost antwoord
+
+Alle 13 HTTP-200-antwoorden van `qwen3.8-or` hebben een bedrag uit `provider_reported`: 6 in `meting.json` (vijf denkvormen en de kanarie) en 7 in `antwoorden.jsonl` (de probe en de run). Het bedrag stond telkens zowel in body-`usage.cost` als in beide kostenheaders, met dezelfde waarde.
+
+`opzoeken` vond alle 13 bij OpenRouter terug: `total_cost` was gelijk aan het bedrag van LiteLLM, en `provider_name` was steeds DeepInfra. De endpointlijst van `qwen/qwen3.8-27b` (18 endpoints) noemt DeepInfra alleen met `bf16`, dus elk antwoord krijgt "bf16 volgens endpointlijst". Dat is een BF16-consistentiecontrole, geen gemeten precisie per antwoord. De andere 17 aanbieders staan erin met `fp8`, `fp4`, `fp16` of `unknown`.
+
+De bedragen lagen tussen $0,0000065 (de uit-vorm) en $0,00065 (de laatste runbeurt). Samen was dat $0,0022 (meting $0,00035, probe en run $0,00183).
+
+### Niet-200-antwoorden
+
+- De negatieve controle (3×) en de kale kanarie op `qwen3.8-or-neg` gaven HTTP 404, zie hieronder.
+- Eén proxyregel had `http_status: null` met `fout: client_verbroken`: dat was `a_plain` van de gehoste probe, afgebroken door de harness na 120 s. Dat is geen antwoord en valt buiten het kostencriterium.
+- Er waren geen andere fouten, geen 429 en geen `niet_leesbaar`.
+
+### Negatieve controle (providervoorkeuren)
+
+Alle drie de varianten op `qwen3.8-or-neg` (kaal, met de uit-vorm en met de aan-vorm) gaven HTTP 404 met een fout van OpenRouter zelf: `litellm.NotFoundError: NotFoundError: OpenrouterException - {"error":{"message":"No allowed providers are available for the selected model. …`. `qwen3.8-or` gaf steeds 200. Het `provider`-blok uit `litellm_params.extra_body` komt dus bij OpenRouter aan, ook als de aanvraag eigen denkvelden meestuurt.
+
+### Denkstand van `qwen3.8-or`
+
+| Vorm | HTTP | `finish_reason` | `reasoning_tokens` | denktekst | stand |
+|---|---|---|---|---|---|
+| 1 geen veld | 200 | stop | 19 | `reasoning_content`, 72 tekens | aan |
+| 2 `reasoning_effort: "none"` | 200 | stop | 0 | geen | **uit** (gekozen) |
+| 3 `reasoning: {effort: "none"}` | 200 | stop | 0 | geen | uit |
+| 4 `reasoning_effort: "medium"` | 200 | stop | 39 | `reasoning_content`, 151 tekens | **aan** (gekozen) |
+| 5 `reasoning: {effort: "medium"}` | 200 | stop | 37 | `reasoning_content`, 144 tekens | aan |
+
+Dit volgt de beslisregel uit het plan. Zonder veld denkt het model dus. De gehoste probe moet de uit-vorm meesturen, en dat deed hij.
+
+### `gsq-lokaal`: kosten
+
+Geen enkel antwoord van `gsq-lokaal` (de brugaanvraag en 8 proxyregels) had een kostenheader of body-`usage.cost`. LiteLLM berekent voor dit lokale model niets. `reasoning_tokens` ontbreekt. De productieworker heeft geen `reasoningEffort` en geen `extraBody` (`gsq-lokaal.json`), dus `probe-extra-gsq.json` is `{}`.
+
+### Controles
+
+| Controle | Uitkomst |
+|---|---|
+| Sleutelscan op de proefmap op max2 (`grep -rlF -f m45.pat`) | exit 1 (schoon) |
+| `docker logs litellm` naar een bestand | exit 0 (567 regels) |
+| Sleutelscan op die logs | exit 1 (schoon) |
+| Kanariescan op die logs (3 kanaries, `turn_off_message_logging: true`) | exit 1 (inhoud blijft uit de logs) |
+| Sleutelscan op de kopie op de Mac | exit 1 (schoon) |
+| Poorten | 4000 alleen op `127.0.0.1`; de proxy alleen op `127.0.0.1:4001` |
+| Na het venster | geen container en geen netwerk `litellm`; poort 4001 vrij; de brug `failed` (exit 3, dus gestopt); de geheime bestanden in `/run/user/1000` weg; de vasthouder dicht (`pgrep` exit 1, sessies terug van 4 naar 3) |
+
+### Dienststand en keystand
+
+- **M4-stop:** schoon (18 `local_llm`-rijen, geen claim, diff leeg).
+- **Dienststand vooraf:** worker `active`, containers `dsh` en `open-webui` (geen `tei-gpu`), 270 MiB GPU-geheugen, geen model geladen.
+- **Dienststand achteraf:** worker `active`, `dsh` en `open-webui`. De dienstregels zijn gelijk aan vooraf. Het model van de worker staat nog in het VRAM.
+- **Keystand (bench-sleutel, limiet $20):** vooraf $2,098526 verbruikt, achteraf $2,100713, gemeten 5 min na de laatste aanvraag. Het verschil is $0,002187, ruim onder de verwachte $0,05. Geregistreerd was $0,002180; het restje van ongeveer $0,000007 past bij de afgebroken `a_plain`-aanvraag (zie ontwerpinput 6).
+
+### Go/no-go (spec §7.1)
+
+| Voorwaarde | Uitkomst |
+|---|---|
+| Beide probes `reliable` | ja |
+| Beide runs `completed`, met ten minste één geslaagde toolcall | ja (2 en 2) |
+| Elk 200-antwoord van `qwen3.8-or` heeft een bedrag uit `provider_reported` of `litellm_computed` | ja (13/13 `provider_reported`) |
+
+**Technisch: GO.** Het besluit is aan JP.
+
+### Wat de proef beslist voor increment 2 (plan §6)
+
+1. **Kostenbron.** Body-`usage.cost` komt via LiteLLM door, met de waarde van OpenRouter (gelijk aan `total_cost`). De model-client blijft zoals hij is; een header lezen is niet nodig.
+2. **Providervoorkeuren.** Ze gaan via `litellm_params.extra_body`: `qwen3.8-or` gaf 200, en elke variant op `qwen3.8-or-neg` gaf een upstreamfout van OpenRouter. De `extraBody` van de harness is daarvoor niet nodig.
+3. **Denkstand.** Uit is `reasoning_effort: "none"`, aan is `reasoning_effort: "medium"`. Zonder veld denkt `qwen3.8-or`.
+4. **De brug** werkte als gestarte unit, zonder enable. Increment 2 maakt hem blijvend, onder ops-agent.
+5. **`qwen3.8-or-neg`** verdwijnt uit de config van increment 2.
+6. **Ook ontwerpinput:**
+   - **Cooldown.** `router_settings.disable_cooldowns: true` blijft nodig (zie "Droge proef").
+   - **Lokale kosten.** `gsq-lokaal` levert geen kosten, dus `costMode` voor lokale configuraties kan niet op LiteLLM leunen (spec §4.2 en §6.1).
+   - **Snelheid.** Gehoste aanvragen via de enige BF16-aanbieder (DeepInfra) duurden 14 tot ruim 110 s per stuk. `a_plain` haalde de standaarddeadline van 120 s van `harness probe` niet. Voor de gehoste probe in increment 2 is een ruimere `--step-timeout` het overwegen waard, of de bestaande herhaling. De gehoste run (54 s) was hier ruim vier keer zo traag als de lokale (12,6 s).
+   - **Afbreken stopt de rekening niet.** De afgebroken `a_plain`-aanvraag werd bij OpenRouter wel uitgevoerd en geboekt (ongeveer $0,000007 extra op de keystand), maar staat in geen enkele kostenregel. Een kostenplafond dat alleen geregistreerde antwoorden optelt, mist zulke aanvragen.
