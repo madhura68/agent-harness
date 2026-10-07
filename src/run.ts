@@ -1,15 +1,27 @@
 import { createHash } from 'node:crypto'
+import type { CostStop } from './cost.js'
 import type { Manifest } from './manifest.js'
 import { ModelError, type ModelClient } from './model-client.js'
 import { createPolicy, type Policy } from './tools/policy.js'
 import { RegistryError } from './tools/registry.js'
 import { redactManifest, type RunResult, type TraceWriter } from './trace.js'
-import type { ChatMessage, ErrorCode, RunStatus, ToolCall, ToolDef, ToolExecResult, ToolRegistry } from './types.js'
+import type { ChatMessage, CompleteResult, ErrorCode, RunStatus, ToolCall, ToolDef, ToolExecResult, ToolRegistry } from './types.js'
 
 export type AfterAnswerResult =
   | { kind: 'accept' } // run ends as completed with this answer
   | { kind: 'retry'; message: string } // added as a user message; the loop continues
   | { kind: 'fail'; code: 'VERIFY_FAILED'; message: string } // run ends as failed
+
+/**
+ * The cost ceiling of a run (M45-2d). The worker passes the guard of the job; a run without one (the CLI) has no ceiling. A stop is the
+ * terminal result of the run, `failed` with COST_LIMIT_EXCEEDED or COST_UNKNOWN; the amounts are the guard's own, exact ones.
+ */
+export type CostGuardHooks = {
+  /** Before a model call; the guard decides whether the total has reached the ceiling (the first call is never stopped). */
+  beforeRequest(): CostStop | undefined
+  /** With the whole model response, after its usage was processed: adds its cost, and stops on an unknown cost or, when the response asks for tools, a reached ceiling. */
+  afterResponse(res: CompleteResult): CostStop | undefined
+}
 
 export type RunDeps = {
   client: ModelClient
@@ -33,11 +45,26 @@ export type RunDeps = {
    * maxTurns/context/output budgets apply to it as normal. Task 11 wires the verify gate through this hook.
    */
   afterAnswer?: (answer: string, signal: AbortSignal) => Promise<AfterAnswerResult>
+  costGuard?: CostGuardHooks
+  /**
+   * Repeat a model call once when it fails with a storing: a network error, an error body in a 200, HTTP 429 or HTTP >= 500. Never after
+   * another failure, an abort or the deadline, and never a second time. The worker sets it for a hosted configuration only; a retry
+   * changes no total, so the check before it is the one at the top of the loop.
+   */
+  retryOnce?: boolean
 }
 
 type Terminal = { status: RunStatus; answer?: string; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex')
+
+/** A failure that a repeat can cure (spec §4): the provider or the network, not the request. */
+function isStoring(err: ModelError): boolean {
+  const d = err.detail
+  if (!d) return false
+  if (d.kind === 'network' || d.kind === 'error_body') return true
+  return d.kind === 'http' && d.status !== undefined && (d.status === 429 || d.status >= 500)
+}
 
 const ABORTED: Terminal = { status: 'failed', error: { code: 'HARNESS_ERROR', message: 'aborted' } }
 
@@ -219,6 +246,8 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
 
     for (;;) {
       if (aborted()) return ABORTED
+      const overCeiling = deps.costGuard?.beforeRequest()
+      if (overCeiling) return overCeiling
       if (turns + 1 > limits.maxTurns) return { status: 'budget_exceeded' }
       if (now() >= deadline) return { status: 'timed_out' }
       let maxTokens = limits.maxOutputTokens - outputTokens
@@ -242,13 +271,17 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       const signal = within(deadline - now())
       const charsAtRequest = charsOf(messages)
       let res
-      try {
-        res = await client.complete(messages, { signal, maxTokens, tools })
-      } catch (err) {
-        if (aborted()) return ABORTED
-        if (signal.aborted || now() >= deadline) return { status: 'timed_out' }
-        if (err instanceof ModelError) return { status: 'failed', error: { code: 'MODEL_ERROR', message: err.message } }
-        throw err
+      for (let attempt = 1; ; attempt++) {
+        try {
+          res = await client.complete(messages, { signal, maxTokens, tools })
+          break
+        } catch (err) {
+          if (aborted()) return ABORTED
+          if (signal.aborted || now() >= deadline) return { status: 'timed_out' }
+          if (!(err instanceof ModelError)) throw err
+          if (deps.retryOnce && attempt === 1 && isStoring(err)) continue
+          return { status: 'failed', error: { code: 'MODEL_ERROR', message: err.message } }
+        }
       }
       responses++
       if (res.model) reportedModel = res.model
@@ -270,6 +303,9 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         ...(res.systemFingerprint !== undefined ? { systemFingerprint: res.systemFingerprint } : {}),
         ...(res.provider !== undefined ? { provider: res.provider } : {}),
       })
+      // After the usage and before anything the response asks for: an unknown cost, or a reached ceiling with tools still to run, ends the run here.
+      const costStop = deps.costGuard?.afterResponse(res)
+      if (costStop) return costStop
 
       if (outputTokens > limits.maxOutputTokens) return { status: 'budget_exceeded' }
       if (res.message.toolCalls.length === 0) {

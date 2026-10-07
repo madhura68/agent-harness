@@ -7,7 +7,7 @@ import { createRegistryView } from '../src/tools/registry.js'
 import { createControlChannel } from '../src/worker/control.js'
 import { openRunLog } from '../src/worker/run-log.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
-import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
+import { completion, priced, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
 import { seedProbe, seedProbes } from './fakes/probe-seed.js'
@@ -40,11 +40,13 @@ type Setup = {
   apiKey?: string
   heartbeatMs?: number
   requestTimeoutMs?: number
+  /** The MCP refuses the cost of a final update (M45-2d T-2067). */
+  refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
 }
 
 async function setup(s: Setup) {
   model = await startFakeModelServer(s.script ?? [])
-  mcp = await startFakeScrum4meMcp({ claims: s.claims, failUpdate: s.failUpdate })
+  mcp = await startFakeScrum4meMcp({ claims: s.claims, failUpdate: s.failUpdate, refuseCost: s.refuseCost })
   const config = testWorkerConfig(
     {
       limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2, ...s.limits },
@@ -104,7 +106,7 @@ describe('runWorker — a successful turn', () => {
     expect(t.mcp.calls.map((c) => c.name).filter((n) => n !== 'job_heartbeat')).toEqual(['wait_for_job', 'update_job_status', 'update_job_status'])
     expect(controlCalls(t.mcp)).toEqual([
       { job_id: 'job1', status: 'running' },
-      { job_id: 'job1', status: 'done', summary: 'Zie de worker-runbook.', model_id: 'qwen3-coder:30b', input_tokens: 120, output_tokens: 30 },
+      { job_id: 'job1', status: 'done', summary: 'Zie de worker-runbook.', model_id: 'qwen3-coder:30b', input_tokens: 120, output_tokens: 30, cost: COST_LOCAL },
     ])
     const dirs = jobRunDirs(t.out)
     expect(dirs).toHaveLength(1)
@@ -204,14 +206,14 @@ describe('runWorker — ownership and failures', () => {
     const t = await setup({ claims: [job()], script: [answer('   \n')] })
     const r = await t.run()
     expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
-    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'leeg antwoord van qwen3-coder:30b' })
+    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'leeg antwoord van qwen3-coder:30b', input_tokens: 10, output_tokens: 5, cost: COST_LOCAL })
   })
 
   it('fails without a model call when nothing is pending', async () => {
     const t = await setup({ claims: [job(ideaChatPayload({ pending: [] }))], script: [answer('nee')] })
     await t.run()
     expect(t.model.requests).toHaveLength(0)
-    expect(controlCalls(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'geen onbeantwoord USER-bericht' }])
+    expect(controlCalls(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'geen onbeantwoord USER-bericht', cost: COST_NONE }])
   })
 
   it('fails an unsupported kind without a model call', async () => {
@@ -261,7 +263,7 @@ describe('runWorker — ownership and failures', () => {
     setTimeout(() => stop.abort(), 150)
     const r = await t.run()
     expect(r.exitCode).toBe(0)
-    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'worker gestopt' })
+    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'worker gestopt', cost: COST_LOCAL })
   })
 
   it('truncates an answer above 4000 characters with a visible marker', async () => {
@@ -574,7 +576,7 @@ describe('runWorker — review fixes', () => {
     const r = await t.run()
     expect(r.exitCode).toBe(0)
     expect(t.model.requests).toHaveLength(0)
-    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'worker gestopt' })
+    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'worker gestopt', cost: COST_LOCAL })
   })
 
   it('keeps a completed answer when Ctrl-C lands after the run finished', async () => {
@@ -730,6 +732,7 @@ describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
 const harnessConfig = (model: unknown, maxCost: unknown = '0.05') => ({ runtime: 'HARNESS', model, max_cost_usd: maxCost })
 const withoutCost = (model: unknown) => ({ runtime: 'HARNESS', model })
 const COST_NONE = { reported_cost_usd: null, cost_source: 'none' }
+const COST_LOCAL = { reported_cost_usd: '0', cost_source: 'local' }
 
 describe('runWorker — the configuration of a job (M45-2d T-2065)', () => {
   const configurations = {
@@ -745,7 +748,7 @@ describe('runWorker — the configuration of a job (M45-2d T-2065)', () => {
   it('gives each job the model client, the reasoning effort and the context window of its own configuration', async () => {
     const t = await setup({
       claims: [job(ideaChatPayload({ jobId: 'a', config: harnessConfig('fast-local') })), job(ideaChatPayload({ jobId: 'b', config: harnessConfig('deep-hosted') })), job(ideaChatPayload({ jobId: 'c', config: harnessConfig('tiny') }))],
-      script: [answer('een'), answer('twee'), answer('drie')],
+      script: [answer('een'), priced(answer('twee')), answer('drie')],
       configurations,
       once: false,
     })
@@ -892,7 +895,7 @@ describe('runWorker — the probe gate per job (M45-2d T-2066)', () => {
   it.each(ruins)('fails only the job of a configuration with %s: no running, no model call, no cost figure; the next job of the other configuration runs', async (_what, ruin, error) => {
     const t = await setup({
       claims: [job(ideaChatPayload({ jobId: 'bad', config: harnessConfig('fast-local') })), job(ideaChatPayload({ jobId: 'good', config: harnessConfig('deep-hosted') }))],
-      script: [answer('Antwoord.')],
+      script: [priced(answer('Antwoord.'))],
       configurations,
       once: false,
     })
@@ -949,5 +952,145 @@ describe('runWorker — the probe gate per job (M45-2d T-2066)', () => {
     stopAfterWaits(t, 2)
     await t.run()
     expect(controlCalls(t.mcp).map((c) => c.error)).toEqual(['UNKNOWN_CONFIGURATION: nope', 'COST_LIMIT_MISSING: ontbrekend'])
+  })
+})
+
+// ---- the tokens and the cost of every final status (M45-2d T-2067) ----
+
+describe('runWorker — the tokens and the cost of a final status (M45-2d T-2067)', () => {
+  // The default configuration stays in: the run-log of a test is opened from it.
+  const configurations = {
+    [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 32768 },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768 },
+  }
+  const usage = (over: Record<string, unknown> = {}) => ({ prompt_tokens: 120, completion_tokens: 30, ...over })
+  const hostedAnswer = (over: { usage?: Record<string, unknown>; provider?: string; text?: string } = {}): FakeTurn => ({
+    body: completion({ content: over.text ?? 'Antwoord.', model: 'qwen3-coder:30b', usage: usage({ cost: 0.000123, ...over.usage }), ...(over.provider ? { provider: over.provider } : {}) }),
+  })
+  const hosted = (jobId = 'job1', maxCost = '0.05') => job(ideaChatPayload({ jobId, config: harnessConfig('deep-hosted', maxCost) }))
+  const docSearch = (cost?: number): FakeTurn => ({
+    body: completion({ toolCalls: [{ id: 'd1', name: 'search_product_docs', arguments: { product_id: 'prod-harness', query: 'worker' } }], usage: usage(cost === undefined ? {} : { cost }) }),
+  })
+
+  it('hosted done: the exact sum as a string, the provider, and the tokens with the cached and the thinking part', async () => {
+    const t = await setup({
+      claims: [hosted()],
+      script: [hostedAnswer({ provider: 'DeepInfra', usage: { prompt_tokens_details: { cached_tokens: 7 }, completion_tokens_details: { reasoning_tokens: 11 } } })],
+      configurations,
+    })
+    await t.run()
+    expect(controlCalls(t.mcp).at(-1)).toEqual({
+      job_id: 'job1', status: 'done', summary: 'Antwoord.', model_id: 'qwen3-coder:30b',
+      input_tokens: 120, output_tokens: 30, cache_read_tokens: 7, actual_thinking_tokens: 11, // the thinking tokens are part of the 30, not added to them
+      cost: { reported_cost_usd: '0.000123000', cost_source: 'provider_reported', provider: 'DeepInfra' },
+    })
+    expect(controlCalls(t.mcp).at(-1)).not.toHaveProperty('cache_write_tokens')
+  })
+
+  it('hosted done without a provider in any answer: the report has no provider field', async () => {
+    const t = await setup({ claims: [hosted()], script: [hostedAnswer()], configurations })
+    await t.run()
+    const cost = controlCalls(t.mcp).at(-1)?.cost as Record<string, unknown>
+    expect(cost).toEqual({ reported_cost_usd: '0.000123000', cost_source: 'provider_reported' })
+    expect('provider' in cost).toBe(false)
+  })
+
+  it('hosted, a final answer above the ceiling stays done, with the amount', async () => {
+    const t = await setup({ claims: [hosted('job1', '0.05')], script: [hostedAnswer({ usage: { cost: 0.09 } })], configurations })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', cost: { reported_cost_usd: '0.090000000', cost_source: 'provider_reported' } })
+  })
+
+  it('hosted COST_UNKNOWN: failed with its own error text, cost none, and the tokens the provider did report', async () => {
+    const t = await setup({ claims: [hosted()], script: [{ body: completion({ content: 'zonder bedrag', usage: usage() }) }], configurations })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(controlCalls(t.mcp).at(-1)).toEqual({
+      job_id: 'job1', status: 'failed', error: 'COST_UNKNOWN: antwoord 1 van deep-hosted had geen bedrag',
+      input_tokens: 120, output_tokens: 30, cost: COST_NONE,
+    })
+  })
+
+  it('hosted COST_LIMIT_EXCEEDED after a paid answer: failed with the exact totals, the tokens and the cost already spent; the tools did not run', async () => {
+    const t = await setup({ claims: [hosted('job1', '0.05')], script: [docSearch(0.06), hostedAnswer()], configurations })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(controlCalls(t.mcp).at(-1)).toEqual({
+      job_id: 'job1', status: 'failed', error: 'COST_LIMIT_EXCEEDED: 0.060000000 ≥ 0.050000000 USD na 1 aanroepen',
+      input_tokens: 120, output_tokens: 30, cost: { reported_cost_usd: '0.060000000', cost_source: 'provider_reported' },
+    })
+    expect(t.model.requests).toHaveLength(1)
+    expect(t.mcp.calls.some((c) => c.name === 'search_product_docs')).toBe(false)
+  })
+
+  it('hosted failure before the first answer (HTTP 400): cost none and no tokens', async () => {
+    const t = await setup({ claims: [hosted()], script: [{ status: 400, body: { error: { message: 'slecht verzoek' } } }], configurations })
+    await t.run()
+    const last = controlCalls(t.mcp).at(-1)
+    expect(last).toMatchObject({ status: 'failed', cost: COST_NONE })
+    expect(last).not.toHaveProperty('input_tokens')
+  })
+
+  it('local failed after an answer: the tokens, and cost local "0" whatever the answer says it cost', async () => {
+    const t = await setup({ claims: [job()], script: [{ body: completion({ content: '   ', usage: usage({ cost: 7 }) }) }] })
+    await t.run()
+    expect(controlCalls(t.mcp).at(-1)).toEqual({ job_id: 'job1', status: 'failed', error: 'leeg antwoord van fake-model', input_tokens: 120, output_tokens: 30, cost: COST_LOCAL })
+  })
+
+  it('hosted: one storing is repeated once, so the job is done after two requests; a local configuration is not repeated', async () => {
+    const h = await setup({ claims: [hosted()], script: [{ status: 503, body: { error: { message: 'even niet' } } }, hostedAnswer()], configurations })
+    const hr = await h.run()
+    expect(hr.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(h.model.requests).toHaveLength(2)
+    await model?.close()
+    await mcp?.close()
+    const l = await setup({ claims: [job()], script: [{ status: 503, body: { error: { message: 'even niet' } } }, answer('Antwoord.')] })
+    const lr = await l.run()
+    expect(lr.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(l.model.requests).toHaveLength(1)
+  })
+
+  it.each(['COST_REPORT_INVALID', 'COST_REPORT_NOT_ALLOWED'] as const)('%s: the same final status once more, without cost', async (refusal) => {
+    const t = await setup({ claims: [hosted()], script: [hostedAnswer({ provider: 'DeepInfra' })], configurations, refuseCost: refusal })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    const finals = controlCalls(t.mcp).filter((c) => c.status === 'done')
+    expect(finals).toHaveLength(2)
+    expect(finals[0]).toHaveProperty('cost')
+    const { cost: _cost, ...withoutCost } = finals[0]
+    expect(finals[1]).toEqual(withoutCost)
+    expect(finals[1]).not.toHaveProperty('cost')
+  })
+
+  it('refused cost on a failure before running: the same failed status once more, without cost', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ config: harnessConfig('nope') }))], refuseCost: 'COST_REPORT_NOT_ALLOWED' })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(controlCalls(t.mcp)).toEqual([
+      { job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE },
+      { job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope' },
+    ])
+  })
+
+  it('writes one cost line in the run-log before the closing block', async () => {
+    const t = await setup({ claims: [hosted('job1', '0.05')], script: [hostedAnswer({ provider: 'DeepInfra' })], configurations })
+    await t.run()
+    const lines = runLogLines(t.runLogDir)
+    const at = lines.findIndex((l) => l.includes('[harness] cost source='))
+    expect(lines.filter((l) => l.includes('[harness] cost source='))).toHaveLength(1)
+    expect(lines[at]).toMatch(/\[harness\] cost source=provider_reported amount=0\.000123000 provider=DeepInfra ceiling=0\.05$/)
+    expect(at).toBeGreaterThan(lines.findIndex((l) => l.includes('step job_status running')))
+    expect(at).toBeLessThan(lines.findIndex((l) => l.includes('"type":"harness.run_end"')))
+  })
+
+  it('writes the cost line of a local job and of a job that failed before running', async () => {
+    const t = await setup({ claims: [job(), job(ideaChatPayload({ jobId: 'job2', config: harnessConfig('nope') }))], script: [answer('Antwoord.')], once: false })
+    stopAfterWaits(t, 2)
+    await t.run()
+    const dir = runLogRunsDir(t.runLogDir)
+    const text = readdirSync(dir).map((f) => readFileSync(join(dir, f), 'utf8')).join('\n')
+    expect(text).toMatch(/\[harness\] cost source=local amount=0 provider=- ceiling=0\.05\n/)
+    expect(text).toMatch(/\[harness\] cost source=none amount=null provider=- ceiling=ontbrekend\n/)
   })
 })

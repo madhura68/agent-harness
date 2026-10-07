@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -14,7 +14,7 @@ import { commitAll, snapshotGitAdmin } from '../src/worker/host-git.js'
 import { openRunLog } from '../src/worker/run-log.js'
 import { buildSummary, renderTaskPrompt, TaskPayloadSchema } from '../src/worker/task-impl.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
-import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
+import { completion, priced, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep, type UpdateOutcomeOverride } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
 import { seedProbe, seedProbes } from './fakes/probe-seed.js'
@@ -189,6 +189,8 @@ type Setup = {
   maxWallSeconds?: number
   /** Replaces the configurations of the worker (the default is one local configuration, TEST_CONFIGURATION). */
   configurations?: Record<string, unknown>
+  /** The MCP refuses the cost of a final update (M45-2d T-2067). */
+  refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
 }
 
 async function setup(s: Setup = {}) {
@@ -200,6 +202,7 @@ async function setup(s: Setup = {}) {
     failUpdate: s.failUpdate,
     verifyResult: s.verifyResult,
     updateOutcome: { done: s.doneOutcome ?? PUSHED },
+    refuseCost: s.refuseCost,
   })
   const config = testWorkerConfig(
     {
@@ -440,7 +443,7 @@ describe('runTaskJob — failures', () => {
     const t = await setup({ noTask: true, script: [answer('nee')] })
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
-    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'worker heeft geen task-config' }])
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'worker heeft geen task-config', cost: COST_LOCAL }])
     expect(taskUpdates(t.mcp)).toEqual([])
     expect(t.model.requests).toHaveLength(0)
     expect(t.docker.calls).toEqual([])
@@ -449,7 +452,7 @@ describe('runTaskJob — failures', () => {
   it('no recipe ⇒ failed without touching the task', async () => {
     const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, repoUrl: 'https://git.example/ander.git' }) }] })
     await t.run()
-    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'geen recept voor https://git.example/ander.git' }])
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'geen recept voor https://git.example/ander.git', cost: COST_LOCAL }])
     expect(taskUpdates(t.mcp)).toEqual([])
     expect(t.docker.runs()).toEqual([])
   })
@@ -749,7 +752,7 @@ describe('runWorker — leftover containers', () => {
     const t = await setup({ script: [answer('nee')], docker: { leftovers: [{ out: 'abc123\n' }, { out: 'abc123\n' }], rmCode: 1 } })
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
-    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'achtergebleven harness-container niet aantoonbaar opgeruimd; geen taak uitgevoerd' }])
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'achtergebleven harness-container niet aantoonbaar opgeruimd; geen taak uitgevoerd', cost: COST_LOCAL }])
     expect(t.docker.runs()).toEqual([])
     expect(taskUpdates(t.mcp)).toEqual([])
     expect(t.model.requests).toHaveLength(0)
@@ -990,6 +993,7 @@ describe('runTaskJob — run-log (M4 Taak 6, spec §5.6)', () => {
 
 const harnessConfig = (model: unknown, maxCost: unknown = '0.05') => ({ runtime: 'HARNESS', model, max_cost_usd: maxCost })
 const COST_NONE = { reported_cost_usd: null, cost_source: 'none' }
+const COST_LOCAL = { reported_cost_usd: '0', cost_source: 'local' }
 
 describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
   const configurations = {
@@ -1010,7 +1014,7 @@ describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
         { job: taskPayload({ worktree: wt, jobId: 'b', config: harnessConfig('deep-hosted') }) },
         { job: taskPayload({ worktree: wt, jobId: 'c', config: harnessConfig('tiny') }) },
       ],
-      script: [write('a.txt', 'a\n', 'w1'), answer('een'), write('b.txt', 'b\n', 'w2'), answer('twee')],
+      script: [write('a.txt', 'a\n', 'w1'), answer('een'), priced(write('b.txt', 'b\n', 'w2')), priced(answer('twee'))],
       once: false,
     })
     const stop = new AbortController()
@@ -1112,7 +1116,7 @@ describe('runTaskJob — the probe gate per job (M45-2d T-2066)', () => {
         { job: taskPayload({ worktree: wt, jobId: 'bad', config: harnessConfig('fast-local') }) },
         { job: ideaChatPayload({ jobId: 'job2', config: harnessConfig('deep-hosted') }) },
       ],
-      script: [answer('idee-antwoord')],
+      script: [priced(answer('idee-antwoord'))],
       once: false,
     })
     rmSync(join(probeDir(t.out, 'fast-local'), 'probe.json'))
@@ -1156,5 +1160,152 @@ describe('runTaskJob — the probe gate per job (M45-2d T-2066)', () => {
     rmSync(join(probeDir(t.out, TEST_CONFIGURATION), 'probe.json'))
     await t.run()
     expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE }])
+  })
+})
+
+describe('runTaskJob — the tokens and the cost of a final status (M45-2d T-2067)', () => {
+  // The default configuration stays in: the run-log of a test is opened from it.
+  const configurations = {
+    [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 32768 },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768 },
+  }
+  const hostedJob = (maxCost = '0.05') => (wt: string): ClaimStep[] => [{ job: taskPayload({ worktree: wt, config: harnessConfig('deep-hosted', maxCost) }) }]
+  /** A turn with what a provider measured: `usage.cost`, and optionally the provider, the cached and the thinking tokens. */
+  const turn = (
+    over: { cost?: number; provider?: string; cached?: number; thinking?: number; tool?: { path: string }; text?: string },
+    usage = { prompt_tokens: 100, completion_tokens: 20 },
+  ): FakeTurn => ({
+    body: completion({
+      ...(over.tool ? { toolCalls: [{ id: 'w1', name: 'write_file', arguments: { path: over.tool.path, content: 'x\n' } }] } : { content: over.text ?? 'klaar' }),
+      model: 'qwen3-coder:30b',
+      usage: {
+        ...usage,
+        ...(over.cost === undefined ? {} : { cost: over.cost }),
+        ...(over.cached === undefined ? {} : { prompt_tokens_details: { cached_tokens: over.cached } }),
+        ...(over.thinking === undefined ? {} : { completion_tokens_details: { reasoning_tokens: over.thinking } }),
+      },
+      ...(over.provider ? { provider: over.provider } : {}),
+    }),
+  })
+
+  it('hosted done: the exact sum of the answers (0.1 + 0.2), the providers, and the tokens summed with the cached and the thinking part', async () => {
+    const t = await setup({
+      configurations,
+      claims: hostedJob('1'),
+      script: [turn({ cost: 0.1, provider: 'DeepInfra', cached: 30, thinking: 4, tool: { path: 'a.txt' } }), turn({ cost: 0.2, provider: 'Fireworks', cached: 50, thinking: 6 })],
+    })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'done', summary: expect.any(String), model_id: 'qwen3-coder:30b',
+      input_tokens: 200, output_tokens: 40, cache_read_tokens: 80, actual_thinking_tokens: 10,
+      cost: { reported_cost_usd: '0.300000000', cost_source: 'provider_reported', provider: 'DeepInfra,Fireworks' },
+    })
+  })
+
+  it('local done: cost local "0", whatever the answers say they cost', async () => {
+    const t = await setup({ script: [turn({ cost: 3, tool: { path: 'a.txt' } }), turn({ cost: 4 })] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({ status: 'done', input_tokens: 200, output_tokens: 40, cost: COST_LOCAL })
+  })
+
+  it('hosted failed after paid answers (VERIFY_FAILED): the tokens and the cost spent so far', async () => {
+    const t = await setup({
+      configurations,
+      claims: hostedJob(),
+      script: [turn({ cost: 0.001, provider: 'DeepInfra', tool: { path: 'a.txt' } }), turn({ cost: 0.002 })],
+      docker: { verify: [RED()] },
+      maxVerifyRepairs: 1,
+    })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'failed', error: expect.stringMatching(/^failed: VERIFY_FAILED /),
+      input_tokens: 200, output_tokens: 40, cost: { reported_cost_usd: '0.003000000', cost_source: 'provider_reported', provider: 'DeepInfra' },
+    })
+  })
+
+  it('hosted COST_LIMIT_EXCEEDED after a paid answer with a tool call: failed with the exact totals; the tool did not run, no second call', async () => {
+    const t = await setup({ configurations, claims: hostedJob('0.05'), script: [turn({ cost: 0.06, tool: { path: 'a.txt' } }), turn({ cost: 0.01 })] })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'failed', error: expect.stringMatching(/^COST_LIMIT_EXCEEDED: 0\.060000000 ≥ 0\.050000000 USD na 1 aanroepen; /),
+      input_tokens: 100, output_tokens: 20, cost: { reported_cost_usd: '0.060000000', cost_source: 'provider_reported' },
+    })
+    expect(t.model.requests).toHaveLength(1)
+    expect(existsSync(join(t.worktree, 'a.txt'))).toBe(false)
+    expect(taskUpdates(t.mcp)).toEqual(['in_progress']) // the task is not put in review
+  })
+
+  it('hosted COST_LIMIT_EXCEEDED on the call after a red verify gate (afterAnswer retry): no further model call', async () => {
+    const t = await setup({
+      configurations,
+      claims: hostedJob('0.05'),
+      script: [turn({ cost: 0.01, tool: { path: 'a.txt' } }), turn({ cost: 0.05 }), turn({ cost: 0.01 })],
+      docker: { verify: [RED()] },
+    })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({
+      status: 'failed', error: expect.stringMatching(/^COST_LIMIT_EXCEEDED: 0\.060000000 ≥ 0\.050000000 USD na 2 aanroepen/), cost: { reported_cost_usd: '0.060000000', cost_source: 'provider_reported' },
+    })
+    expect(t.model.requests).toHaveLength(2)
+  })
+
+  it('hosted COST_UNKNOWN: failed, cost none, and the tokens the provider did report', async () => {
+    const t = await setup({ configurations, claims: hostedJob(), script: [turn({ tool: { path: 'a.txt' } })] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'failed', error: expect.stringMatching(/^COST_UNKNOWN: antwoord 1 van deep-hosted had geen bedrag; /),
+      input_tokens: 100, output_tokens: 20, cost: COST_NONE,
+    })
+    expect(existsSync(join(t.worktree, 'a.txt'))).toBe(false)
+  })
+
+  it('failures before the model ran: a hosted configuration has no figure (none), a local one reports local "0"', async () => {
+    const h = await setup({ configurations, claims: hostedJob(), docker: { prepare: RED('npm ERR') } })
+    await h.run()
+    expect(lastJobUpdate(h.mcp)).toEqual({ job_id: 'job1', status: 'failed', error: expect.stringMatching(/^prepare faalde/), cost: COST_NONE })
+    await model?.close()
+    await mcp?.close()
+    const l = await setup({ docker: { prepare: RED('npm ERR') } })
+    await l.run()
+    expect(lastJobUpdate(l.mcp)).toEqual({ job_id: 'job1', status: 'failed', error: expect.stringMatching(/^prepare faalde/), cost: COST_LOCAL })
+  })
+
+  it('a payload that is invalid carries no figure either: cost none', async () => {
+    const t = await setup({ claims: (wt) => [{ job: { ...taskPayload({ worktree: wt }), task: { id: '' } } }] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({ status: 'failed', error: expect.stringMatching(/^payload ongeldig/), cost: COST_NONE })
+  })
+
+  it.each(['COST_REPORT_INVALID', 'COST_REPORT_NOT_ALLOWED'] as const)('%s on the done update: the same status once more, without cost, and the job goes on as done', async (refusal) => {
+    const t = await setup({ configurations, claims: hostedJob('1'), script: [turn({ cost: 0.1, tool: { path: 'a.txt' } }), turn({ cost: 0.2 })], refuseCost: refusal })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    const dones = jobUpdates(t.mcp).filter((u) => u.status === 'done')
+    expect(dones).toHaveLength(2)
+    const { cost, ...rest } = dones[0]
+    expect(cost).toEqual({ reported_cost_usd: '0.300000000', cost_source: 'provider_reported' })
+    expect(dones[1]).toEqual(rest)
+    expect(taskUpdates(t.mcp)).toEqual(['in_progress', 'review'])
+  })
+
+  it('COST_REPORT_INVALID on a failed update: the same failed status once more, without cost', async () => {
+    const t = await setup({ docker: { prepare: RED('npm ERR') }, refuseCost: 'COST_REPORT_INVALID' })
+    await t.run()
+    const fails = jobUpdates(t.mcp).filter((u) => u.status === 'failed')
+    expect(fails).toHaveLength(2)
+    expect(fails[0]).toHaveProperty('cost')
+    expect(fails[1]).toEqual({ job_id: 'job1', status: 'failed', error: fails[0].error })
+  })
+
+  it('writes the cost line in the run-log before the closing block', async () => {
+    const t = await setup({ configurations, claims: hostedJob('0.5'), script: [turn({ cost: 0.1, provider: 'DeepInfra', tool: { path: 'a.txt' } }), turn({ cost: 0.2 })] })
+    await t.run()
+    const lines = runLogLines(t.runLogDir)
+    const at = lines.findIndex((l) => l.includes('[harness] cost source='))
+    expect(lines[at]).toMatch(/\[harness\] cost source=provider_reported amount=0\.300000000 provider=DeepInfra ceiling=0\.5$/)
+    expect(lines.filter((l) => l.includes('[harness] cost source='))).toHaveLength(1)
+    expect(at).toBeLessThan(lines.findIndex((l) => l.includes('"type":"harness.run_end"')))
   })
 })

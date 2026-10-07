@@ -1,7 +1,8 @@
 import { createServer, type IncomingHttpHeaders } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
-export type FakeTurn = { status?: number; body?: unknown; delayMs?: number }
+/** `drop` closes the connection without an answer: the client sees a network error. */
+export type FakeTurn = { status?: number; body?: unknown; delayMs?: number; drop?: boolean }
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- captured JSON bodies are inspected ad hoc in tests
 export type CapturedRequest = { method: string; url: string; headers: IncomingHttpHeaders; body: any }
 
@@ -37,6 +38,10 @@ export async function startFakeModelServer(script: FakeTurn[], models: FakeModel
       const turn = script[requests.length - 1]
       const send = () => {
         if (res.destroyed) return
+        if (turn?.drop) {
+          req.socket.destroy()
+          return
+        }
         if (!turn) {
           res.writeHead(599, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ error: { message: 'script exhausted' } }))
@@ -70,8 +75,17 @@ export function completion(opts: {
   content?: string | null
   toolCalls?: Array<{ id?: string; name: string; arguments?: unknown }>
   finishReason?: string
-  usage?: { prompt_tokens: number; completion_tokens: number; cost?: number } | null
+  /** `cost` is `usage.cost` of the response (what the provider billed, in dollars); the details are what the provider measured of the cached and the thinking tokens. */
+  usage?: {
+    prompt_tokens: number
+    completion_tokens: number
+    cost?: number
+    prompt_tokens_details?: { cached_tokens: number }
+    completion_tokens_details?: { reasoning_tokens: number }
+  } | null
   model?: string
+  /** The top-level `provider` of the response (OpenRouter names who served the request). */
+  provider?: string
 }) {
   const message: Record<string, unknown> = { role: 'assistant', content: opts.content ?? null }
   if (opts.toolCalls) {
@@ -87,6 +101,13 @@ export function completion(opts: {
     model: opts.model ?? 'fake-model',
     choices: [{ index: 0, message, finish_reason: opts.finishReason ?? (opts.toolCalls ? 'tool_calls' : 'stop') }],
   }
+  if (opts.provider !== undefined) body.provider = opts.provider
   if (opts.usage !== null) body.usage = opts.usage ?? { prompt_tokens: 10, completion_tokens: 5 }
   return body
+}
+
+/** A scripted turn with `usage.cost` set: what a hosted configuration needs, since a hosted answer without an amount stops the job (COST_UNKNOWN). */
+export function priced(turn: FakeTurn, cost = 0.001): FakeTurn {
+  const body = turn.body as { usage?: Record<string, unknown> }
+  return { ...turn, body: { ...body, usage: { ...body.usage, cost } } }
 }

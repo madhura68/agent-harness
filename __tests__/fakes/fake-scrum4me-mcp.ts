@@ -33,6 +33,8 @@ export async function startFakeScrum4meMcp(
     updateOutcome?: Partial<Record<'running' | 'done' | 'failed' | 'skipped', UpdateOutcomeOverride>>
     verifyResult?: 'aligned' | 'partial' | 'empty' | 'divergent'
     health?: HealthSetup
+    /** The MCP refuses the cost of every final update, as it does for a cost report it does not allow or does not accept (scrum4me-mcp harness-cost.ts). */
+    refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
   } = {},
 ) {
   const calls: ToolCallRecord[] = []
@@ -78,6 +80,8 @@ export async function startFakeScrum4meMcp(
         model_id: z.string().optional(),
         input_tokens: z.number().int().optional(),
         output_tokens: z.number().int().optional(),
+        cache_read_tokens: z.number().int().optional(),
+        actual_thinking_tokens: z.number().int().optional(),
         // The cost of the job (M45-2d): a decimal string or null, with where the figure came from.
         cost: z
           .object({ reported_cost_usd: z.string().nullable(), cost_source: z.enum(['provider_reported', 'local', 'none']), provider: z.string().optional() })
@@ -86,6 +90,7 @@ export async function startFakeScrum4meMcp(
     },
     async (args) => {
       calls.push({ name: 'update_job_status', args })
+      if (opts.refuseCost !== undefined && args.cost !== undefined) return toolError(`VALIDATION_ERROR: ${opts.refuseCost}`)
       const requested = args.status as 'running' | 'done' | 'failed' | 'skipped'
       if (state.failUpdate.has(requested as 'running' | 'done' | 'failed')) return toolError(`Job ${args.job_id} is already terminal`)
       const override = state.updateOutcome[requested] ?? {}

@@ -1,3 +1,4 @@
+import { createCostGuard, parseCeilingNanos, type CostGuard } from '../cost.js'
 import type { Manifest } from '../manifest.js'
 import type { ModelClient } from '../model-client.js'
 import { runManifest } from '../run.js'
@@ -7,6 +8,7 @@ import type { WorkerConfig } from './config.js'
 import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
 import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './exit-codes.js'
+import { costFailureText, costLogLine, sendFinalStatus, withMeasured } from './final-status.js'
 import { startHeartbeat } from './heartbeat.js'
 import { IDEA_CHAT_SYSTEM_PROMPT, IdeaChatPayloadSchema, pendingUserMessages, renderIdeaChatUserMessage } from './idea-chat.js'
 import { failBeforeRunning, limitsFor, modelClientFor, modelSpecFor, resolveJobConfiguration } from './job-configuration.js'
@@ -78,6 +80,8 @@ function runIdFor(jobId: string): string {
 }
 
 function failureText(result: RunResult, config: WorkerConfig): string {
+  const costText = costFailureText(result)
+  if (costText) return costText
   if (result.error) return `${result.status}: ${result.error.code} ${result.error.message}`
   if (result.status === 'timed_out') return `timed_out: geen antwoord binnen maxWallSeconds=${config.limits.maxWallSeconds}`
   if (result.status === 'budget_exceeded') {
@@ -86,7 +90,7 @@ function failureText(result: RunResult, config: WorkerConfig): string {
   return `${result.status}: onbekende fout`
 }
 
-/** What to send when the run ended; null = send nothing (ownership lost). `configuration` is the name the provider's own model name falls back to. */
+/** What to send when the run ended, without the tokens and the cost (`close` adds those). `configuration` is the name the provider's own model name falls back to. */
 function closingUpdate(result: RunResult, config: WorkerConfig, configuration: string): StatusUpdate {
   if (result.status === 'completed') {
     const answer = result.answer ?? ''
@@ -96,9 +100,6 @@ function closingUpdate(result: RunResult, config: WorkerConfig, configuration: s
       status: 'done',
       summary: cut(answer, SUMMARY_LIMIT, TRUNCATED_MARK),
       model_id: modelId,
-      ...(result.usage.source === 'provider_reported'
-        ? { input_tokens: result.usage.inputTokens, output_tokens: result.usage.outputTokens }
-        : {}),
     }
   }
   return { status: 'failed', error: cut(failureText(result, config), ERROR_LIMIT) }
@@ -148,8 +149,15 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const { jobId } = claim
 
-  const close = async (update: StatusUpdate): Promise<JobOutcome> => {
-    const res = await control.updateStatus(jobId, update)
+  // What the final status carries besides its own fields (M45-2d): the tokens of the run and the cost the guard of the job counted. Both
+  // stay empty for a job that never got as far as a run, which reports no cost figure.
+  let guard: CostGuard | undefined = undefined
+  let runUsage: RunResult['usage'] | undefined
+  let ceiling = 'ontbrekend'
+  const close = async (update: StatusUpdate, measured = true): Promise<JobOutcome> => {
+    const final = measured ? withMeasured(update, runUsage, guard) : update
+    if (final.cost) runLog?.meta(costLogLine(final.cost, ceiling))
+    const res = await sendFinalStatus(control, jobId, final)
     if (!res.ok) log(`job ${jobId}: update_job_status(${update.status}) mislukt: ${res.message ?? 'onbekend'}`)
     runLog?.step(`job_status ${update.status === 'done' ? 'done' : 'failed'}`)
     return update.status === 'done' ? 'done' : 'failed'
@@ -158,7 +166,7 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   // Second lock behind the claim filter: this worker runs IDEA_CHAT and TASK_IMPLEMENTATION only.
   if (claim.kind !== 'IDEA_CHAT') {
     runLog?.fail('CLAIM_FILTER', `kind ${claim.kind} niet ondersteund door agent-harness`)
-    await close({ status: 'failed', error: `kind ${claim.kind} niet ondersteund door agent-harness` })
+    await close({ status: 'failed', error: `kind ${claim.kind} niet ondersteund door agent-harness` }, false) // not a job of this worker: no cost report
     throw new ClaimFilterError(`kind ${claim.kind}`)
   }
   const parsed = IdeaChatPayloadSchema.safeParse(claim.payload)
@@ -179,7 +187,9 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   const job = resolved.job
   // The probe gate of that configuration, after the configuration and the ceiling and before running: no accepted probe of the hash it has now fails this job only.
   const probed = checkProbeForJob(config, deps.out, job.name)
-  if (!probed.ok) return failBeforeRunning(deps, jobId, runLog, probed.failure)
+  if (!probed.ok) return failBeforeRunning(deps, jobId, runLog, probed.failure, job.maxCostUsd)
+  ceiling = job.maxCostUsd
+  guard = createCostGuard({ mode: job.configuration.costMode, ceilingNanos: parseCeilingNanos(job.maxCostUsd), configuration: job.name })
 
   const running = await control.updateStatus(jobId, { status: 'running' })
   if (!running.ok) {
@@ -218,7 +228,10 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
       connectRegistry: (signal) => deps.registryView(signal),
       signal: inner.signal,
       runStartExtra: { jobId, ideaId: payload.idea.id },
+      costGuard: guard,
+      retryOnce: job.configuration.costMode === 'hosted',
     })
+    runUsage = result.usage
     update = closingUpdate(result, config, job.name)
     if (update.status === 'failed') failInfo = { code: ideaChatFailCode(result), message: update.error ?? '' }
   } catch (err) {

@@ -2,10 +2,12 @@
 // payload's `config`, which the MCP resolves at claim: `{ runtime: 'HARNESS', model: <configuration name>, max_cost_usd: <decimal string> }`.
 // A job that asks for something this worker cannot do fails on its own, before it runs (spec §4); the worker goes on with the next one.
 
+import { parseCeilingNanos } from '../cost.js'
 import type { Manifest } from '../manifest.js'
 import type { ModelClient } from '../model-client.js'
 import type { Configuration, WorkerConfig } from './config.js'
 import type { ControlChannel } from './control.js'
+import { costLogLine, sendFinalStatus } from './final-status.js'
 import type { RunLog } from './run-log.js'
 
 export type JobConfiguration = { name: string; configuration: Configuration; maxCostUsd: string }
@@ -39,10 +41,17 @@ function claimedConfig(payload: unknown): Record<string, unknown> {
 
 /**
  * The ceiling as a validated decimal string: digits, optionally a point and digits, and not zero. No number is made of it, so
- * nothing rounds (the nano-dollar parser that counts with it comes with the cost reporting). Anything else is no ceiling at all.
+ * nothing rounds; the job counts with it in nano-dollars through the same exact parser (`parseCeilingNanos`), which decides what a decimal
+ * string is. Anything else is no ceiling at all.
  */
 function parseMaxCostUsd(value: unknown): string | undefined {
-  return typeof value === 'string' && /^\d+(\.\d+)?$/.test(value) && /[1-9]/.test(value) ? value : undefined
+  if (typeof value !== 'string' || !/[1-9]/.test(value)) return undefined
+  try {
+    parseCeilingNanos(value)
+  } catch {
+    return undefined
+  }
+  return value
 }
 
 /**
@@ -109,14 +118,14 @@ export async function failBeforeRunning(
   jobId: string,
   runLog: RunLog | null,
   failure: JobFailure,
+  /** The ceiling of the job when it has a valid one, for the cost line of the run-log. */
+  ceiling = 'ontbrekend',
 ): Promise<'failed'> {
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   runLog?.fail(failure.code, failure.detail)
-  const res = await deps.control.updateStatus(jobId, {
-    status: 'failed',
-    error: `${failure.code}: ${failure.detail}`,
-    cost: { reported_cost_usd: null, cost_source: 'none' },
-  })
+  const cost = { reported_cost_usd: null, cost_source: 'none' } as const
+  runLog?.meta(costLogLine(cost, ceiling))
+  const res = await sendFinalStatus(deps.control, jobId, { status: 'failed', error: `${failure.code}: ${failure.detail}`, cost })
   if (!res.ok) log(`job ${jobId}: update_job_status(failed) mislukt: ${res.message ?? 'onbekend'}`)
   runLog?.step('job_status failed')
   log(`job ${jobId}: failed (${failure.code})`)

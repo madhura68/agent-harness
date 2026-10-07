@@ -17,6 +17,9 @@ export type StatusUpdate = {
   model_id?: string
   input_tokens?: number
   output_tokens?: number
+  /** Measured by the provider (M45-2d): the cached part of the input and the thinking part of the output (never added to `output_tokens`). */
+  cache_read_tokens?: number
+  actual_thinking_tokens?: number
   /** What the job cost (M45-2d): `reported_cost_usd` is a decimal string, or null when there is no figure; `cost_source` says where it came from. */
   cost?: { reported_cost_usd: string | null; cost_source: 'provider_reported' | 'local' | 'none'; provider?: string }
 }
