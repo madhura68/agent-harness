@@ -9,7 +9,7 @@
 #   status | install | stop | start | probe | release-update | release-rollback | mcp-update | mcp-rollback
 #   | litellm-up | litellm-upgrade | provider-key <NAME>
 #
-# Exit codes: 0 ok; 64 unknown action, extra argument, unknown NAME or unusable value; 66 a needed directory is missing;
+# Exit codes: 0 ok; 64 unknown action, extra argument, unknown NAME or unusable value; 66 a needed directory or source file is missing, a source file is a symlink, or a release is not built;
 #   70 the action is not built yet; 73 a file could not be created; 74 a release could not be built, switched or looked up;
 #   75 busy (another action holds the lock) or the worker
 #   is not at a standstill.
@@ -17,7 +17,7 @@
 # Rules this file keeps:
 # - git and npm only through `runuser` as the checkout owner (owner_git, owner_npm); never git as root in a checkout. runuser
 #   keeps root's environment, HOME=/root included, so every owner command runs through `env HOME=<owner's home>` (owner_run):
-#   git and npm never read or write root's config or cache.
+#   git and npm never read or write root's config or cache. owner_run also sets GIT_TERMINAL_PROMPT=0.
 # - All paths are variables with fixed defaults (AH_ETC, AH_LITELLM_ENV, AH_LOCK, AH_OWNER, AH_OWNER_HOME, AH_SRV, AH_UNIT_DIR,
 #   AH_REPO_URL, ...), and so is PATH: the script sets
 #   a fixed PATH itself instead of relying on sudo's secure_path (AH_PATH replaces it). sudo's env_reset wipes the caller's
@@ -86,8 +86,9 @@ not_implemented() { # $1 = action, $2 = the plan part that builds it
   die 70 "$1: nog niet geïmplementeerd (deel $2)"
 }
 
-# A command as the checkout owner, never as root, with the owner's HOME (runuser keeps root's HOME=/root).
-owner_run() { runuser -u "$AH_OWNER" -- env HOME="$AH_OWNER_HOME" "$@"; }
+# A command as the checkout owner, never as root, with the owner's HOME (runuser keeps root's HOME=/root) and without a git
+# prompt: a missing credential must fail (the caller exits 74), never wait for a terminal that is not there.
+owner_run() { runuser -u "$AH_OWNER" -- env HOME="$AH_OWNER_HOME" GIT_TERMINAL_PROMPT=0 "$@"; }
 owner_git() { owner_run git "$@"; }
 owner_npm() { owner_run npm "$@"; }
 
@@ -182,9 +183,16 @@ swap_current() { # $1 = commit
   printf 'current wijst naar release %s\n' "$commit"
 }
 
+# A source that root copies out of a release the owner built must be a plain file: a symlink there could point at any file root
+# can read (say litellm.env) and root would copy its content into a world-readable target.
+require_plain_file() { # $1 = source
+  [[ ! -L $1 ]] || die 66 "bronbestand $1 is een symlink; niet gekopieerd"
+  [[ -f $1 ]] || die 66 "bronbestand $1 ontbreekt"
+}
+
 # Copy a file with a temp file beside the target and an atomic rename, so a crash leaves the old file or the new one.
 install_file() { # $1 = source, $2 = target, $3 = mode
-  [[ -f $1 ]] || die 66 "bronbestand $1 ontbreekt"
+  require_plain_file "$1"
   make_temp_beside "$2"
   cat -- "$1" >"$TEMP_FILE"
   publish_temp "$2" "$3"
@@ -216,7 +224,7 @@ install_units() {
 # definition (`failed`) until then, and `enable --now` in litellm-up would start that one.
 install_bridge_unit() {
   local src="$AH_CURRENT/deploy/max2/litellm/$UNIT_BRIDGE" dst="$AH_UNIT_DIR/$UNIT_BRIDGE" backup
-  [[ -f $src ]] || die 66 "bronbestand $src ontbreekt"
+  require_plain_file "$src"
   if [[ -f $dst ]] && cmp -s -- "$src" "$dst"; then
     printf '%s is al actueel\n' "$dst"
     return 0
@@ -251,7 +259,7 @@ read_env_value() { # $1 = file, $2 = NAME
 # One source for the master key. litellm.env (read by LiteLLM) gets a new LITELLM_MASTER_KEY only when it has none: `sk-` plus
 # `openssl rand -hex 24` (the shape of increment 1), through a temp file and rename, written with builtins. harness-litellm.env
 # (read by the harness) gets the key from litellm.env when it is missing and never a new one, so both always hold the same key,
-# also after an interrupted install. Both 0600 under umask 077.
+# also after an interrupted install. Both 0600 under umask 077, and existing ones are brought back to 0600.
 ensure_master_key() {
   local key line old_umask
   old_umask=$(umask)
@@ -275,9 +283,11 @@ ensure_master_key() {
     key=""
     printf 'masterkey aangemaakt in %s\n' "$AH_LITELLM_ENV"
   else
+    chmod 600 "$AH_LITELLM_ENV"
     printf 'masterkey bestaat al in %s; ongewijzigd\n' "$AH_LITELLM_ENV"
   fi
   if [[ -e $AH_HARNESS_ENV ]]; then
+    chmod 600 "$AH_HARNESS_ENV"
     printf '%s bestaat al; ongewijzigd\n' "$AH_HARNESS_ENV"
   else
     make_temp_beside "$AH_HARNESS_ENV"

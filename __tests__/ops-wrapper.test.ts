@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -209,12 +209,12 @@ describe('ops wrapper: runuser en stilstand (helpers)', () => {
   it('draait git en npm als janpeter via runuser, nooit rechtstreeks', () => {
     const res = runHelper('owner_git -C /srv/x status; owner_npm ci')
     expect(res.code).toBe(0)
-    expect(stubCalls()).toEqual(['runuser -u janpeter -- env HOME=/home/janpeter git -C /srv/x status', 'runuser -u janpeter -- env HOME=/home/janpeter npm ci'])
+    expect(stubCalls()).toEqual(['runuser -u janpeter -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 git -C /srv/x status', 'runuser -u janpeter -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 npm ci'])
   })
 
-  it('houdt de eigenaar en zijn home overschrijfbaar voor tests, met janpeter en /home/janpeter als vaste standaard, en zet HOME op die home (runuser behoudt HOME=/root)', () => {
+  it('houdt de eigenaar en zijn home overschrijfbaar voor tests, met janpeter en /home/janpeter als vaste standaard, en zet HOME op die home (runuser behoudt HOME=/root) en GIT_TERMINAL_PROMPT=0 (nooit een prompt)', () => {
     runHelper('owner_git log; owner_npm ci', { AH_OWNER: 'tester', AH_OWNER_HOME: '/home/tester' })
-    expect(stubCalls()).toEqual(['runuser -u tester -- env HOME=/home/tester git log', 'runuser -u tester -- env HOME=/home/tester npm ci'])
+    expect(stubCalls()).toEqual(['runuser -u tester -- env HOME=/home/tester GIT_TERMINAL_PROMPT=0 git log', 'runuser -u tester -- env HOME=/home/tester GIT_TERMINAL_PROMPT=0 npm ci'])
   })
 
   it('telt alleen inactive en failed als stilstand', () => {
@@ -429,6 +429,11 @@ function installStubs(): void {
   writeStub(
     'git',
     `${LOG_LINE}
+# a repo that needs a credential: with prompts disabled git fails at once; without GIT_TERMINAL_PROMPT=0 it would sit on a prompt forever
+if { [ "$1" = ls-remote ] || [ "$1" = clone ]; } && [ -n "$STUB_NEEDS_CREDENTIAL" ]; then
+  if [ "$GIT_TERMINAL_PROMPT" = 0 ]; then echo 'fatal: could not read Username: terminal prompts disabled' >&2; exit 128; fi
+  echo 'git would wait on a prompt' >&2; exit 99
+fi
 case "$1" in
   ls-remote)
     if [ -n "$STUB_LSREMOTE_OUT" ]; then printf '%s\\n' "$STUB_LSREMOTE_OUT"; else printf '%s\\trefs/heads/main\\n' "$STUB_HEAD"; fi
@@ -522,12 +527,12 @@ describe('ops wrapper: install en releases (deel c)', () => {
       expect(onlyOwner).toEqual([
         'flock -n 9',
         'systemctl is-active agent-harness.service',
-        `runuser -u ${me} -- env HOME=/home/janpeter git ls-remote ${url} refs/heads/main`,
-        `runuser -u ${me} -- env HOME=/home/janpeter git clone ${url} ${rel}`,
-        `runuser -u ${me} -- env HOME=/home/janpeter git -C ${rel} checkout --detach ${SHA}`,
-        `runuser -u ${me} -- env HOME=/home/janpeter npm ci`,
-        `runuser -u ${me} -- env HOME=/home/janpeter npm run build`,
-        `runuser -u ${me} -- env HOME=/home/janpeter touch ${rel}/.built`,
+        `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 git ls-remote ${url} refs/heads/main`,
+        `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 git clone ${url} ${rel}`,
+        `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 git -C ${rel} checkout --detach ${SHA}`,
+        `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 npm ci`,
+        `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 npm run build`,
+        `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 touch ${rel}/.built`,
         'systemctl daemon-reload', // units installeren
         'systemctl daemon-reload', // brug-unit ontbrak
       ])
@@ -547,7 +552,7 @@ describe('ops wrapper: install en releases (deel c)', () => {
       const viaRunuser = stubCalls().filter((c) => c.startsWith('runuser') && / (git|npm) /.test(c))
       expect(direct.length).toBe(viaRunuser.length)
       expect(viaRunuser.length).toBeGreaterThan(0)
-      for (const c of viaRunuser) expect(c).toContain('env HOME=/home/janpeter ')
+      for (const c of viaRunuser) expect(c).toContain('env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 ')
     })
 
     it('installeert beide units uit current, zonder enable of start, en laat de dienst ongestart', () => {
@@ -726,7 +731,7 @@ describe('ops wrapper: install en releases (deel c)', () => {
       expect(res.code, res.stderr).toBe(0)
       expect(existsSync(srv('releases', SHA, 'half-gebouwd'))).toBe(false)
       expect(existsSync(srv('releases', SHA, '.built'))).toBe(true)
-      const names = stubCalls().filter((c) => c.startsWith('runuser')).map((c) => c.replace(/^runuser -u \S+ -- env HOME=\S+ /, ''))
+      const names = stubCalls().filter((c) => c.startsWith('runuser')).map((c) => c.replace(/^runuser -u \S+ -- env HOME=\S+ GIT_TERMINAL_PROMPT=0 /, ''))
       expect(names.map((n) => n.split(' ').slice(0, 2).join(' '))).toEqual(['rm -rf', 'git clone', 'git -C', 'npm ci', 'npm run', 'touch ' + srv('releases', SHA, '.built')].map((x) => x))
     })
 
@@ -829,6 +834,81 @@ describe('ops wrapper: install en releases (deel c)', () => {
       writeFileSync(srv('current', 'x'), 'bewaar')
       expect(swap(SHA).code).toBe(74)
       expect(readFileSync(srv('current', 'x'), 'utf8')).toBe('bewaar')
+    })
+  })
+
+  describe('hardening (fix ronde 1)', () => {
+    it('draait git zonder prompt: een ontbrekende credential laat install met 74 falen in plaats van te blijven hangen', () => {
+      const res = install({ STUB_NEEDS_CREDENTIAL: '1' })
+      expect(res.code, res.stderr).toBe(74)
+      expect(existsSync(srv('current'))).toBe(false)
+      expect(res.stderr).toContain('terminal prompts disabled')
+      expect(res.stderr).not.toContain('would wait on a prompt')
+      // ook de clone zelf (ls-remote niet nodig): build_release faalt met 74
+      const res2 = runHelper(`build_release ${SHA}`, installEnv({ STUB_NEEDS_CREDENTIAL: '1' }))
+      expect(res2.code).toBe(74)
+      expect(res2.stderr).toContain('terminal prompts disabled')
+      expect(existsSync(srv('releases', SHA, '.built'))).toBe(false)
+    })
+
+    it.each(['max2/agent-harness.service', 'max2/agent-harness-probe.service', 'max2/harness.json', 'max2/litellm/config.yaml', 'max2/litellm/compose.yml', 'max2/litellm/litellm-ollama-bridge.service'])(
+      'weigert (66) een bronbestand dat een symlink is (%s): root kopieert nooit de inhoud van een link, ook niet naar een 0644-doel',
+      (rel) => {
+        const geheim = join(dir, 'geheim.env')
+        writeFileSync(geheim, 'LITELLM_MASTER_KEY=sk-niet-kopieren\n', { mode: 0o600 })
+        const bron = join(dir, 'deploy-src')
+        cpSync(REPO_DEPLOY, bron, { recursive: true })
+        rmSync(join(bron, rel))
+        symlinkSync(geheim, join(bron, rel))
+        const res = install({ STUB_SRC_DEPLOY: bron })
+        expect(res.code, res.stderr).toBe(66)
+        expect(res.stderr).toContain('symlink')
+        // nergens in de doelmappen staat de inhoud van de link
+        for (const d of [units(), etc(), etc('litellm')]) {
+          for (const f of existsSync(d) ? readdirSync(d) : []) {
+            const pad = join(d, f)
+            if (statSync(pad).isFile()) expect(readFileSync(pad, 'utf8'), pad).not.toContain('sk-niet-kopieren')
+          }
+        }
+      },
+    )
+
+    it('zet de modus van bestaande sleutelbestanden terug op 0600 (litellm.env en harness-litellm.env) bij een tweede install', () => {
+      const key = `sk-${'cd34'.repeat(12)}`
+      mkdirSync(etc(), { recursive: true })
+      writeFileSync(litellmEnv(), `LITELLM_MASTER_KEY=${key}\n`)
+      writeFileSync(harnessEnv(), `LITELLM_MASTER_KEY=${key}\n`)
+      chmodSync(litellmEnv(), 0o644)
+      chmodSync(harnessEnv(), 0o664)
+      const res = install()
+      expect(res.code, res.stderr).toBe(0)
+      expect(mode(litellmEnv())).toBe('600')
+      expect(mode(harnessEnv())).toBe('600')
+      expect(readFileSync(litellmEnv(), 'utf8')).toBe(`LITELLM_MASTER_KEY=${key}\n`)
+      expect(readFileSync(harnessEnv(), 'utf8')).toBe(`LITELLM_MASTER_KEY=${key}\n`)
+    })
+
+    it('zet litellm.env op 0600 als alleen harness-litellm.env ontbreekt (bestaande sleutel, ruime modus)', () => {
+      mkdirSync(etc(), { recursive: true })
+      writeFileSync(litellmEnv(), `LITELLM_MASTER_KEY=sk-${'ef56'.repeat(12)}\n`)
+      chmodSync(litellmEnv(), 0o644)
+      expect(install().code).toBe(0)
+      expect(mode(litellmEnv())).toBe('600')
+      expect(mode(harnessEnv())).toBe('600')
+    })
+
+    it('verwijdert bij een onvolledige releasemap die een symlink naar een map is alleen de link, niet de map waar hij heen wijst', () => {
+      const doel = join(dir, 'doelmap')
+      mkdirSync(doel)
+      writeFileSync(join(doel, 'sentinel'), 'blijft')
+      mkdirSync(srv('releases'), { recursive: true })
+      symlinkSync(doel, srv('releases', SHA))
+      const res = runHelper(`build_release ${SHA}`, installEnv())
+      expect(res.code, res.stderr).toBe(0)
+      expect(readFileSync(join(doel, 'sentinel'), 'utf8')).toBe('blijft')
+      expect(readdirSync(doel)).toEqual(['sentinel'])
+      expect(lstatSync(srv('releases', SHA)).isSymbolicLink()).toBe(false)
+      expect(existsSync(srv('releases', SHA, '.built'))).toBe(true)
     })
   })
 })
