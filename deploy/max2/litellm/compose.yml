@@ -1,7 +1,8 @@
-# LiteLLM for the M45 trial on max2 (increment 1): runs only during the trial window, listens only on loopback.
-# Every compose call needs LITELLM_ENV_FILE, `down` included:
+# LiteLLM for the M45-2d harness worker on max2 (production): always on (restart: unless-stopped), listens only on loopback.
+# Installed as /etc/agent-harness/litellm/compose.yml next to config.yaml. The env file defaults to
+# /etc/agent-harness/litellm.env (OPENROUTER_API_KEY and LITELLM_MASTER_KEY, root-owned, never in this repo);
+# LITELLM_ENV_FILE overrides it, for a trial run from another file:
 #   LITELLM_ENV_FILE=/run/user/1000/m45.env docker compose -f deploy/max2/litellm/compose.yml up -d
-# That file holds OPENROUTER_API_KEY and LITELLM_MASTER_KEY; it never lives in this repo.
 name: litellm
 
 services:
@@ -12,8 +13,8 @@ services:
     image: ghcr.io/berriai/litellm@sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf
     # Plain `litellm`: the harness worker removes containers that carry its own name prefix (M45 plan, constraint 7).
     container_name: litellm
-    restart: "no"
-    env_file: ${LITELLM_ENV_FILE:?set LITELLM_ENV_FILE to the env file with the keys}
+    restart: unless-stopped
+    env_file: ${LITELLM_ENV_FILE:-/etc/agent-harness/litellm.env}
     command: ["--config", "/opt/litellm/config.yaml", "--port", "4000"]
     volumes:
       - ./config.yaml:/opt/litellm/config.yaml:ro

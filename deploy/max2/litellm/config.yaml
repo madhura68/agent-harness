@@ -1,5 +1,6 @@
-# LiteLLM config for the M45 trial on max2 (increment 1). Keys only as os.environ/...: the values come from
-# the compose env file (LITELLM_ENV_FILE), never from this repo. No database, no callbacks.
+# LiteLLM config for the M45-2d harness worker on max2 (production). Keys only as os.environ/...: the values come from
+# the compose env file (/etc/agent-harness/litellm.env by default), never from this repo. No database, no callbacks.
+# The model_name values are exactly the configuration names in harness.json (a test pins that).
 model_list:
   # Local: max2's Ollama, reached through litellm-ollama-bridge.service on the litellm network's gateway.
   - model_name: gsq-lokaal
@@ -21,17 +22,6 @@ model_list:
           data_collection: "deny"
           require_parameters: true
           allow_fallbacks: false
-  # Increment 1 only: the negative control. If the provider block arrives, OpenRouter finds no provider and
-  # every request must fail upstream.
-  - model_name: qwen3.8-or-neg
-    litellm_params:
-      model: openrouter/qwen/qwen3.8-27b
-      api_key: os.environ/OPENROUTER_API_KEY
-      timeout: 600
-      extra_body:
-        provider:
-          only: ["bestaat-niet"]
-          allow_fallbacks: false
 
 litellm_settings:
   turn_off_message_logging: true
@@ -39,7 +29,7 @@ litellm_settings:
 router_settings:
   # One deployment per model and no fallbacks, so a cooldown has nothing to route around: after an upstream error it would
   # only answer the next requests for 5 s with LiteLLM's own 429 ("No deployments available"). That hides real upstream
-  # answers from the measurement (the negative control fails upstream on purpose) and from the harness. Seen on 1.83.3.
+  # answers from the harness. Seen on 1.83.3.
   disable_cooldowns: true
 
 general_settings:

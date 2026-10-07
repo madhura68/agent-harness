@@ -1,5 +1,6 @@
 # /etc/systemd/system/litellm-ollama-bridge.service: a copy of max2's dsh-ollama-bridge.service for the litellm
-# network. M45 increment 1 only starts it during the trial window; it is never enabled.
+# network. Since M45-2d it is an enabled unit under ops-agent (the ops wrapper installs and starts it); the increment-1
+# trial only started it by hand during the trial window.
 [Unit]
 Description=litellm container -> Ollama bridge (172.30.82.1:11434 -> 127.0.0.1:11434)
 After=docker.service ollama.service
