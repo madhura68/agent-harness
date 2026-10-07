@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -30,10 +30,16 @@ const LOCK_FREE = ['status', 'stop']
 const LOCKED = ACTIONS.filter((a) => !LOCK_FREE.includes(a))
 /** Every invocation that takes the lock: the locked actions and provider-key with a valid name. */
 const LOCKED_CASES: string[][] = [...LOCKED.map((a) => [a]), ['provider-key', 'OPENROUTER_API_KEY']]
+/** Actions that are built in an earlier part (own describe blocks); the rest still answers 70. */
+const BUILT = ['install']
+const NOT_BUILT = ACTIONS.filter((a) => !BUILT.includes(a))
+const NOT_BUILT_LOCKED_CASES = LOCKED_CASES.filter((c) => !BUILT.includes(c[0]))
 const COMMAND_STUBS = ['systemctl', 'runuser', 'git', 'npm', 'docker', 'curl', 'flock']
 const FILE_SHIMS = ['mktemp', 'mv', 'chmod', 'rm', 'cat', 'sed', 'awk', 'grep', 'tee', 'env', 'id', 'dirname', 'basename', 'cp', 'ln', 'mkdir', 'touch', 'printf']
 
 const FAKE_KEY = 'sk-fake-not-a-real-key-0123456789'
+
+const LOG_LINE = `printf '%s' "\${0##*/}" >> "$STUB_LOG"; for a in "$@"; do printf ' %s' "$a" >> "$STUB_LOG"; done; printf '\\n' >> "$STUB_LOG"`
 
 let dir: string
 let log: string
@@ -45,7 +51,7 @@ function setup(): void {
   mkdirSync(join(dir, 'bin'))
   mkdirSync(join(dir, 'etc'))
   mkdirSync(join(dir, 'state'))
-  const logLine = `printf '%s' "\${0##*/}" >> "$STUB_LOG"; for a in "$@"; do printf ' %s' "$a" >> "$STUB_LOG"; done; printf '\\n' >> "$STUB_LOG"`
+  const logLine = LOG_LINE
   for (const naam of COMMAND_STUBS) {
     let body = logLine
     if (naam === 'flock') body += '\nif [ -n "$STUB_FLOCK_RC" ]; then exit "$STUB_FLOCK_RC"; fi\nif [ -n "$STUB_FLOCK_BUSY" ]; then exit 1; fi\nexit 0'
@@ -132,15 +138,16 @@ describe('ops wrapper: de actielijst', () => {
   })
 
   it('kent alle elf acties: elke actie die nog niet is gebouwd geeft 70 met een duidelijke regel, de rest van de wrapper blijft ongemoeid', () => {
-    for (const actie of ACTIONS) {
+    for (const actie of NOT_BUILT) {
       const res = run([actie])
       expect(res.code, actie).toBe(70)
-      expect(res.stderr, actie).toMatch(new RegExp(`${actie}: nog niet geïmplementeerd \\(deel [cde]\\)`))
+      expect(res.stderr, actie).toMatch(new RegExp(`${actie}: nog niet geïmplementeerd \\(deel [de]\\)`))
     }
+    expect(run(['install']).stderr).not.toContain('nog niet geïmplementeerd')
   })
 
   it('neemt voor elke actie behalve status en stop eerst de exclusieve flock (flock -n 9) en roept verder geen stub aan', () => {
-    for (const args of LOCKED_CASES) {
+    for (const args of NOT_BUILT_LOCKED_CASES) {
       writeFileSync(log, '')
       rmSync(join(dir, 'ops.lock'), { force: true })
       run(args, { input: `${FAKE_KEY}\n` })
@@ -202,12 +209,12 @@ describe('ops wrapper: runuser en stilstand (helpers)', () => {
   it('draait git en npm als janpeter via runuser, nooit rechtstreeks', () => {
     const res = runHelper('owner_git -C /srv/x status; owner_npm ci')
     expect(res.code).toBe(0)
-    expect(stubCalls()).toEqual(['runuser -u janpeter -- git -C /srv/x status', 'runuser -u janpeter -- npm ci'])
+    expect(stubCalls()).toEqual(['runuser -u janpeter -- env HOME=/home/janpeter git -C /srv/x status', 'runuser -u janpeter -- env HOME=/home/janpeter npm ci'])
   })
 
-  it('houdt de eigenaar overschrijfbaar voor tests, met janpeter als vaste standaard', () => {
-    runHelper('owner_git log', { AH_OWNER: 'tester' })
-    expect(stubCalls()).toEqual(['runuser -u tester -- git log'])
+  it('houdt de eigenaar en zijn home overschrijfbaar voor tests, met janpeter en /home/janpeter als vaste standaard, en zet HOME op die home (runuser behoudt HOME=/root)', () => {
+    runHelper('owner_git log; owner_npm ci', { AH_OWNER: 'tester', AH_OWNER_HOME: '/home/tester' })
+    expect(stubCalls()).toEqual(['runuser -u tester -- env HOME=/home/tester git log', 'runuser -u tester -- env HOME=/home/tester npm ci'])
   })
 
   it('telt alleen inactive en failed als stilstand', () => {
@@ -403,5 +410,425 @@ describe('ops wrapper: provider-key', () => {
     const res = run(['provider-key', 'OPENROUTER_API_KEY'], { input: `${FAKE_KEY}\n` })
     expect(res.stdout + res.stderr).toMatch(/OPENROUTER_API_KEY/)
     secretFree(res)
+  })
+})
+
+// --- releases, units installeren en install (deel c) ------------------------------------------------------------------------
+
+const SHA = '1234567890abcdef1234567890abcdef12345678'
+const SHA2 = 'fedcba0987654321fedcba0987654321fedcba09'
+const REPO_DEPLOY = fileURLToPath(new URL('../deploy', import.meta.url))
+const REPO_MAX2 = join(REPO_DEPLOY, 'max2')
+const MASTER_RE = /^sk-[0-9a-f]{48}$/
+
+/** runuser runs the rest of its command line (after `-u <user> --`), so env/git/npm/touch behave as janpeter's would; clone copies the repo's own deploy/ dir. */
+function installStubs(): void {
+  // node is the real one: the swap must be tested on a real file system (rename(2) does not follow the link).
+  symlinkSync(process.execPath, join(dir, 'bin', 'node'))
+  writeStub('runuser', `${LOG_LINE}\nshift 3\nexec "$@"`)
+  writeStub(
+    'git',
+    `${LOG_LINE}
+case "$1" in
+  ls-remote)
+    if [ -n "$STUB_LSREMOTE_OUT" ]; then printf '%s\\n' "$STUB_LSREMOTE_OUT"; else printf '%s\\trefs/heads/main\\n' "$STUB_HEAD"; fi
+    exit "\${STUB_LSREMOTE_RC:-0}" ;;
+  clone)
+    if [ -n "$STUB_CLONE_RC" ]; then exit "$STUB_CLONE_RC"; fi
+    mkdir -p "$3" && cp -R "$STUB_SRC_DEPLOY" "$3/deploy"; exit $? ;;
+  -C)
+    if [ "$3" = checkout ] && [ -n "$STUB_CHECKOUT_RC" ]; then exit "$STUB_CHECKOUT_RC"; fi ;;
+esac
+exit 0`,
+  )
+  writeStub('npm', `${LOG_LINE}\nprintf 'npmcwd %s\\n' "$(pwd)" >> "$STUB_LOG"\nif [ "$STUB_NPM_FAIL" = "$1" ]; then exit 1; fi\nexit 0`)
+}
+
+function installEnv(extra: Record<string, string> = {}): Record<string, string> {
+  return {
+    // chown lives in /usr/sbin on macOS; the stubs still come first
+    AH_PATH: `${join(dir, 'bin')}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    AH_SRV: join(dir, 'srv'),
+    AH_UNIT_DIR: join(dir, 'units'),
+    AH_OWNER: userInfo().username,
+    AH_OWNER_HOME: '/home/janpeter',
+    AH_REPO_URL: 'https://git.example.invalid/janpeter/agent-harness.git',
+    STUB_HEAD: SHA,
+    STUB_SRC_DEPLOY: REPO_DEPLOY,
+    ...extra,
+  }
+}
+
+const srv = (...p: string[]): string => join(dir, 'srv', ...p)
+const etc = (...p: string[]): string => join(dir, 'etc', ...p)
+const units = (...p: string[]): string => join(dir, 'units', ...p)
+const harnessEnv = (): string => etc('harness-litellm.env')
+const install = (extra: Record<string, string> = {}) => run(['install'], { env: installEnv(extra) })
+const systemctlCalls = (): string[] => stubCalls().filter((c) => c.startsWith('systemctl'))
+const stateOf = (unit: string, state: string): void => writeFileSync(join(dir, 'state', unit), state)
+
+/** A release dir as the build leaves it (the shape of the repo's deploy/), without calling the stubs. */
+function fakeRelease(commit: string, built = true): void {
+  mkdirSync(srv('releases', commit), { recursive: true })
+  cpSync(REPO_DEPLOY, srv('releases', commit, 'deploy'), { recursive: true })
+  if (built) writeFileSync(srv('releases', commit, '.built'), '')
+}
+
+describe('ops wrapper: install en releases (deel c)', () => {
+  beforeEach(() => {
+    installStubs()
+    mkdirSync(units(), { recursive: true })
+    stateOf('agent-harness.service', 'inactive')
+  })
+
+  describe('stilstand en lock', () => {
+    it('weigert install met 75 bij active en activating, zonder git, npm, docker of daemon-reload, en maakt niets aan', () => {
+      for (const toestand of ['active', 'activating', 'deactivating', '']) {
+        writeFileSync(log, '')
+        stateOf('agent-harness.service', toestand)
+        const res = install()
+        expect(res.code, JSON.stringify(toestand)).toBe(75)
+        expect(res.stderr).toContain('agent-harness.service')
+        expect(stubCalls(), toestand).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+      }
+      expect(existsSync(srv())).toBe(false)
+      expect(existsSync(etc('litellm'))).toBe(false)
+      expect(existsSync(litellmEnv())).toBe(false)
+    })
+
+    it('gaat door bij inactive en failed', () => {
+      for (const toestand of ['inactive', 'failed']) {
+        stateOf('agent-harness.service', toestand)
+        const res = install()
+        expect(res.code, `${toestand}: ${res.stderr}`).toBe(0)
+      }
+    })
+
+    it('geeft 75 bij een bezette lock, vóór elke andere aanroep', () => {
+      const res = install({ STUB_FLOCK_BUSY: '1' })
+      expect(res.code).toBe(75)
+      expect(stubCalls()).toEqual(['flock -n 9'])
+    })
+  })
+
+  describe('eerste install', () => {
+    it('bouwt de release van origin/main als janpeter met HOME=janpeters home, wisselt current en noemt de aanroepen in de goede volgorde', () => {
+      const res = install()
+      expect(res.code, res.stderr).toBe(0)
+      const url = 'https://git.example.invalid/janpeter/agent-harness.git'
+      const rel = srv('releases', SHA)
+      const onlyOwner = stubCalls().filter((c) => c.startsWith('runuser') || c.startsWith('flock') || c.startsWith('systemctl'))
+      const me = userInfo().username
+      expect(onlyOwner).toEqual([
+        'flock -n 9',
+        'systemctl is-active agent-harness.service',
+        `runuser -u ${me} -- env HOME=/home/janpeter git ls-remote ${url} refs/heads/main`,
+        `runuser -u ${me} -- env HOME=/home/janpeter git clone ${url} ${rel}`,
+        `runuser -u ${me} -- env HOME=/home/janpeter git -C ${rel} checkout --detach ${SHA}`,
+        `runuser -u ${me} -- env HOME=/home/janpeter npm ci`,
+        `runuser -u ${me} -- env HOME=/home/janpeter npm run build`,
+        `runuser -u ${me} -- env HOME=/home/janpeter touch ${rel}/.built`,
+        'systemctl daemon-reload', // units installeren
+        'systemctl daemon-reload', // brug-unit ontbrak
+      ])
+      // npm draait in de releasemap, niet in de cwd van root
+      const cwds = calls().filter((c) => c.startsWith('npmcwd '))
+      expect(cwds).toHaveLength(2)
+      for (const c of cwds) expect(c.endsWith(`/releases/${SHA}`), c).toBe(true)
+      expect(existsSync(join(rel, '.built'))).toBe(true)
+      expect(readlinkSync(srv('current'))).toBe(`releases/${SHA}`)
+      expect(existsSync(srv('current.new'))).toBe(false)
+    })
+
+    it('zet root-git nergens in: elke git- en npm-aanroep staat achter runuser', () => {
+      install()
+      const direct = stubCalls().filter((c) => c.split(' ')[0] === 'git' || c.split(' ')[0] === 'npm')
+      // elke stub-aanroep komt via `runuser … env HOME=… git|npm` (de stubs zelf loggen daarna nog eens): tel ze tegen de runuser-regels
+      const viaRunuser = stubCalls().filter((c) => c.startsWith('runuser') && / (git|npm) /.test(c))
+      expect(direct.length).toBe(viaRunuser.length)
+      expect(viaRunuser.length).toBeGreaterThan(0)
+      for (const c of viaRunuser) expect(c).toContain('env HOME=/home/janpeter ')
+    })
+
+    it('installeert beide units uit current, zonder enable of start, en laat de dienst ongestart', () => {
+      install()
+      for (const u of ['agent-harness.service', 'agent-harness-probe.service']) {
+        expect(readFileSync(units(u), 'utf8'), u).toBe(readFileSync(join(REPO_MAX2, u), 'utf8'))
+        expect(mode(units(u)), u).toBe('644')
+      }
+      const verbs = systemctlCalls().map((c) => c.split(' ')[1])
+      expect(verbs.filter((v) => v !== 'is-active' && v !== 'daemon-reload')).toEqual([])
+      expect(calls().some((c) => /^docker /.test(c))).toBe(false)
+    })
+
+    it('maakt de mappen en bestanden met de goede modi, en kopieert harness.json, config.yaml en compose.yml uit current', () => {
+      install()
+      expect(mode(srv())).toBe('755')
+      expect(mode(srv('releases'))).toBe('755')
+      expect(statSync(srv('releases')).uid).toBe(userInfo().uid)
+      expect(mode(etc('litellm'))).toBe('755')
+      expect(readFileSync(etc('harness.json'), 'utf8')).toBe(readFileSync(join(REPO_MAX2, 'harness.json'), 'utf8'))
+      expect(readFileSync(etc('litellm', 'config.yaml'), 'utf8')).toBe(readFileSync(join(REPO_MAX2, 'litellm', 'config.yaml'), 'utf8'))
+      expect(readFileSync(etc('litellm', 'compose.yml'), 'utf8')).toBe(readFileSync(join(REPO_MAX2, 'litellm', 'compose.yml'), 'utf8'))
+      for (const p of [etc('harness.json'), etc('litellm', 'config.yaml'), etc('litellm', 'compose.yml')]) expect(mode(p), p).toBe('644')
+      expect(readFileSync(units('litellm-ollama-bridge.service'), 'utf8')).toBe(readFileSync(join(REPO_MAX2, 'litellm', 'litellm-ollama-bridge.service'), 'utf8'))
+      expect(mode(units('litellm-ollama-bridge.service'))).toBe('644')
+    })
+
+    it('maakt een masterkey van sk- plus 48 hex-tekens, schrijft die identiek naar beide env-bestanden (0600), en drukt hem nergens af', () => {
+      const res = install()
+      expect(res.code, res.stderr).toBe(0)
+      const m = /^LITELLM_MASTER_KEY=(.*)$/m.exec(readFileSync(litellmEnv(), 'utf8'))
+      expect(m).not.toBeNull()
+      const key = m![1]
+      expect(key).toMatch(MASTER_RE)
+      expect(readFileSync(litellmEnv(), 'utf8')).toBe(`LITELLM_MASTER_KEY=${key}\n`)
+      expect(readFileSync(harnessEnv(), 'utf8')).toBe(`LITELLM_MASTER_KEY=${key}\n`)
+      expect(mode(litellmEnv())).toBe('600')
+      expect(mode(harnessEnv())).toBe('600')
+      expect(res.stdout + res.stderr).not.toContain(key)
+      expect(res.stdout + res.stderr).not.toContain('sk-')
+      expect(readFileSync(log, 'utf8')).not.toContain(key)
+      expect(readFileSync(log, 'utf8')).not.toContain('LITELLM_MASTER_KEY')
+      // geen tijdelijk bestand achter
+      expect(readdirSync(etc()).sort()).toEqual(['harness-litellm.env', 'harness.json', 'litellm', 'litellm.env'])
+      expect(readdirSync(etc('litellm')).sort()).toEqual(['compose.yml', 'config.yaml'])
+    })
+
+    it('maakt twee verschillende installs onafhankelijk: een nieuwe omgeving krijgt een andere sleutel (echte willekeur)', () => {
+      install()
+      const eerste = readFileSync(litellmEnv(), 'utf8')
+      rmSync(litellmEnv())
+      rmSync(harnessEnv())
+      install()
+      expect(readFileSync(litellmEnv(), 'utf8')).not.toBe(eerste)
+    })
+  })
+
+  describe('tweede install (idempotent)', () => {
+    it('doet met een bestaande current geen git- of npm-aanroep en meldt dat de release bestaat', () => {
+      expect(install().code).toBe(0)
+      writeFileSync(log, '')
+      const res = install()
+      expect(res.code, res.stderr).toBe(0)
+      expect(res.stdout).toContain('release bestaat; bijwerken via release-update')
+      const names = stubCalls().map((c) => c.split(' ')[0])
+      expect(names).not.toContain('git')
+      expect(names).not.toContain('npm')
+      expect(names).not.toContain('docker')
+      expect(stubCalls().filter((c) => c.startsWith('runuser'))).toEqual([])
+      expect(readlinkSync(srv('current'))).toBe(`releases/${SHA}`)
+    })
+
+    it('laat een bestaande harness.json, bestaande LiteLLM-bestanden en beide sleutels ongemoeid', () => {
+      install()
+      const key = readFileSync(litellmEnv(), 'utf8')
+      writeFileSync(etc('harness.json'), '{"eigen":"aanpassing"}\n')
+      writeFileSync(etc('litellm', 'config.yaml'), '# eigen config\n')
+      writeFileSync(etc('litellm', 'compose.yml'), '# eigen compose\n')
+      chmodSync(etc('litellm', 'config.yaml'), 0o640)
+      writeFileSync(harnessEnv(), 'LITELLM_MASTER_KEY=sk-eigen-andere-sleutel\n', { mode: 0o600 })
+      const res = install()
+      expect(res.code, res.stderr).toBe(0)
+      expect(readFileSync(etc('harness.json'), 'utf8')).toBe('{"eigen":"aanpassing"}\n')
+      expect(readFileSync(etc('litellm', 'config.yaml'), 'utf8')).toBe('# eigen config\n')
+      expect(readFileSync(etc('litellm', 'compose.yml'), 'utf8')).toBe('# eigen compose\n')
+      expect(readFileSync(litellmEnv(), 'utf8')).toBe(key)
+      expect(readFileSync(harnessEnv(), 'utf8')).toBe('LITELLM_MASTER_KEY=sk-eigen-andere-sleutel\n')
+    })
+
+    it('doet na een onveranderde brug-unit maar één daemon-reload (de units-stap)', () => {
+      install()
+      writeFileSync(log, '')
+      install()
+      expect(systemctlCalls().filter((c) => c === 'systemctl daemon-reload')).toHaveLength(1)
+      expect(readdirSync(units()).filter((f) => f.includes('.bak-'))).toEqual([])
+    })
+  })
+
+  describe('de sleutel uit één bron', () => {
+    it('geeft harness-litellm.env dezelfde sleutel als een bestaande litellm.env, en maakt geen nieuwe', () => {
+      mkdirSync(etc(), { recursive: true })
+      const key = `sk-${'ab12'.repeat(12)}`
+      writeFileSync(litellmEnv(), `OPENROUTER_API_KEY=fake-or\nLITELLM_MASTER_KEY=${key}\n`, { mode: 0o600 })
+      const res = install()
+      expect(res.code, res.stderr).toBe(0)
+      expect(readFileSync(litellmEnv(), 'utf8')).toBe(`OPENROUTER_API_KEY=fake-or\nLITELLM_MASTER_KEY=${key}\n`)
+      expect(readFileSync(harnessEnv(), 'utf8')).toBe(`LITELLM_MASTER_KEY=${key}\n`)
+      expect(mode(harnessEnv())).toBe('600')
+      expect(readFileSync(log, 'utf8')).not.toContain(key)
+      expect(res.stdout + res.stderr).not.toContain(key)
+    })
+
+    it('voegt de sleutel toe aan een litellm.env zonder (of met een lege) LITELLM_MASTER_KEY, met de rest ongewijzigd, en houdt modus 0600', () => {
+      for (const voor of ['OPENROUTER_API_KEY=fake-or\n', 'OPENROUTER_API_KEY=fake-or\nLITELLM_MASTER_KEY=\n', 'OPENROUTER_API_KEY=fake-or']) {
+        rmSync(etc(), { recursive: true, force: true })
+        mkdirSync(etc(), { recursive: true })
+        writeFileSync(litellmEnv(), voor, { mode: 0o644 })
+        chmodSync(litellmEnv(), 0o644)
+        const res = install()
+        expect(res.code, res.stderr).toBe(0)
+        const inhoud = readFileSync(litellmEnv(), 'utf8')
+        const m = /^(OPENROUTER_API_KEY=fake-or\n)LITELLM_MASTER_KEY=(sk-[0-9a-f]{48})\n$/.exec(inhoud)
+        expect(m, JSON.stringify(voor)).not.toBeNull()
+        expect(mode(litellmEnv())).toBe('600')
+        expect(readFileSync(harnessEnv(), 'utf8')).toBe(`LITELLM_MASTER_KEY=${m![2]}\n`)
+      }
+    })
+
+    it('herstelt na een onderbroken install: litellm.env heeft de sleutel, harness-litellm.env ontbreekt', () => {
+      install()
+      const key = readFileSync(litellmEnv(), 'utf8')
+      rmSync(harnessEnv())
+      install()
+      expect(readFileSync(litellmEnv(), 'utf8')).toBe(key)
+      expect(readFileSync(harnessEnv(), 'utf8')).toBe(key)
+    })
+  })
+
+  describe('de brug-unit', () => {
+    it('vervangt een afwijkende brug-unit (increment 1) door die uit current, bewaart de vorige als back-up en doet daarna een daemon-reload', () => {
+      const oud = '# increment 1: never enabled\n[Unit]\nDescription=oud\n'
+      writeFileSync(units('litellm-ollama-bridge.service'), oud)
+      const res = install()
+      expect(res.code, res.stderr).toBe(0)
+      expect(readFileSync(units('litellm-ollama-bridge.service'), 'utf8')).toBe(readFileSync(join(REPO_MAX2, 'litellm', 'litellm-ollama-bridge.service'), 'utf8'))
+      const back = readdirSync(units()).filter((f) => f.startsWith('litellm-ollama-bridge.service.bak-'))
+      expect(back).toHaveLength(1)
+      expect(readFileSync(units(back[0]), 'utf8')).toBe(oud)
+      const sc = systemctlCalls()
+      expect(sc.filter((c) => c === 'systemctl daemon-reload')).toHaveLength(2) // units-stap + na de vervanging
+      expect(sc[sc.length - 1]).toBe('systemctl daemon-reload')
+    })
+
+    it('laat een brug-unit die gelijk is aan die uit current ongemoeid (geen back-up)', () => {
+      const src = readFileSync(join(REPO_MAX2, 'litellm', 'litellm-ollama-bridge.service'), 'utf8')
+      writeFileSync(units('litellm-ollama-bridge.service'), src)
+      install()
+      expect(readdirSync(units()).filter((f) => f.includes('.bak-'))).toEqual([])
+      expect(systemctlCalls().filter((c) => c === 'systemctl daemon-reload')).toHaveLength(1)
+    })
+  })
+
+  describe('de build', () => {
+    it('slaat een release met .built over zonder git- of npm-aanroep', () => {
+      mkdirSync(srv('releases'), { recursive: true })
+      fakeRelease(SHA)
+      const res = runHelper(`build_release ${SHA}`, installEnv())
+      expect(res.code, res.stderr).toBe(0)
+      expect(stubCalls()).toEqual([])
+    })
+
+    it('verwijdert een onvolledige releasemap eerst (een afgebroken aanvraag) en bouwt opnieuw, met .built pas aan het eind', () => {
+      fakeRelease(SHA, false)
+      writeFileSync(srv('releases', SHA, 'half-gebouwd'), 'x')
+      const res = runHelper(`build_release ${SHA}`, installEnv())
+      expect(res.code, res.stderr).toBe(0)
+      expect(existsSync(srv('releases', SHA, 'half-gebouwd'))).toBe(false)
+      expect(existsSync(srv('releases', SHA, '.built'))).toBe(true)
+      const names = stubCalls().filter((c) => c.startsWith('runuser')).map((c) => c.replace(/^runuser -u \S+ -- env HOME=\S+ /, ''))
+      expect(names.map((n) => n.split(' ').slice(0, 2).join(' '))).toEqual(['rm -rf', 'git clone', 'git -C', 'npm ci', 'npm run', 'touch ' + srv('releases', SHA, '.built')].map((x) => x))
+    })
+
+    it.each([
+      ['clone', { STUB_CLONE_RC: '128' }],
+      ['checkout', { STUB_CHECKOUT_RC: '1' }],
+      ['npm ci', { STUB_NPM_FAIL: 'ci' }],
+      ['npm run build', { STUB_NPM_FAIL: 'run' }],
+    ])('geeft 74 bij een mislukte %s, zonder .built en zonder current aan te raken', (_naam, extra) => {
+      fakeRelease(SHA2)
+      symlinkSync(`releases/${SHA2}`, srv('current'))
+      const res = runHelper(`build_release ${SHA}`, installEnv(extra))
+      expect(res.code).toBe(74)
+      expect(existsSync(srv('releases', SHA, '.built'))).toBe(false)
+      expect(readlinkSync(srv('current'))).toBe(`releases/${SHA2}`)
+      // een volgende poging begint schoon
+      expect(runHelper(`build_release ${SHA}`, installEnv()).code).toBe(0)
+      expect(existsSync(srv('releases', SHA, '.built'))).toBe(true)
+    })
+
+    it('laat install bij een mislukte build zonder current, zonder units en zonder sleutel achter', () => {
+      const res = install({ STUB_NPM_FAIL: 'run' })
+      expect(res.code).toBe(74)
+      expect(existsSync(srv('current'))).toBe(false)
+      expect(readdirSync(units())).toEqual([])
+      expect(existsSync(litellmEnv())).toBe(false)
+      expect(systemctlCalls().filter((c) => c === 'systemctl daemon-reload')).toEqual([])
+    })
+
+    it.each(['', 'main', '../x', 'ABCDEF', SHA.slice(1), `${SHA}0`, `${SHA};id`])('weigert de commit %j (64), zonder één aanroep', (commit) => {
+      const res = runHelper(`build_release '${commit}'`, installEnv())
+      expect(res.code).toBe(64)
+      expect(stubCalls()).toEqual([])
+    })
+
+    it('geeft 74 als ls-remote geen geldige commit levert, zonder te clonen', () => {
+      for (const extra of [{ STUB_LSREMOTE_OUT: 'geen-sha\trefs/heads/main' }, { STUB_LSREMOTE_OUT: '' }, { STUB_LSREMOTE_RC: '128' }]) {
+        writeFileSync(log, '')
+        const res = install({ ...extra, STUB_HEAD: '' })
+        expect(res.code, JSON.stringify(extra)).toBe(74)
+        expect(stubCalls().some((c) => / git clone /.test(c))).toBe(false)
+        expect(existsSync(srv('current'))).toBe(false)
+      }
+    })
+  })
+
+  describe('current wisselen (echte node, echt bestandssysteem)', () => {
+    const swap = (commit: string) => runHelper(`swap_current ${commit}`, installEnv())
+
+    it('maakt current als hij nog niet bestaat, met een relatief linkdoel', () => {
+      fakeRelease(SHA)
+      const res = swap(SHA)
+      expect(res.code, res.stderr).toBe(0)
+      expect(readlinkSync(srv('current'))).toBe(`releases/${SHA}`)
+      expect(existsSync(srv('current', 'deploy', 'max2', 'agent-harness.service'))).toBe(true)
+      expect(existsSync(srv('current.new'))).toBe(false)
+    })
+
+    it('vervangt een bestaande current atomair door de nieuwe release', () => {
+      fakeRelease(SHA2)
+      symlinkSync(`releases/${SHA2}`, srv('current'))
+      fakeRelease(SHA)
+      expect(swap(SHA).code).toBe(0)
+      expect(readlinkSync(srv('current'))).toBe(`releases/${SHA}`)
+      expect(readdirSync(srv()).sort()).toEqual(['current', 'releases'])
+    })
+
+    it('laat een achtergebleven current.new (onderbroken wissel) de oude release niet vervuilen: geen link ín de oude release, current wijst naar de nieuwe', () => {
+      fakeRelease(SHA2)
+      symlinkSync(`releases/${SHA2}`, srv('current'))
+      symlinkSync(`releases/${SHA2}`, srv('current.new')) // de gemeten val: `ln -s releases/C current.new` zou een link ín releases/B maken
+      fakeRelease(SHA)
+      const before = readdirSync(srv('releases', SHA2)).sort()
+      const res = swap(SHA)
+      expect(res.code, res.stderr).toBe(0)
+      expect(readlinkSync(srv('current'))).toBe(`releases/${SHA}`)
+      expect(readdirSync(srv('releases', SHA2)).sort()).toEqual(before)
+      expect(existsSync(srv('current.new'))).toBe(false)
+    })
+
+    it('wisselt met ln of mv nooit: die volgen een bestaande link naar een map', () => {
+      fakeRelease(SHA)
+      swap(SHA)
+      // current.new als link naar een map: de wissel gebruikt alleen node
+      expect(calls().filter((c) => /^(ln|mv) /.test(c))).toEqual([])
+    })
+
+    it('weigert een release zonder .built (current blijft zoals hij was) en een ongeldige commit', () => {
+      fakeRelease(SHA2)
+      symlinkSync(`releases/${SHA2}`, srv('current'))
+      fakeRelease(SHA, false)
+      expect(swap(SHA).code).toBe(66)
+      expect(swap('../x').code).toBe(64)
+      expect(readlinkSync(srv('current'))).toBe(`releases/${SHA2}`)
+    })
+
+    it('weigert (74) als current een gewone map is, en laat die ongemoeid', () => {
+      fakeRelease(SHA)
+      mkdirSync(srv('current'))
+      writeFileSync(srv('current', 'x'), 'bewaar')
+      expect(swap(SHA).code).toBe(74)
+      expect(readFileSync(srv('current', 'x'), 'utf8')).toBe('bewaar')
+    })
   })
 })
