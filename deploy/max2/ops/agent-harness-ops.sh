@@ -37,7 +37,8 @@
 # link without following it; `ln -s` and `mv` would follow an existing link to a directory, and `mv -T` is GNU only), and
 # install_units installs both worker units from current (never enable or start). release-update and release-rollback reuse them.
 #
-# State files in AH_STATE_DIR (/var/lib/agent-harness), each one commit plus a newline, always written through a temp file and rename:
+# State files in AH_STATE_DIR (/var/lib/agent-harness, writable by the owner), each one commit plus a newline. Root reads and writes them
+# only through node on a file descriptor (O_NOFOLLOW/O_NONBLOCK read, O_EXCL temp file + rename write), never by a checked path:
 #   release.prev  the release `current` pointed at before the last release-update (release-rollback never changes it)
 #   mcp.built     the commit of the last successful MCP install in the mcp-stable checkout (first use: its HEAD)
 #   mcp.prev      the commit mcp.built had before the last update to another commit (mcp-rollback never changes it)
@@ -142,8 +143,9 @@ make_temp_beside() {
 }
 
 publish_temp() { # $1 = target, $2 = mode
-  chmod "$2" "$TEMP_FILE"
-  mv -f -- "$TEMP_FILE" "$1"
+  # A failure here is 73 with a line, never a bare `set -e` exit 1 (1 means "checkout not clean"); the EXIT trap removes the temp file.
+  chmod "$2" "$TEMP_FILE" || die 73 "rechten van het tijdelijke bestand voor $1 zetten mislukt"
+  mv -f -- "$TEMP_FILE" "$1" || die 73 "tijdelijk bestand naar $1 verplaatsen mislukt"
   TEMP_FILE=""
 }
 
@@ -281,18 +283,65 @@ require_state_dir() {
   [[ -d $AH_STATE_DIR ]] || die 66 "map $AH_STATE_DIR ontbreekt"
 }
 
-# Sets STATE_COMMIT to the commit in a state file ("" when the file is missing). A symlink or a first line that is no full commit
-# is 75, except with a second argument (lenient: the caller overwrites the file anyway), which reads it as missing.
+# The state files live in AH_STATE_DIR, which the owner (janpeter) can write while root reads and writes the files. A path that root
+# checks and then opens (-L, then `read <file`; mktemp, then `> $temp`) can be swapped by the owner in between: root would follow a
+# link, write or chmod any file, or hang on a FIFO while it holds the lock. So both directions run in node, on a file descriptor:
+# - reading opens with O_NOFOLLOW|O_NONBLOCK and fstat must say regular file of at most 256 bytes (exit 2 = missing, 3 = corrupt);
+# - writing creates a temp file beside the target with O_CREAT|O_EXCL (a name that exists, a link included, is an error, never
+#   followed), sets the mode on the descriptor, writes, fsyncs, and renames it over the target (rename replaces a link entry, it
+#   never follows it). The temp name is random; a failure removes a temp file of ours and exits 1.
+STATE_READ_JS='const fs = require("fs");
+let fd;
+try {
+  fd = fs.openSync(process.argv[1], fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+} catch (e) { process.exit(e.code === "ENOENT" ? 2 : 3); }
+try {
+  const st = fs.fstatSync(fd);
+  if (!st.isFile() || st.size > 256) process.exit(3);
+  const buf = Buffer.alloc(st.size);
+  fs.readSync(fd, buf, 0, st.size, 0);
+  process.stdout.write(buf.toString("utf8"));
+} catch (e) { process.exit(3); }'
+
+STATE_WRITE_JS='const fs = require("fs"), path = require("path"), crypto = require("crypto");
+const target = process.argv[1], value = process.argv[2];
+if (!/^[0-9a-f]{40}$/.test(value)) { process.stderr.write("geen volledige commit\n"); process.exit(1); }
+const tmp = path.join(path.dirname(target), "." + path.basename(target) + "." + crypto.randomBytes(8).toString("hex"));
+let fd, created = false;
+try {
+  fd = fs.openSync(tmp, "wx", 0o644);
+  created = true;
+  fs.fchmodSync(fd, 0o644);
+  fs.writeSync(fd, value + "\n");
+  fs.fsyncSync(fd);
+  fs.closeSync(fd);
+  fd = undefined;
+  fs.renameSync(tmp, target);
+} catch (e) {
+  try { if (fd !== undefined) fs.closeSync(fd); } catch (_) {}
+  try { if (created) fs.unlinkSync(tmp); } catch (_) {}
+  process.stderr.write((e && e.code ? e.code : "fout") + "\n");
+  process.exit(1);
+}'
+
+# Sets STATE_COMMIT to the commit in a state file ("" when the file is missing). A symlink, FIFO or other non-regular file, a file over
+# 256 bytes, or a first line that is no full commit is 75, except with a second argument (lenient: the caller overwrites the file
+# anyway), which reads all of that as missing.
 STATE_COMMIT=""
 read_state_commit() { # $1 = file, $2 = "lenient" (optional)
-  local line=""
+  local out="" line rc=0
   STATE_COMMIT=""
-  [[ -e $1 || -L $1 ]] || return 0
-  if [[ -L $1 || ! -f $1 ]]; then
-    [[ ${2:-} == lenient ]] && return 0
-    die 75 "$1 is geen gewoon bestand"
-  fi
-  IFS= read -r line <"$1" || true
+  out=$(node -e "$STATE_READ_JS" "$1") || rc=$?
+  case $rc in
+    0) ;;
+    2) return 0 ;;
+    3)
+      [[ ${2:-} == lenient ]] && return 0
+      die 75 "$1 is geen gewoon bestand van een paar bytes (symlink, FIFO of te groot)"
+      ;;
+    *) die 74 "$1 kon niet worden gelezen (node rc=$rc)" ;;
+  esac
+  line=${out%%$'\n'*}
   if [[ ! $line =~ ^[0-9a-f]{40}$ ]]; then
     [[ ${2:-} == lenient ]] && return 0
     die 75 "$1 bevat geen volledige commit"
@@ -300,12 +349,12 @@ read_state_commit() { # $1 = file, $2 = "lenient" (optional)
   STATE_COMMIT=$line
 }
 
-# A state file is always written through a temp file and rename, so a crash leaves the old file or the new one, never half of one.
+# A state file is written whole or not at all (see above); a failure is 73 with a line (exit 1 means "checkout not clean").
 write_state_commit() { # $1 = file, $2 = commit
+  local err rc=0
   require_commit "$2"
-  make_temp_beside "$1"
-  printf '%s\n' "$2" >"$TEMP_FILE"
-  publish_temp "$1" 644
+  err=$(node -e "$STATE_WRITE_JS" "$1" "$2" 2>&1) || rc=$?
+  ((rc == 0)) || die 73 "$1 schrijven mislukt (${err:-rc=$rc})"
 }
 
 require_mcp_checkout() {

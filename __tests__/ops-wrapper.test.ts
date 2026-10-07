@@ -90,9 +90,9 @@ function env(extra: Record<string, string> = {}): Record<string, string> {
   }
 }
 
-function run(args: string[], opts: { input?: string; env?: Record<string, string> } = {}): { code: number | null; stdout: string; stderr: string } {
-  const res = spawnSync(process.env.OPS_BASH ?? 'bash', [SCRIPT, ...args], { input: opts.input ?? '', env: env(opts.env), encoding: 'utf8' })
-  return { code: res.status, stdout: res.stdout, stderr: res.stderr }
+function run(args: string[], opts: { input?: string; env?: Record<string, string>; timeout?: number } = {}): { code: number | null; stdout: string; stderr: string; signal: NodeJS.Signals | null } {
+  const res = spawnSync(process.env.OPS_BASH ?? 'bash', [SCRIPT, ...args], { input: opts.input ?? '', env: env(opts.env), encoding: 'utf8', timeout: opts.timeout })
+  return { code: res.status, stdout: res.stdout, stderr: res.stderr, signal: res.signal }
 }
 
 /** Source the wrapper and run a snippet with its helpers (the main dispatcher does not run when the file is sourced). */
@@ -322,7 +322,8 @@ describe('ops wrapper: provider-key', () => {
   it('laat bij een mislukte vervanging het oude bestand intact en geen tijdelijk bestand achter', () => {
     writeFileSync(litellmEnv(), `${MASTER}\n`, { mode: 0o600 })
     const res = run(['provider-key', 'OPENROUTER_API_KEY'], { input: `${FAKE_KEY}\n`, env: { STUB_MV_FAIL: '1' } })
-    expect(res.code).not.toBe(0)
+    expect(res.code).toBe(73) // not a bare set -e exit 1
+    expect(res.stderr).toContain('verplaatsen mislukt')
     expect(readFileSync(litellmEnv(), 'utf8')).toBe(`${MASTER}\n`)
     expect(readdirSync(join(dir, 'etc'))).toEqual(['litellm.env'])
     secretFree(res)
@@ -958,6 +959,38 @@ describe('ops wrapper: stop, start, probe, release-* en mcp-* (deel d)', () => {
   const failNodeOnce = (): void => writeFileSync(join(dir, 'state', 'node-fail-once'), '')
   const failReloadOnce = (): void => writeFileSync(join(dir, 'state', 'fail-reload-once'), '')
 
+  /** git, npm and the checkout as one fake mcp-stable: HEAD and origin/main are files; flags in STUB_MCP make steps fail. */
+  function mcpSetup(): void {
+    mkdirSync(MCP())
+    mkdirSync(MCPSTATE())
+    writeFileSync(join(MCPSTATE(), 'head'), `${RA}\n`)
+    writeFileSync(join(MCPSTATE(), 'remote'), `${RB}\n`)
+    writeStub(
+      'git',
+      `${LOG_LINE}
+M="$STUB_MCP"
+[ "$1" = -C ] && shift 2
+case "$1" in
+status) [ -f "$M/dirty" ] && echo ' M prisma/schema.prisma'; [ -f "$M/generated" ] && [ -f "$M/dirty-after-generate" ] && echo ' M prisma/schema.prisma'; exit 0 ;;
+fetch) [ -f "$M/fail-fetch" ] && exit 1; exit 0 ;;
+rev-parse) case "$2" in origin/main) cat "$M/remote" ;; HEAD) cat "$M/head" ;; *) exit 1 ;; esac; exit 0 ;;
+merge) [ "$2" = --ff-only ] || exit 2; [ -f "$M/fail-merge" ] && exit 1; printf '%s\\n' "$3" > "$M/head"; exit 0 ;;
+reset) [ "$2" = --hard ] || exit 2; [ -f "$M/fail-reset" ] && exit 1; printf '%s\\n' "$3" > "$M/head"; rm -f "$M/dirty" "$M/generated"; exit 0 ;;
+submodule) [ -f "$M/fail-submodule" ] && exit 1; exit 0 ;;
+esac
+exit 0`,
+    )
+    writeStub(
+      'npm',
+      `${LOG_LINE}
+printf 'npmcwd %s\\n' "$(pwd)" >> "$STUB_LOG"
+if [ "$STUB_NPM_FAIL" = "$1" ] || [ "$STUB_NPM_FAIL" = "$1 $2" ]; then exit 1; fi
+if [ "$1 $2" = "run prisma:generate" ]; then : > "$STUB_MCP/generated"; fi
+exit 0`,
+    )
+  }
+  const gitCallsAll = (): string[] => view().filter((c) => c.startsWith('git '))
+
   beforeEach(() => {
     installStubs()
     mkdirSync(units(), { recursive: true })
@@ -966,7 +999,15 @@ describe('ops wrapper: stop, start, probe, release-* en mcp-* (deel d)', () => {
     stateOf('agent-harness-worker.service', 'inactive')
     // node: the real one, except that a flag file makes the next call fail once (an interruption inside the switch)
     rmSync(join(dir, 'bin', 'node'))
-    writeStub('node', `if [ -f "$STUB_STATE/node-fail-once" ]; then rm -f "$STUB_STATE/node-fail-once"; exit 1; fi\nexec "$STUB_REAL_NODE" "$@"`)
+    // (the flag fails only the switch of \`current\`; STUB_STATE_WRITE_FAIL fails every state-file writer; STUB_NODE_PRELOAD preloads a module)
+    writeStub(
+      'node',
+      `case "$*" in
+  *current.new*) if [ -f "$STUB_STATE/node-fail-once" ]; then rm -f "$STUB_STATE/node-fail-once"; exit 1; fi ;;
+  *'"wx"'*) if [ -n "$STUB_STATE_WRITE_FAIL" ]; then exit 1; fi ;;
+esac
+exec "$STUB_REAL_NODE" \${STUB_NODE_PRELOAD:+-r "$STUB_NODE_PRELOAD"} "$@"`,
+    )
     // systemctl: is-active from the state files; daemon-reload fails once on a flag; start can be given an exit code
     writeStub(
       'systemctl',
@@ -1328,36 +1369,6 @@ exit 0`,
   })
 
   describe('mcp-update en mcp-rollback', () => {
-    /** git, npm and the checkout as one fake mcp-stable: HEAD and origin/main are files; flags in STUB_MCP make steps fail. */
-    function mcpStubs(): void {
-      mkdirSync(MCP())
-      mkdirSync(MCPSTATE())
-      writeFileSync(join(MCPSTATE(), 'head'), `${RA}\n`)
-      writeFileSync(join(MCPSTATE(), 'remote'), `${RB}\n`)
-      writeStub(
-        'git',
-        `${LOG_LINE}
-M="$STUB_MCP"
-[ "$1" = -C ] && shift 2
-case "$1" in
-  status) [ -f "$M/dirty" ] && echo ' M prisma/schema.prisma'; [ -f "$M/generated" ] && [ -f "$M/dirty-after-generate" ] && echo ' M prisma/schema.prisma'; exit 0 ;;
-  fetch) [ -f "$M/fail-fetch" ] && exit 1; exit 0 ;;
-  rev-parse) case "$2" in origin/main) cat "$M/remote" ;; HEAD) cat "$M/head" ;; *) exit 1 ;; esac; exit 0 ;;
-  merge) [ "$2" = --ff-only ] || exit 2; [ -f "$M/fail-merge" ] && exit 1; printf '%s\\n' "$3" > "$M/head"; exit 0 ;;
-  reset) [ "$2" = --hard ] || exit 2; [ -f "$M/fail-reset" ] && exit 1; printf '%s\\n' "$3" > "$M/head"; rm -f "$M/dirty" "$M/generated"; exit 0 ;;
-  submodule) [ -f "$M/fail-submodule" ] && exit 1; exit 0 ;;
-esac
-exit 0`,
-      )
-      writeStub(
-        'npm',
-        `${LOG_LINE}
-printf 'npmcwd %s\\n' "$(pwd)" >> "$STUB_LOG"
-if [ "$STUB_NPM_FAIL" = "$1" ] || [ "$STUB_NPM_FAIL" = "$1 $2" ]; then exit 1; fi
-if [ "$1 $2" = "run prisma:generate" ]; then : > "$STUB_MCP/generated"; fi
-exit 0`,
-      )
-    }
     const flag = (name: string): void => writeFileSync(join(MCPSTATE(), name), '')
     const unflag = (name: string): void => rmSync(join(MCPSTATE(), name), { force: true })
     const head = (): string => read(join(MCPSTATE(), 'head')).trim()
@@ -1367,7 +1378,7 @@ exit 0`,
     const setRemote = (c: string): void => writeFileSync(join(MCPSTATE(), 'remote'), `${c}\n`)
 
     beforeEach(() => {
-      mcpStubs()
+      mcpSetup()
       setBuilt(RA)
     })
 
@@ -1553,9 +1564,10 @@ exit 0`,
       expect(read(mcpPrevFile())).toBe(`${RA}\n`)
     })
 
-    it('schrijft mcp.prev en mcp.built nooit half: een mislukte rename laat het oude bestand en geen tijdelijk bestand achter', () => {
-      const res = act('mcp-update', { STUB_MV_FAIL: '1' })
-      expect(res.code).not.toBe(0)
+    it('schrijft mcp.prev en mcp.built nooit half: een mislukte schrijfactie geeft 73, laat het oude bestand en geen tijdelijk bestand achter', () => {
+      const res = act('mcp-update', { STUB_STATE_WRITE_FAIL: '1' })
+      expect(res.code).toBe(73)
+      expect(res.stderr).toContain('mcp.prev')
       expect(read(builtFile())).toBe(`${RA}\n`)
       expect(existsSync(mcpPrevFile())).toBe(false)
       expect(readdirSync(VAR())).toEqual(['mcp.built'])
@@ -1582,6 +1594,151 @@ exit 0`,
       const via = stubCalls().filter((c) => c.startsWith('runuser') && / (git|npm) /.test(c))
       expect(direct.length).toBe(via.length)
       for (const c of via) expect(c).toContain('env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 ')
+    })
+  })
+
+  describe('statusbestanden in een map van janpeter (geen symlink-race, geen hang)', () => {
+    const SENTINEL_BODY = 'doel-van-de-link: mag niet worden overschreven\n'
+    const sentinel = (): string => join(dir, 'sentinel')
+    const makeSentinel = (): void => {
+      writeFileSync(sentinel(), SENTINEL_BODY, { mode: 0o600 })
+      chmodSync(sentinel(), 0o600)
+    }
+    const sentinelIntact = (): void => {
+      expect(readFileSync(sentinel(), 'utf8')).toBe(SENTINEL_BODY)
+      expect(mode(sentinel())).toBe('600')
+    }
+    const mkfifo = (p: string): void => {
+      expect(spawnSync('mkfifo', [p]).status).toBe(0)
+    }
+    const timed = (action: string, extra: Record<string, string> = {}) => {
+      const res = run([action], { env: dEnv(extra), timeout: 20000 })
+      expect(res.signal, `${action} bleef hangen`).toBeNull()
+      return res
+    }
+
+    describe('schrijven', () => {
+      it('release-update schrijft door een symlink op het definitieve pad niet heen: de link wordt vervangen, het doel blijft ongemoeid', () => {
+        releases(RB, RA)
+        makeSentinel()
+        rmSync(prevFile())
+        symlinkSync(sentinel(), prevFile())
+        const res = act('release-update', { STUB_HEAD: RC })
+        expect(res.code, res.stderr).toBe(0)
+        sentinelIntact()
+        expect(lstatSync(prevFile()).isSymbolicLink()).toBe(false)
+        expect(read(prevFile())).toBe(`${RB}\n`)
+        expect(mode(prevFile())).toBe('644')
+      })
+
+      it('mcp-update schrijft mcp.built en mcp.prev niet door symlinks heen (ook niet bij een dode link)', () => {
+        mcpSetup()
+        makeSentinel()
+        rmSync(join(VAR(), 'mcp.built'), { force: true })
+        symlinkSync(join(dir, 'bestaat-niet'), builtFile()) // mcp.built is een dode link: ontbrekend lezen mag niet volgen
+        symlinkSync(sentinel(), mcpPrevFile())
+        const res = act('mcp-update')
+        // een link als mcp.built is corrupt (75): niets wordt geschreven, het doel blijft staan
+        expect(res.code).toBe(75)
+        sentinelIntact()
+        expect(existsSync(join(dir, 'bestaat-niet'))).toBe(false)
+        rmSync(builtFile())
+        writeFileSync(builtFile(), `${RA}\n`)
+        const res2 = act('mcp-update')
+        expect(res2.code, res2.stderr).toBe(0)
+        sentinelIntact()
+        expect(lstatSync(mcpPrevFile()).isSymbolicLink()).toBe(false)
+        expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+      })
+
+      it('weigert (73) een tijdelijk pad dat al bestaat (een symlink op een geraden naam): O_EXCL volgt niets, het doel blijft ongemoeid en er blijft niets achter', () => {
+        releases(RB, RA)
+        makeSentinel()
+        const preload = join(dir, 'preload.cjs')
+        writeFileSync(preload, "require('crypto').randomBytes = () => Buffer.from('0102030405060708', 'hex')\n")
+        const geraden = join(VAR(), '.release.prev.0102030405060708')
+        symlinkSync(sentinel(), geraden)
+        const res = act('release-update', { STUB_HEAD: RC, STUB_NODE_PRELOAD: preload })
+        expect(res.code).toBe(73)
+        sentinelIntact()
+        expect(lstatSync(geraden).isSymbolicLink()).toBe(true) // niet van ons: niet weggehaald
+        expect(read(prevFile())).toBe(`${RA}\n`)
+        expect(current()).toBe(`releases/${RB}`)
+      })
+
+      it('geeft 73 met een duidelijke regel als het schrijven mislukt (echte fout: de map is niet beschrijfbaar), zonder tijdelijk bestand en met current ongewijzigd', () => {
+        releases(RB, RA)
+        chmodSync(VAR(), 0o500)
+        try {
+          const res = act('release-update', { STUB_HEAD: RC })
+          expect(res.code, res.stderr).toBe(73)
+          expect(res.stderr).toContain('release.prev')
+        } finally {
+          chmodSync(VAR(), 0o700)
+        }
+        expect(readdirSync(VAR())).toEqual(['release.prev'])
+        expect(read(prevFile())).toBe(`${RA}\n`)
+        expect(current()).toBe(`releases/${RB}`)
+      })
+
+      it('geeft 73 (niet 1) als de schrijver faalt, en laat release.prev en current ongemoeid', () => {
+        releases(RB, RA)
+        const res = act('release-update', { STUB_HEAD: RC, STUB_STATE_WRITE_FAIL: '1' })
+        expect(res.code).toBe(73)
+        expect(res.stderr).toContain('release.prev')
+        expect(current()).toBe(`releases/${RB}`)
+        expect(read(prevFile())).toBe(`${RA}\n`)
+      })
+    })
+
+    describe('lezen', () => {
+      it.each([
+        ['release-rollback', 'release.prev'],
+        ['mcp-rollback', 'mcp.prev'],
+      ])('%s: een FIFO als %s is corrupt (75) en laat de actie niet hangen', (actie, naam) => {
+        releases(RB, RA)
+        mcpSetup()
+        rmSync(join(VAR(), naam), { force: true })
+        mkfifo(join(VAR(), naam))
+        const res = timed(actie)
+        expect(res.code, res.stderr).toBe(75)
+        expect(current()).toBe(`releases/${RB}`)
+      })
+
+      it.each([
+        ['release-rollback', 'release.prev'],
+        ['mcp-rollback', 'mcp.prev'],
+        ['mcp-update', 'mcp.built'],
+      ])('%s: een symlink als %s, zelfs naar een geldige commit, is corrupt (75)', (actie, naam) => {
+        releases(RB, RA)
+        mcpSetup()
+        const doel = join(dir, 'commit-elders')
+        writeFileSync(doel, `${RA}\n`)
+        rmSync(join(VAR(), naam), { force: true })
+        symlinkSync(doel, join(VAR(), naam))
+        const res = timed(actie)
+        expect(res.code, res.stderr).toBe(75)
+        expect(current()).toBe(`releases/${RB}`)
+        expect(gitCallsAll().filter((c) => / (merge|reset) /.test(c))).toEqual([])
+      })
+
+      it('een te groot bestand is corrupt (75)', () => {
+        releases(RB, RA)
+        writeFileSync(prevFile(), `${RA}\n${'x'.repeat(10000)}`)
+        expect(timed('release-rollback').code).toBe(75)
+        expect(current()).toBe(`releases/${RB}`)
+      })
+
+      it('mcp-rollback leest een FIFO of symlink als mcp.built als ontbrekend (hij wordt overschreven) en hangt niet', () => {
+        mcpSetup()
+        writeFileSync(mcpPrevFile(), `${RA}\n`)
+        rmSync(builtFile(), { force: true })
+        mkfifo(builtFile())
+        const res = timed('mcp-rollback')
+        expect(res.code, res.stderr).toBe(0)
+        expect(lstatSync(builtFile()).isFile()).toBe(true)
+        expect(read(builtFile())).toBe(`${RA}\n`)
+      })
     })
   })
 })
