@@ -6,8 +6,15 @@ import { DOC_TOOLS, findRecipe, loadWorkerConfig, normalizeRepoUrl, WorkerConfig
 import { ManifestError } from '../src/manifest.js'
 
 const base = {
-  model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'qwen3-coder:30b' },
+  litellm: { baseUrl: 'http://127.0.0.1:4000/v1', configPath: '/etc/agent-harness/litellm/config.yaml', composePath: '/etc/agent-harness/litellm/compose.yaml' },
+  configurations: { 'qwen3-coder-30b': { costMode: 'local', contextTokens: 32768 } },
   mcp: { command: 'node', args: ['server.js'], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}' } },
+}
+
+/** The messages of the issues a parse of `input` gives, as `path: message` lines; empty when it parses. */
+function issuesOf(input: unknown): string {
+  const r = WorkerConfigSchema.safeParse(input)
+  return r.success ? '' : r.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')
 }
 
 function writeConfig(cfg: unknown): string {
@@ -32,10 +39,12 @@ describe('WorkerConfigSchema', () => {
     expect(msg).toContain(tool)
   })
 
-  it('passes an optional contextTokens through to the limits', () => {
-    const limits = { maxTurns: 8, maxOutputTokens: 4096, maxWallSeconds: 240, maxToolErrors: 2, contextTokens: 32768 }
+  it('refuses contextTokens in limits: the context window belongs to the configuration', () => {
+    const limits = { maxTurns: 8, maxOutputTokens: 4096, maxWallSeconds: 240, maxToolErrors: 2 }
     expect(WorkerConfigSchema.parse({ ...base, limits }).limits).toEqual(limits)
-    expect(WorkerConfigSchema.safeParse({ ...base, limits: { ...limits, contextTokens: -1 } }).success).toBe(false)
+    const r = WorkerConfigSchema.safeParse({ ...base, limits: { ...limits, contextTokens: 32768 } })
+    expect(r.success).toBe(false)
+    expect(issuesOf({ ...base, limits: { ...limits, contextTokens: 32768 } })).toContain('limits')
   })
 
   it('accepts a subset of the doc tools', () => {
@@ -81,22 +90,155 @@ describe('workerMcpEnv', () => {
   })
 })
 
-describe('model.reasoningEffort', () => {
-  it('accepts none/low/medium/high and leaves it unset by default', () => {
-    expect(WorkerConfigSchema.parse(base).model.reasoningEffort).toBeUndefined()
-    for (const e of ['none', 'low', 'medium', 'high']) {
-      expect(WorkerConfigSchema.parse({ ...base, model: { ...base.model, reasoningEffort: e } }).model.reasoningEffort).toBe(e)
+// Row 1 of the T-2065 table: the schema is strict at every level, and a configuration carries what the model needs.
+const taskBlock = {
+  limits: { maxTurns: 40, maxOutputTokens: 80000, maxWallSeconds: 2400, maxToolErrors: 8 },
+  image: 'node:24-bookworm',
+  uid: 1000,
+  gid: 1000,
+  npmCacheDir: '/c',
+  recipes: [{ repoUrl: 'https://git.jp-visser.nl/janpeter/agent-harness.git', prepare: ['npm ci'], verify: 'npm run verify' }],
+}
+
+describe('strict schema', () => {
+  it('refuses the old model block, naming it', () => {
+    const issues = issuesOf({ ...base, model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'qwen3-coder:30b' } })
+    expect(issues).toContain('model')
+  })
+
+  it.each([
+    ['at the top', (c: Record<string, unknown>) => ({ ...c, extra: 1 }), 'extra'],
+    ['in litellm', (c: Record<string, unknown>) => ({ ...c, litellm: { ...(c.litellm as object), extra: 1 } }), 'litellm'],
+    ['in a configuration', (c: Record<string, unknown>) => ({ ...c, configurations: { 'qwen3-coder-30b': { costMode: 'local', contextTokens: 1, extra_body: {} } } }), 'extra_body'],
+    ['in mcp', (c: Record<string, unknown>) => ({ ...c, mcp: { ...(c.mcp as object), cwd: '/x' } }), 'mcp'],
+    ['in limits', (c: Record<string, unknown>) => ({ ...c, limits: { maxTurns: 1, maxOutputTokens: 1, maxWallSeconds: 1, maxToolErrors: 0, maxTurn: 2 } }), 'maxTurn'],
+    ['in workerLog', (c: Record<string, unknown>) => ({ ...c, workerLog: { dir: '/x', pool: 'harness', instance: 'max2', extra: 1 } }), 'workerLog'],
+  ])('refuses an unknown key %s instead of dropping it', (_where, mutate, shown) => {
+    const issues = issuesOf(mutate(base))
+    expect(issues).not.toBe('')
+    expect(issues).toContain(shown)
+  })
+
+  it('refuses an unknown key in the task block, its limits and a recipe', () => {
+    expect(issuesOf({ ...base, task: taskBlock })).toBe('')
+    expect(issuesOf({ ...base, task: { ...taskBlock, extra: 1 } })).toContain('task')
+    expect(issuesOf({ ...base, task: { ...taskBlock, limits: { ...taskBlock.limits, maxTurn: 2 } } })).toContain('task.limits')
+    expect(issuesOf({ ...base, task: { ...taskBlock, recipes: [{ ...taskBlock.recipes[0], extra: 1 }] } })).toContain('task.recipes')
+  })
+
+  it('refuses contextTokens in task.limits', () => {
+    expect(issuesOf({ ...base, task: { ...taskBlock, limits: { ...taskBlock.limits, contextTokens: 65536 } } })).toContain('task.limits')
+  })
+
+  it('still accepts every top-level key the live config uses', () => {
+    const live = {
+      ...base,
+      mcp: { command: 'tsx', args: ['a'], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}' } },
+      allow: ['search_product_docs'],
+      limits: { maxTurns: 8, maxOutputTokens: 4096, maxWallSeconds: 240, maxToolErrors: 2 },
+      waitSeconds: 300,
+      workerLog: { dir: '/srv/scrum4me/worker-logs', pool: 'harness', instance: 'max2' },
+      task: taskBlock,
+    }
+    expect(issuesOf(live)).toBe('')
+  })
+})
+
+describe('configurations', () => {
+  const withConfigurations = (configurations: unknown) => ({ ...base, configurations })
+
+  it('takes one or more, each with a cost mode and a context window', () => {
+    const hosted = { costMode: 'hosted', contextTokens: 131072, reasoningEffort: 'medium', extraBody: { temperature: 0.7, provider: { data_collection: 'deny' } } }
+    const cfg = WorkerConfigSchema.parse(withConfigurations({ 'qwen3-coder-30b': { costMode: 'local', contextTokens: 32768 }, 'qwen3.6-35b-a3b': hosted }))
+    expect(Object.keys(cfg.configurations)).toEqual(['qwen3-coder-30b', 'qwen3.6-35b-a3b'])
+    expect(cfg.configurations['qwen3.6-35b-a3b']).toEqual(hosted)
+  })
+
+  it('wants at least one', () => {
+    expect(issuesOf(withConfigurations({}))).toContain('configurations')
+  })
+
+  it('wants the key configurations at all', () => {
+    const { configurations: _gone, ...rest } = base
+    expect(issuesOf(rest)).toContain('configurations')
+  })
+
+  it.each(['a', 'qwen3-coder-30b', 'qwen3.6-35b-a3b', '0abc', 'a'.repeat(64)])('accepts the name %s', (name) => {
+    expect(issuesOf(withConfigurations({ [name]: { costMode: 'local', contextTokens: 1 } }))).toBe('')
+  })
+
+  it.each(['', 'Qwen', '-qwen', '.qwen', 'qwen:30b', 'qwen_30b', 'qwen 30b', 'qwen/30b', 'a'.repeat(65), 'é'])('refuses the name %j', (name) => {
+    expect(issuesOf(withConfigurations({ [name]: { costMode: 'local', contextTokens: 1 } }))).toContain('configurations')
+  })
+
+  it('refuses a configuration without contextTokens, and one with a zero, negative, fractional or text value', () => {
+    expect(issuesOf(withConfigurations({ x: { costMode: 'local' } }))).toContain('contextTokens')
+    for (const contextTokens of [0, -1, 1.5, '32768']) {
+      expect(issuesOf(withConfigurations({ x: { costMode: 'local', contextTokens } }))).toContain('contextTokens')
     }
   })
 
-  it('rejects an unknown effort', () => {
-    expect(WorkerConfigSchema.safeParse({ ...base, model: { ...base.model, reasoningEffort: 'off' } }).success).toBe(false)
+  it('refuses a configuration without costMode, and one with another cost mode', () => {
+    expect(issuesOf(withConfigurations({ x: { contextTokens: 1 } }))).toContain('costMode')
+    expect(issuesOf(withConfigurations({ x: { costMode: 'free', contextTokens: 1 } }))).toContain('costMode')
   })
 
-  it('the example worker config uses GSQ-RCO with thinking on and room for thinking tokens', () => {
+  it('accepts none/low/medium/high as reasoningEffort and leaves it unset by default', () => {
+    expect(WorkerConfigSchema.parse(base).configurations['qwen3-coder-30b'].reasoningEffort).toBeUndefined()
+    for (const e of ['none', 'low', 'medium', 'high']) {
+      const cfg = WorkerConfigSchema.parse(withConfigurations({ x: { costMode: 'local', contextTokens: 1, reasoningEffort: e } }))
+      expect(cfg.configurations.x.reasoningEffort).toBe(e)
+    }
+    expect(issuesOf(withConfigurations({ x: { costMode: 'local', contextTokens: 1, reasoningEffort: 'off' } }))).toContain('reasoningEffort')
+  })
+
+  it.each(['model', 'messages', 'tools', 'stream', 'max_tokens', 'max_completion_tokens', 'n'])('refuses the reserved extraBody key %s with a ManifestError naming the configuration', (key) => {
+    const p = writeConfig(withConfigurations({ x: { costMode: 'local', contextTokens: 1, extraBody: { [key]: 1 } } }))
+    expect(() => loadWorkerConfig(p)).toThrow(ManifestError)
+    expect(() => loadWorkerConfig(p)).toThrow(new RegExp(`configurations\\.x\\.extraBody: .*bevatten: "${key}"`))
+  })
+
+  it('refuses reasoning_effort in extraBody next to reasoningEffort, and lets it through alone', () => {
+    const clash = withConfigurations({ x: { costMode: 'local', contextTokens: 1, reasoningEffort: 'none', extraBody: { reasoning_effort: 'low' } } })
+    expect(issuesOf(clash)).toContain('configurations.x.extraBody')
+    expect(issuesOf(withConfigurations({ x: { costMode: 'local', contextTokens: 1, extraBody: { reasoning_effort: 'low' } } }))).toBe('')
+  })
+})
+
+describe('litellm', () => {
+  const withLitellm = (litellm: unknown) => ({ ...base, litellm })
+  const good: Record<string, string> = base.litellm
+
+  it('takes a URL and two absolute paths', () => {
+    expect(WorkerConfigSchema.parse(base).litellm).toEqual(good)
+  })
+
+  it.each(['baseUrl', 'configPath', 'composePath'])('wants %s', (key) => {
+    const { [key]: _gone, ...rest } = good
+    expect(issuesOf(withLitellm(rest))).toContain(`litellm.${key}`)
+  })
+
+  it('refuses a baseUrl that is no URL', () => {
+    expect(issuesOf(withLitellm({ ...good, baseUrl: 'not a url' }))).toContain('litellm.baseUrl')
+  })
+
+  it.each(['configPath', 'composePath'])('refuses a relative %s', (key) => {
+    expect(issuesOf(withLitellm({ ...good, [key]: 'litellm/config.yaml' }))).toContain(`litellm.${key}`)
+  })
+
+  it('is required', () => {
+    const { litellm: _gone, ...rest } = base
+    expect(issuesOf(rest)).toContain('litellm')
+  })
+})
+
+describe('the example worker config', () => {
+  it('is in the new form: a LiteLLM block and configurations, no model block, and room for thinking tokens', () => {
     const cfg = loadWorkerConfig('examples/worker.json')
-    expect(cfg.model.name).toBe('qwen3.8-gsq-rco:27b-iq3_s-text')
-    expect(cfg.model.reasoningEffort).toBeUndefined()
+    expect(cfg.litellm).toMatchObject({ baseUrl: 'http://127.0.0.1:4000/v1' })
+    expect(Object.keys(cfg.configurations)).toEqual(['qwen3.8-gsq-rco'])
+    expect(cfg.configurations['qwen3.8-gsq-rco']).toEqual({ costMode: 'local', contextTokens: 65536 })
+    expect(cfg).not.toHaveProperty('model')
     expect(cfg.limits).toMatchObject({ maxTurns: 8, maxOutputTokens: 4096 })
   })
 
@@ -104,7 +246,7 @@ describe('model.reasoningEffort', () => {
     const cfg = loadWorkerConfig('examples/worker.json')
     expect(cfg.task).toBeDefined()
     expect(cfg.task).toMatchObject({
-      limits: { maxTurns: 40, maxOutputTokens: 80000, maxWallSeconds: 2400, maxToolErrors: 8, contextTokens: 65536 },
+      limits: { maxTurns: 40, maxOutputTokens: 80000, maxWallSeconds: 2400, maxToolErrors: 8 },
       image: 'node:24-bookworm',
       uid: 1000,
       gid: 1000,
@@ -138,34 +280,6 @@ describe('model.reasoningEffort', () => {
     })
     // No real secret value anywhere in the example config.
     expect(JSON.stringify(cfg)).not.toMatch(/FORGEJO_PUSH_TOKEN":\s*"(?!\$\{)/)
-  })
-})
-
-// ModelSpecSchema is shared with the run manifest, so the model block of a worker config takes extraBody too, under the same rules.
-describe('model.extraBody', () => {
-  const extraBody = { temperature: 0.7, seed: 1, provider: { data_collection: 'deny', require_parameters: true }, reasoning: { effort: 'none' } }
-  const withModel = (model: Record<string, unknown>) => ({ ...base, model: { ...base.model, ...model } })
-
-  it('accepts extraBody in the model block and keeps it as written', () => {
-    expect(WorkerConfigSchema.parse(withModel({ extraBody })).model.extraBody).toEqual(extraBody)
-    expect(loadWorkerConfig(writeConfig(withModel({ extraBody }))).model.extraBody).toEqual(extraBody)
-  })
-
-  it('leaves it unset by default, in the example worker config too', () => {
-    expect(WorkerConfigSchema.parse(base).model.extraBody).toBeUndefined()
-    expect(loadWorkerConfig('examples/worker.json').model.extraBody).toBeUndefined()
-  })
-
-  it.each(['model', 'messages', 'tools', 'stream', 'max_tokens', 'max_completion_tokens', 'n'])('rejects the reserved key %s with a ManifestError naming model.extraBody', (key) => {
-    const p = writeConfig(withModel({ extraBody: { [key]: 1 } }))
-    expect(() => loadWorkerConfig(p)).toThrow(ManifestError)
-    expect(() => loadWorkerConfig(p)).toThrow(new RegExp(`model\\.extraBody: .*bevatten: "${key}"`))
-  })
-
-  it('rejects reasoning_effort in extraBody next to reasoningEffort, and lets it through alone', () => {
-    const clash = WorkerConfigSchema.safeParse(withModel({ reasoningEffort: 'none', extraBody: { reasoning_effort: 'low' } }))
-    expect(clash.success).toBe(false)
-    expect(WorkerConfigSchema.safeParse(withModel({ extraBody: { reasoning_effort: 'low' } })).success).toBe(true)
   })
 })
 

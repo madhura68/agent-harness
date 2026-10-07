@@ -78,6 +78,10 @@ export async function startFakeScrum4meMcp(
         model_id: z.string().optional(),
         input_tokens: z.number().int().optional(),
         output_tokens: z.number().int().optional(),
+        // The cost of the job (M45-2d): a decimal string or null, with where the figure came from.
+        cost: z
+          .object({ reported_cost_usd: z.string().nullable(), cost_source: z.enum(['provider_reported', 'local', 'none']), provider: z.string().optional() })
+          .optional(),
       },
     },
     async (args) => {

@@ -1,7 +1,9 @@
+import { TEST_CONFIGURATION } from './worker-config.js'
+
 type Msg = { id: string; role: string; kind?: string; content: string; created_at: string }
 
 /** An IDEA_CHAT payload in the shape of the scrum4me-mcp wait_for_job IDEA_CHAT branch. */
-export function ideaChatPayload(opts: { jobId?: string; kind?: string; runtime?: string; messages?: Msg[]; pending?: string[] } = {}) {
+export function ideaChatPayload(opts: { jobId?: string; kind?: string; runtime?: string; config?: Record<string, unknown>; messages?: Msg[]; pending?: string[] } = {}) {
   const messages: Msg[] = opts.messages ?? [
     { id: 'm1', role: 'USER', kind: 'TEXT', content: 'Eerste vraag', created_at: '2026-09-26T09:00:00.000Z' },
     { id: 'm2', role: 'ASSISTANT', kind: 'TEXT', content: 'Eerste antwoord', created_at: '2026-09-26T09:00:20.000Z' },
@@ -12,7 +14,8 @@ export function ideaChatPayload(opts: { jobId?: string; kind?: string; runtime?:
     kind: opts.kind ?? 'IDEA_CHAT',
     source: 'SYSTEM',
     status: 'claimed',
-    config: { runtime: opts.runtime ?? 'HARNESS', model: 'claude-sonnet-5' },
+    // What the MCP resolves at claim for a HARNESS job: the runtime, the configuration name and the cost ceiling as a decimal string.
+    config: opts.config ?? { runtime: opts.runtime ?? 'HARNESS', model: TEST_CONFIGURATION, max_cost_usd: '0.05' },
     doc_index: [],
     idea: {
       id: 'idea1',

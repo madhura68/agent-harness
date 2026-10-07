@@ -2,9 +2,8 @@ import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import { runTaskBench, type BenchResult } from '../src/bench/task-bench.js'
-import { createModelClient } from '../src/model-client.js'
 import type { ToolRegistry } from '../src/types.js'
-import { WorkerConfigSchema, type TaskConfig } from '../src/worker/config.js'
+import type { TaskConfig } from '../src/worker/config.js'
 import type { ControlChannel, StatusOutcome, StatusUpdate } from '../src/worker/control.js'
 import { ContainerUncertainError, runTaskJob } from '../src/worker/task-impl.js'
 import type { WorkerDeps } from '../src/worker/worker.js'
@@ -13,6 +12,7 @@ import { benchTmp, cleanupBenchFixtures, createBenchRepo, disposeBenchRepo, fixt
 import { fakeDocker, type DockerStep, type FakeDockerOptions } from './fakes/fake-docker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { taskPayload } from './fakes/task-payload.js'
+import { testModelClients, testWorkerConfig } from './fakes/worker-config.js'
 import { readTrace } from './helpers.js'
 
 // src/bench/task-bench.ts holds a deliberate copy of the verify gate and the container handling of runTaskJob (src/worker/task-impl.ts):
@@ -93,12 +93,12 @@ async function viaWorker(s: Scenario, task: TaskConfig, repo: BenchRepo) {
     verifyTaskAgainstPlan: async () => ({ ok: true, result: 'aligned' }),
     log: async () => ({ ok: true }),
   }
-  const config = WorkerConfigSchema.parse({ model: { baseUrl: fake.baseUrl, name: MODEL }, mcp: { command: 'unused', args: [] } })
+  const config = testWorkerConfig({}, fake.baseUrl)
   config.task = task
   const deps: WorkerDeps = {
     control,
     registryView: async () => noDocTools(),
-    modelClient: createModelClient({ baseUrl: fake.baseUrl, name: MODEL }),
+    modelClients: testModelClients(config),
     config,
     out,
     once: true,

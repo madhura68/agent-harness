@@ -26,6 +26,17 @@ export function assertExtraBody(extraBody: Record<string, unknown>, reasoningEff
   }
 }
 
+/** assertExtraBody as a schema check: the failure becomes an issue on `extraBody` of the block being refined. */
+export function refineExtraBody(block: { extraBody?: Record<string, unknown>; reasoningEffort?: string }, ctx: z.RefinementCtx): void {
+  if (!block.extraBody) return
+  try {
+    assertExtraBody(block.extraBody, block.reasoningEffort)
+  } catch (err) {
+    if (!(err instanceof ManifestError)) throw err
+    ctx.addIssue({ code: 'custom', path: ['extraBody'], message: err.message })
+  }
+}
+
 /** Model block shared by run manifests and the worker config. */
 export const ModelSpecSchema = z
   .object({
@@ -36,15 +47,7 @@ export const ModelSpecSchema = z
     /** Extra fields merged into every chat-completions request: temperature, seed, a provider block, a reasoning object. */
     extraBody: z.record(z.string(), z.unknown()).optional(),
   })
-  .superRefine((model, ctx) => {
-    if (!model.extraBody) return
-    try {
-      assertExtraBody(model.extraBody, model.reasoningEffort)
-    } catch (err) {
-      if (!(err instanceof ManifestError)) throw err
-      ctx.addIssue({ code: 'custom', path: ['extraBody'], message: err.message })
-    }
-  })
+  .superRefine(refineExtraBody)
 
 export const ManifestSchema = z
   .object({

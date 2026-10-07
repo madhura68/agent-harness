@@ -2,15 +2,14 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createModelClient } from '../src/model-client.js'
 import { createRegistryView } from '../src/tools/registry.js'
 import { createControlChannel } from '../src/worker/control.js'
-import { WorkerConfigSchema } from '../src/worker/config.js'
 import { openRunLog } from '../src/worker/run-log.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
+import { TEST_CONFIGURATION, testModelClients, testRunLogInit, testWorkerConfig } from './fakes/worker-config.js'
 import { dirContains, readTrace, tmp } from './helpers.js'
 
 type ModelFake = Awaited<ReturnType<typeof startFakeModelServer>>
@@ -32,6 +31,8 @@ type Setup = {
   script?: FakeTurn[]
   once?: boolean
   limits?: Partial<{ maxTurns: number; maxOutputTokens: number; maxWallSeconds: number; maxToolErrors: number }>
+  /** Replaces the configurations of the worker (the default is one local configuration, TEST_CONFIGURATION). */
+  configurations?: Record<string, unknown>
   failUpdate?: Array<'running' | 'done' | 'failed'>
   signal?: AbortSignal
   apiKey?: string
@@ -42,12 +43,14 @@ type Setup = {
 async function setup(s: Setup) {
   model = await startFakeModelServer(s.script ?? [])
   mcp = await startFakeScrum4meMcp({ claims: s.claims, failUpdate: s.failUpdate })
-  const config = WorkerConfigSchema.parse({
-    model: { baseUrl: model.baseUrl, name: 'qwen3-coder:30b', ...(s.apiKey ? { apiKey: s.apiKey } : {}) },
-    mcp: { command: 'unused', args: [] },
-    limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2, ...s.limits },
-    waitSeconds: 1,
-  })
+  const config = testWorkerConfig(
+    {
+      limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2, ...s.limits },
+      waitSeconds: 1,
+      ...(s.configurations ? { configurations: s.configurations } : {}),
+    },
+    model.baseUrl,
+  )
   const out = tmp('worker')
   const runLogDir = tmp('runlog')
   const logs: string[] = []
@@ -55,7 +58,7 @@ async function setup(s: Setup) {
   const deps: WorkerDeps = {
     control: createControlChannel(client, s.requestTimeoutMs ? { requestTimeoutMs: s.requestTimeoutMs } : {}),
     registryView: (signal) => createRegistryView(client, config.allow, signal),
-    modelClient: createModelClient({ baseUrl: config.model.baseUrl, name: config.model.name, apiKey: config.model.apiKey }),
+    modelClients: testModelClients(config, s.apiKey),
     config,
     out,
     once: s.once ?? true,
@@ -65,8 +68,7 @@ async function setup(s: Setup) {
     log: (line) => logs.push(line),
     // M4 Taak 5: every test drives a real run-log writer (spec §6.3 is best-effort, so this must never
     // change a job outcome); individual tests below override runLogFor for their own scenario.
-    runLogFor: (claim) =>
-      openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, { jobId: claim.jobId, kind: claim.kind, model: config.model, version: 'agent-harness@test', secrets: [] }),
+    runLogFor: (claim) => openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, testRunLogInit(config, claim)),
   }
   return { deps, out, runLogDir, logs, mcp, model, run: () => runWorker(deps) }
 }
@@ -602,7 +604,7 @@ describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
     expect(r.jobs[0].outcome).toBe('done')
     const lines = runLogLines(t.runLogDir)
     expect(lines[0]).toMatch(/^\S+ \[harness\] claimed job_id=job1$/)
-    expect(lines[1]).toMatch(/^\S+ \[harness\] config job_id=job1 runtime=HARNESS kind=IDEA_CHAT model=qwen3-coder:30b base_url=/)
+    expect(lines[1]).toMatch(/^\S+ \[harness\] config job_id=job1 runtime=HARNESS kind=IDEA_CHAT model=qwen3-coder-30b configuration=qwen3-coder-30b cost_mode=local max_cost_usd=0\.05 base_url=http:\/\/127\.0\.0\.1:\d+\/v1$/)
     expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] step job_status running$/))
     expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] step job_status done$/))
     const jsonTypes = runLogJsonLines(t.runLogDir).map((j) => j.type)
@@ -700,7 +702,7 @@ describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
     t.deps.runLogFor = (claim) =>
       openRunLog(
         { dir: blockerFile, pool: 'harness', instance: 'test' },
-        { jobId: claim.jobId, kind: claim.kind, model: t.deps.config.model, version: 'agent-harness@test', secrets: [], log: (l) => runLogErrors.push(l) },
+        testRunLogInit(t.deps.config, claim, { log: (l: string) => runLogErrors.push(l) }),
       )
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('done')
@@ -717,5 +719,152 @@ describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
     expect(t.logs.filter((l) => l.includes('run-log uitgeschakeld'))).toHaveLength(1)
     expect(t.logs.filter((l) => l.includes('run-log uitgeschakeld'))[0]).toMatch(/^run-log uitgeschakeld voor job job1: run-log kapot$/)
     expect(existsSync(runLogRunsDir(t.runLogDir))).toBe(false)
+  })
+})
+
+// ---- the configuration and the cost ceiling of a job (M45-2d T-2065) ----
+
+const harnessConfig = (model: unknown, maxCost: unknown = '0.05') => ({ runtime: 'HARNESS', model, max_cost_usd: maxCost })
+const withoutCost = (model: unknown) => ({ runtime: 'HARNESS', model })
+const COST_NONE = { reported_cost_usd: null, cost_source: 'none' }
+
+describe('runWorker — the configuration of a job (M45-2d T-2065)', () => {
+  const configurations = {
+    'fast-local': { costMode: 'local', contextTokens: 32768, reasoningEffort: 'none' },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768, reasoningEffort: 'high', extraBody: { temperature: 0.7 } },
+    tiny: { costMode: 'local', contextTokens: 1100 },
+  }
+  const manifestOf = (out: string, dirIndex: number) => {
+    const dir = join(out, readdirSync(out).sort()[dirIndex])
+    return readTrace(dir)[0] as { manifest: { model: Record<string, unknown>; limits: Record<string, unknown> } }
+  }
+
+  it('gives each job the model client, the reasoning effort and the context window of its own configuration', async () => {
+    const t = await setup({
+      claims: [job(ideaChatPayload({ jobId: 'a', config: harnessConfig('fast-local') })), job(ideaChatPayload({ jobId: 'b', config: harnessConfig('deep-hosted') })), job(ideaChatPayload({ jobId: 'c', config: harnessConfig('tiny') }))],
+      script: [answer('een'), answer('twee'), answer('drie')],
+      configurations,
+      once: false,
+    })
+    stopAfterWaits(t, 3)
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'a', outcome: 'done' }, { jobId: 'b', outcome: 'done' }, { jobId: 'c', outcome: 'failed' }])
+    // Each request carries the name of its configuration, and that configuration's own request fields.
+    expect(t.model.requests).toHaveLength(2)
+    expect(t.model.requests[0].body).toMatchObject({ model: 'fast-local', reasoning_effort: 'none' })
+    expect(t.model.requests[0].body).not.toHaveProperty('temperature')
+    expect(t.model.requests[1].body).toMatchObject({ model: 'deep-hosted', reasoning_effort: 'high', temperature: 0.7 })
+    // The manifest of each run names its configuration, the LiteLLM address and its context window.
+    const base = t.deps.config.litellm.baseUrl
+    expect(manifestOf(t.out, 0).manifest.model).toEqual({ baseUrl: base, name: 'fast-local', reasoningEffort: 'none' })
+    expect(manifestOf(t.out, 0).manifest.limits).toMatchObject({ contextTokens: 32768, maxTurns: 4 })
+    expect(manifestOf(t.out, 1).manifest.model).toEqual({ baseUrl: base, name: 'deep-hosted', reasoningEffort: 'high', extraBody: { temperature: 0.7 } })
+    // The compaction of the third job works inside its own, small window: no request, CONTEXT_EXHAUSTED.
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ job_id: 'c', status: 'failed' })
+    expect(String(controlCalls(t.mcp).at(-1)?.error)).toContain('contextTokens=1100')
+    expect(manifestOf(t.out, 2).manifest.limits).toMatchObject({ contextTokens: 1100 })
+  })
+
+  it('reports the configuration name as model_id when the provider does not name a model', async () => {
+    const noModel = { body: { ...completion({ content: 'Antwoord.' }), model: undefined } }
+    const t = await setup({ claims: [job()], script: [noModel] })
+    await t.run()
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', model_id: TEST_CONFIGURATION })
+  })
+
+  it('reports the model the provider named when it does', async () => {
+    const t = await setup({ claims: [job()], script: [answer('Antwoord.')] })
+    await t.run()
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', model_id: 'qwen3-coder:30b' })
+  })
+
+  it('fails an unknown configuration as UNKNOWN_CONFIGURATION with no running and no model call, and claims the next job', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ jobId: 'bad', config: harnessConfig('nope') })), job(ideaChatPayload({ jobId: 'good' }))], script: [answer('Antwoord.')], once: false })
+    stopAfterWaits(t, 2)
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'bad', outcome: 'failed' }, { jobId: 'good', outcome: 'done' }], exitCode: 0 })
+    expect(controlCalls(t.mcp)).toEqual([
+      { job_id: 'bad', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE },
+      { job_id: 'good', status: 'running' },
+      expect.objectContaining({ job_id: 'good', status: 'done' }),
+    ])
+    expect(t.model.requests).toHaveLength(1)
+    expect(t.logs.join('\n')).not.toMatch(/RUNTIME_MISMATCH|Worker stopt/)
+  })
+
+  it.each([
+    ['a name that is no string', 42, 'UNKNOWN_CONFIGURATION: 42'],
+    ['a missing name', undefined, 'UNKNOWN_CONFIGURATION: ontbrekend'],
+    ['a name that is an Object.prototype member', 'constructor', 'UNKNOWN_CONFIGURATION: constructor'],
+    ['__proto__', '__proto__', 'UNKNOWN_CONFIGURATION: __proto__'],
+    ['a name with other case', 'QWEN3-CODER-30B', 'UNKNOWN_CONFIGURATION: QWEN3-CODER-30B'],
+  ])('fails %s as UNKNOWN_CONFIGURATION', async (_what, name, error) => {
+    const t = await setup({ claims: [job(ideaChatPayload({ config: harnessConfig(name) }))], script: [answer('nee')] })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(controlCalls(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error, cost: COST_NONE }])
+    expect(t.model.requests).toHaveLength(0)
+  })
+
+  it('cuts a very long configuration name in the failure text', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ config: harnessConfig('x'.repeat(5000)) }))], script: [answer('nee')] })
+    await t.run()
+    const error = String(controlCalls(t.mcp).at(-1)?.error)
+    expect(error.startsWith('UNKNOWN_CONFIGURATION: xxx')).toBe(true)
+    expect(error.length).toBeLessThan(200)
+  })
+
+  it('writes the failure to the run-log as ERROR UNKNOWN_CONFIGURATION', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ config: harnessConfig('nope') }))], script: [answer('nee')] })
+    await t.run()
+    const lines = runLogLines(t.runLogDir)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR UNKNOWN_CONFIGURATION: nope$/))
+    expect(lines.at(-1)).toMatch(/ exit code=1$/)
+  })
+})
+
+describe('runWorker — the cost ceiling of a job (M45-2d T-2065)', () => {
+  it.each([
+    ['missing', withoutCost(TEST_CONFIGURATION), 'COST_LIMIT_MISSING: ontbrekend'],
+    ["'0'", harnessConfig(TEST_CONFIGURATION, '0'), 'COST_LIMIT_MISSING: 0'],
+    ["'0.00'", harnessConfig(TEST_CONFIGURATION, '0.00'), 'COST_LIMIT_MISSING: 0.00'],
+    ["'abc'", harnessConfig(TEST_CONFIGURATION, 'abc'), 'COST_LIMIT_MISSING: abc'],
+    ["'1e-2'", harnessConfig(TEST_CONFIGURATION, '1e-2'), 'COST_LIMIT_MISSING: 1e-2'],
+    ['-1 as a number', harnessConfig(TEST_CONFIGURATION, -1), 'COST_LIMIT_MISSING: -1'],
+    ["'-1'", harnessConfig(TEST_CONFIGURATION, '-1'), 'COST_LIMIT_MISSING: -1'],
+    ['0.05 as a number, not a decimal string', harnessConfig(TEST_CONFIGURATION, 0.05), 'COST_LIMIT_MISSING: 0.05'],
+    ['null', harnessConfig(TEST_CONFIGURATION, null), 'COST_LIMIT_MISSING: null'],
+    ['empty', harnessConfig(TEST_CONFIGURATION, ''), 'COST_LIMIT_MISSING: '],
+    ["'.5'", harnessConfig(TEST_CONFIGURATION, '.5'), 'COST_LIMIT_MISSING: .5'],
+    ["'1.'", harnessConfig(TEST_CONFIGURATION, '1.'), 'COST_LIMIT_MISSING: 1.'],
+    ["' 0.05'", harnessConfig(TEST_CONFIGURATION, ' 0.05'), 'COST_LIMIT_MISSING:  0.05'],
+    ["'0.05\\n'", harnessConfig(TEST_CONFIGURATION, '0.05\n'), 'COST_LIMIT_MISSING: "0.05\\n"'],
+    ["'Infinity'", harnessConfig(TEST_CONFIGURATION, 'Infinity'), 'COST_LIMIT_MISSING: Infinity'],
+  ])('fails a ceiling that is %s as COST_LIMIT_MISSING, without running and without a model call', async (_what, config, error) => {
+    const t = await setup({ claims: [job(ideaChatPayload({ config }))], script: [answer('nee')] })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(controlCalls(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error, cost: COST_NONE }])
+    expect(t.model.requests).toHaveLength(0)
+  })
+
+  it('claims the next job after one without a ceiling', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ jobId: 'bad', config: withoutCost(TEST_CONFIGURATION) })), job(ideaChatPayload({ jobId: 'good' }))], script: [answer('Antwoord.')], once: false })
+    stopAfterWaits(t, 2)
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'good', outcome: 'done' }])
+  })
+
+  it.each(['0.05', '0.50', '1', '10.25', '0.000001', '007.5'])('accepts the ceiling %s and runs the job', async (maxCost) => {
+    const t = await setup({ claims: [job(ideaChatPayload({ config: harnessConfig(TEST_CONFIGURATION, maxCost) }))], script: [answer('Antwoord.')] })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(controlCalls(t.mcp).map((c) => c.status)).toEqual(['running', 'done'])
+  })
+
+  it('checks the configuration before the ceiling', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ config: withoutCost('nope') }))] })
+    await t.run()
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ error: 'UNKNOWN_CONFIGURATION: nope' })
   })
 })

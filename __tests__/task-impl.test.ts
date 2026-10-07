@@ -6,9 +6,7 @@ import { PassThrough } from 'node:stream'
 import { promisify } from 'node:util'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createModelClient } from '../src/model-client.js'
 import { createRegistryView } from '../src/tools/registry.js'
-import { WorkerConfigSchema } from '../src/worker/config.js'
 import type { SpawnFn } from '../src/worker/containers.js'
 import { createControlChannel } from '../src/worker/control.js'
 import { commitAll, snapshotGitAdmin } from '../src/worker/host-git.js'
@@ -19,6 +17,7 @@ import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-mo
 import { startFakeScrum4meMcp, type ClaimStep, type UpdateOutcomeOverride } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
 import { taskPayload } from './fakes/task-payload.js'
+import { TEST_CONFIGURATION, testModelClients, testRunLogInit, testWorkerConfig } from './fakes/worker-config.js'
 import { readTrace } from './helpers.js'
 
 // Spies that call through: the tests assert that commitAll/snapshotGitAdmin are NOT called on some paths.
@@ -186,6 +185,8 @@ type Setup = {
   timeouts?: { prepare?: number; verify?: number }
   /** Overrides task.limits.maxWallSeconds after parse (the schema wants whole seconds). */
   maxWallSeconds?: number
+  /** Replaces the configurations of the worker (the default is one local configuration, TEST_CONFIGURATION). */
+  configurations?: Record<string, unknown>
 }
 
 async function setup(s: Setup = {}) {
@@ -198,25 +199,27 @@ async function setup(s: Setup = {}) {
     verifyResult: s.verifyResult,
     updateOutcome: { done: s.doneOutcome ?? PUSHED },
   })
-  const config = WorkerConfigSchema.parse({
-    model: { baseUrl: model.baseUrl, name: 'qwen3-coder:30b' },
-    mcp: { command: 'unused', args: [] },
-    limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2 },
-    waitSeconds: 1,
-    ...(s.noTask
-      ? {}
-      : {
-          task: {
-            limits: { maxTurns: 10, maxOutputTokens: 20000, maxWallSeconds: 30, maxToolErrors: 3 },
-            image: 'node:24-bookworm',
-            uid: 1000,
-            gid: 1000,
-            npmCacheDir: '/tmp/npm-cache',
-            maxVerifyRepairs: s.maxVerifyRepairs ?? 3,
-            recipes: [{ repoUrl: 'https://git.example/repo', prepare: ['npm ci'], verify: 'npm test' }],
-          },
-        }),
-  })
+  const config = testWorkerConfig(
+    {
+      limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2 },
+      waitSeconds: 1,
+      ...(s.configurations ? { configurations: s.configurations } : {}),
+      ...(s.noTask
+        ? {}
+        : {
+            task: {
+              limits: { maxTurns: 10, maxOutputTokens: 20000, maxWallSeconds: 30, maxToolErrors: 3 },
+              image: 'node:24-bookworm',
+              uid: 1000,
+              gid: 1000,
+              npmCacheDir: '/tmp/npm-cache',
+              maxVerifyRepairs: s.maxVerifyRepairs ?? 3,
+              recipes: [{ repoUrl: 'https://git.example/repo', prepare: ['npm ci'], verify: 'npm test' }],
+            },
+          }),
+    },
+    model.baseUrl,
+  )
   // Sub-second container timeouts (the schema wants whole seconds; the runner just multiplies by 1000).
   if (config.task) {
     config.task.prepareTimeoutSeconds = s.timeouts?.prepare ?? 0.05
@@ -231,7 +234,7 @@ async function setup(s: Setup = {}) {
   const deps: WorkerDeps = {
     control: createControlChannel(client),
     registryView: (signal) => createRegistryView(client, config.allow, signal),
-    modelClient: createModelClient({ baseUrl: config.model.baseUrl, name: config.model.name }),
+    modelClients: testModelClients(config),
     config,
     out,
     once: s.once ?? true,
@@ -242,8 +245,7 @@ async function setup(s: Setup = {}) {
     taskDeps: { spawn: docker.spawn, killGraceMs: 20, cleanupTimeoutMs: 500 },
     // M4 Taak 5: a real run-log writer on every test (best-effort — spec §6.3 — so it must never change a
     // job outcome). Taak 6 adds the task-job-specific run-log assertions; this task only wires it through.
-    runLogFor: (claim) =>
-      openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, { jobId: claim.jobId, kind: claim.kind, model: config.model, version: 'agent-harness@test', secrets: [] }),
+    runLogFor: (claim) => openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, testRunLogInit(config, claim)),
   }
   const branchSha = () => git(cloneDir, ['rev-parse', 'feature1'])
   return { deps, out, runLogDir, logs, mcp, model, docker, worktree, cloneDir, baseSha, branchSha, run: () => runWorker(deps) }
@@ -344,7 +346,7 @@ describe('runTaskJob — green path', () => {
     expect(String(done?.summary)).toBe('src/greet.ts toegevoegd; tests groen.\n\nVerify: groen (npm test)')
     const commit = t.mcp.calls.find((c) => c.name === 'log_commit')?.args
     expect(commit).toMatchObject({ commit_hash: await git(t.worktree, ['rev-parse', 'HEAD']), commit_message: 'feat: voeg greet() toe', task_id: 'task-1', story_id: 'story-1' })
-    expect(t.mcp.calls.find((c) => c.name === 'log_implementation')?.args.content).toBe('lokaal model start: qwen3-coder:30b, recept https://git.example/repo.git')
+    expect(t.mcp.calls.find((c) => c.name === 'log_implementation')?.args.content).toBe(`lokaal model start: ${TEST_CONFIGURATION}, recept https://git.example/repo.git`)
     expect(t.docker.runs().map((a) => a[a.indexOf('--name') + 1])).toEqual(['harness-job1-prepare-1', 'harness-job1-verify-2'])
     const containers = traceOf(t.out).filter((e) => e.type === 'container')
     expect(containers.map((e) => [e.kind, e.source])).toEqual([['prepare', 'prepare'], ['verify', 'gate']])
@@ -978,5 +980,118 @@ describe('runTaskJob — run-log (M4 Taak 6, spec §5.6)', () => {
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
     expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR HARNESS_ERROR: harness: /))
+  })
+})
+
+// ---- the configuration and the cost ceiling of a task job (M45-2d T-2065) ----
+
+const harnessConfig = (model: unknown, maxCost: unknown = '0.05') => ({ runtime: 'HARNESS', model, max_cost_usd: maxCost })
+const COST_NONE = { reported_cost_usd: null, cost_source: 'none' }
+
+describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
+  const configurations = {
+    'fast-local': { costMode: 'local', contextTokens: 32768, reasoningEffort: 'none' },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768, reasoningEffort: 'high', extraBody: { temperature: 0.7 } },
+    tiny: { costMode: 'local', contextTokens: 1100 },
+  }
+  const manifestOf = (out: string, dirIndex: number) => {
+    const dir = join(out, readdirSync(out).sort()[dirIndex])
+    return readTrace(dir).find((e) => e.type === 'run_start') as unknown as { manifest: { model: Record<string, unknown>; limits: Record<string, unknown> } }
+  }
+
+  it('gives each task job the model client, the reasoning effort and the context window of its own configuration', async () => {
+    const t = await setup({
+      configurations,
+      claims: (wt) => [
+        { job: taskPayload({ worktree: wt, jobId: 'a', config: harnessConfig('fast-local') }) },
+        { job: taskPayload({ worktree: wt, jobId: 'b', config: harnessConfig('deep-hosted') }) },
+        { job: taskPayload({ worktree: wt, jobId: 'c', config: harnessConfig('tiny') }) },
+      ],
+      script: [write('a.txt', 'a\n', 'w1'), answer('een'), write('b.txt', 'b\n', 'w2'), answer('twee')],
+      once: false,
+    })
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'c' && u.status === 'failed') stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'a', outcome: 'done' }, { jobId: 'b', outcome: 'done' }, { jobId: 'c', outcome: 'failed' }])
+    expect(t.model.requests).toHaveLength(4)
+    expect(t.model.requests.slice(0, 2).map((q) => q.body)).toEqual([expect.objectContaining({ model: 'fast-local', reasoning_effort: 'none' }), expect.objectContaining({ model: 'fast-local', reasoning_effort: 'none' })])
+    expect(t.model.requests[0].body).not.toHaveProperty('temperature')
+    expect(t.model.requests.slice(2).map((q) => q.body)).toEqual([expect.objectContaining({ model: 'deep-hosted', reasoning_effort: 'high', temperature: 0.7 }), expect.objectContaining({ model: 'deep-hosted', reasoning_effort: 'high', temperature: 0.7 })])
+    const base = t.deps.config.litellm.baseUrl
+    expect(manifestOf(t.out, 0).manifest.model).toEqual({ baseUrl: base, name: 'fast-local', reasoningEffort: 'none' })
+    expect(manifestOf(t.out, 0).manifest.limits).toMatchObject({ contextTokens: 32768, maxTurns: 10 })
+    expect(manifestOf(t.out, 1).manifest.model).toEqual({ baseUrl: base, name: 'deep-hosted', reasoningEffort: 'high', extraBody: { temperature: 0.7 } })
+    // The third job runs inside its own, small window: no request, CONTEXT_EXHAUSTED.
+    expect(String(jobUpdates(t.mcp).at(-1)?.error)).toContain('contextTokens=1100')
+    expect(manifestOf(t.out, 2).manifest.limits).toMatchObject({ contextTokens: 1100 })
+    // The log line of the task names the configuration.
+    expect(t.mcp.calls.filter((c) => c.name === 'log_implementation').map((c) => c.args.content)).toEqual([
+      'lokaal model start: fast-local, recept https://git.example/repo.git',
+      'lokaal model start: deep-hosted, recept https://git.example/repo.git',
+      'lokaal model start: tiny, recept https://git.example/repo.git',
+    ])
+  })
+
+  it('reports the configuration name as model_id when the provider does not name a model', async () => {
+    const unnamed = (turn: FakeTurn): FakeTurn => ({ body: { ...(turn.body as object), model: undefined } }) // no model name in any response
+    const t = await setup({ script: [unnamed(write('a.txt', 'a\n')), unnamed({ body: completion({ content: 'klaar', usage: { prompt_tokens: 5, completion_tokens: 2 } }) })] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({ status: 'done', model_id: TEST_CONFIGURATION })
+  })
+
+  it('fails an unknown configuration as UNKNOWN_CONFIGURATION: the task untouched, no container, no model call, and the worker carries on', async () => {
+    const t = await setup({
+      claims: (wt) => [{ job: taskPayload({ worktree: wt, jobId: 'bad', config: harnessConfig('nope') }) }, { job: ideaChatPayload({ jobId: 'job2' }) }],
+      script: [answer('idee-antwoord')],
+      once: false,
+    })
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'job2' && u.status === 'done') stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    expect(jobUpdates(t.mcp)[0]).toEqual({ job_id: 'bad', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE })
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+    expect(t.model.requests).toHaveLength(1) // only the idea chat of job2
+  })
+
+  it('writes ERROR UNKNOWN_CONFIGURATION to the run-log', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, config: harnessConfig('nope') }) }] })
+    await t.run()
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR UNKNOWN_CONFIGURATION: nope$/))
+  })
+
+  it.each([
+    ['missing', { runtime: 'HARNESS', model: TEST_CONFIGURATION }, 'COST_LIMIT_MISSING: ontbrekend'],
+    ["'0'", harnessConfig(TEST_CONFIGURATION, '0'), 'COST_LIMIT_MISSING: 0'],
+    ["'abc'", harnessConfig(TEST_CONFIGURATION, 'abc'), 'COST_LIMIT_MISSING: abc'],
+    ["'1e-2'", harnessConfig(TEST_CONFIGURATION, '1e-2'), 'COST_LIMIT_MISSING: 1e-2'],
+    ['-1', harnessConfig(TEST_CONFIGURATION, -1), 'COST_LIMIT_MISSING: -1'],
+  ])('fails a ceiling that is %s as COST_LIMIT_MISSING, the task untouched, and the worker carries on', async (_what, config, error) => {
+    const t = await setup({
+      claims: (wt) => [{ job: taskPayload({ worktree: wt, jobId: 'bad', config }) }, { job: ideaChatPayload({ jobId: 'job2' }) }],
+      script: [answer('idee-antwoord')],
+      once: false,
+    })
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'job2' && u.status === 'done') stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    expect(jobUpdates(t.mcp)[0]).toEqual({ job_id: 'bad', status: 'failed', error, cost: COST_NONE })
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+  })
+
+  it('checks the configuration before the recipe, so an unknown configuration is reported even for a repo without recipe', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, repoUrl: 'https://git.example/ander.git', config: harnessConfig('nope') }) }] })
+    await t.run()
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE }])
   })
 })

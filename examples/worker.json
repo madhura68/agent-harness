@@ -1,7 +1,14 @@
 {
-  "model": {
-    "baseUrl": "http://127.0.0.1:11434/v1",
-    "name": "qwen3.8-gsq-rco:27b-iq3_s-text"
+  "litellm": {
+    "baseUrl": "http://127.0.0.1:4000/v1",
+    "configPath": "/etc/agent-harness/litellm/config.yaml",
+    "composePath": "/etc/agent-harness/litellm/docker-compose.yaml"
+  },
+  "configurations": {
+    "qwen3.8-gsq-rco": {
+      "costMode": "local",
+      "contextTokens": 65536
+    }
   },
   "mcp": {
     "command": "/Users/janpetervisser/Development/scrum4me-mcp-stable/node_modules/.bin/tsx",
@@ -34,8 +41,7 @@
     "maxTurns": 8,
     "maxOutputTokens": 4096,
     "maxWallSeconds": 240,
-    "maxToolErrors": 2,
-    "contextTokens": 32768
+    "maxToolErrors": 2
   },
   "waitSeconds": 300,
   "workerLog": {
@@ -48,8 +54,7 @@
       "maxTurns": 40,
       "maxOutputTokens": 80000,
       "maxWallSeconds": 2400,
-      "maxToolErrors": 8,
-      "contextTokens": 65536
+      "maxToolErrors": 8
     },
     "image": "node:24-bookworm",
     "uid": 1000,

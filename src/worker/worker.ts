@@ -9,6 +9,7 @@ import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
 import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './exit-codes.js'
 import { startHeartbeat } from './heartbeat.js'
 import { IDEA_CHAT_SYSTEM_PROMPT, IdeaChatPayloadSchema, pendingUserMessages, renderIdeaChatUserMessage } from './idea-chat.js'
+import { failBeforeRunning, limitsFor, modelClientFor, modelSpecFor, resolveJobConfiguration } from './job-configuration.js'
 import type { RunLog } from './run-log.js'
 import { ContainerUncertainError, runTaskJob, type TaskJobContext } from './task-impl.js'
 
@@ -16,7 +17,8 @@ export type WorkerDeps = {
   control: ControlChannel
   /** Allowlist view on the shared MCP connection; closing it leaves the connection open. */
   registryView: (signal?: AbortSignal) => Promise<ToolRegistry>
-  modelClient: ModelClient
+  /** One model client per configuration of `config`, by name; each job runs through the client of the configuration its payload names. */
+  modelClients: Record<string, ModelClient>
   config: WorkerConfig
   out: string
   once: boolean
@@ -83,11 +85,11 @@ function failureText(result: RunResult, config: WorkerConfig): string {
   return `${result.status}: onbekende fout`
 }
 
-/** What to send when the run ended; null = send nothing (ownership lost). */
-function closingUpdate(result: RunResult, config: WorkerConfig): StatusUpdate {
+/** What to send when the run ended; null = send nothing (ownership lost). `configuration` is the name the provider's own model name falls back to. */
+function closingUpdate(result: RunResult, config: WorkerConfig, configuration: string): StatusUpdate {
   if (result.status === 'completed') {
     const answer = result.answer ?? ''
-    const modelId = result.model.reported ?? config.model.name
+    const modelId = result.model.reported ?? configuration
     if (answer.trim() === '') return { status: 'failed', error: `leeg antwoord van ${modelId}` }
     return {
       status: 'done',
@@ -170,6 +172,10 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
     runLog?.fail('JOB_FAILED', 'geen onbeantwoord USER-bericht')
     return close({ status: 'failed', error: 'geen onbeantwoord USER-bericht' })
   }
+  // The job's own configuration and cost ceiling, from its payload: one that this worker does not have fails this job only, before it runs.
+  const resolved = resolveJobConfiguration(config, claim.payload)
+  if (!resolved.ok) return failBeforeRunning(deps, jobId, runLog, resolved.failure)
+  const job = resolved.job
 
   const running = await control.updateStatus(jobId, { status: 'running' })
   if (!running.ok) {
@@ -198,18 +204,18 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
       profile: 'tools',
       system: IDEA_CHAT_SYSTEM_PROMPT,
       prompt: renderIdeaChatUserMessage(payload),
-      model: config.model,
+      model: modelSpecFor(config, job),
       tools: { server: { command: 'shared', args: [] }, allow: config.allow },
-      limits: config.limits,
+      limits: limitsFor(config.limits, job),
     }
     const result = await runManifest(manifest, {
-      client: deps.modelClient,
+      client: modelClientFor(deps.modelClients, job.name),
       trace: runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId),
       connectRegistry: (signal) => deps.registryView(signal),
       signal: inner.signal,
       runStartExtra: { jobId, ideaId: payload.idea.id },
     })
-    update = closingUpdate(result, config)
+    update = closingUpdate(result, config, job.name)
     if (update.status === 'failed') failInfo = { code: ideaChatFailCode(result), message: update.error ?? '' }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)

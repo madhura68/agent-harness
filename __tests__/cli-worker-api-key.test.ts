@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ServerSpec } from '../src/types.js'
@@ -6,10 +6,11 @@ import type { WorkerDeps } from '../src/worker/worker.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
+import { TEST_CONFIGURATION } from './fakes/worker-config.js'
 import { dirContains, tmp } from './helpers.js'
 
-// `harness worker --api-key-env <VAR>`: the model key comes from the environment, beats model.apiKey in the worker config and
-// reaches the model client only. A name or a value that the worker's redaction would not cover is refused before anything starts.
+// `harness worker --api-key-env <VAR>`: the master key of LiteLLM comes from the environment and reaches the model clients and the
+// check of the LiteLLM models only. A name or a value that the worker's redaction would not cover is refused before anything starts.
 // The key values below are obviously fake. The MCP child is mocked the way __tests__/cli-worker.test.ts does it.
 
 const stdioCalls: ServerSpec[] = []
@@ -41,13 +42,11 @@ vi.mock('../src/worker/worker.js', async (importActual) => {
   }
 })
 
-const { main, resolveWorkerModel, UsageError } = await import('../src/cli.js')
-const { probeDir } = await import('../src/probe.js')
+const { main, resolveWorkerApiKey, UsageError } = await import('../src/cli.js')
 
-const MODEL = 'qwen3-coder:30b'
+const MODEL = 'qwen3-coder:30b' // what the fake provider reports
 const KEY_VAR = 'LITELLM_MASTER_KEY' // ends in _KEY, so the redaction treats its value as a secret
 const KEY = 'test-master-key-0123456789'
-const CONFIG_KEY = 'test-config-key-9876543210'
 const SHORT_KEY = 'zq7-x9k' // 7 characters: the redaction masks from 8 up
 const MIN_KEY = 'zq7-x9k2' // 8 characters: the shortest value it masks
 
@@ -90,7 +89,8 @@ afterEach(async () => {
 function workerConfig(dir: string, baseUrl: string, over: Record<string, unknown> = {}) {
   const p = join(dir, 'worker.json')
   writeFileSync(p, JSON.stringify({
-    model: { baseUrl, name: MODEL },
+    litellm: { baseUrl, configPath: '/etc/agent-harness/litellm/config.yaml', composePath: '/etc/agent-harness/litellm/compose.yaml' },
+    configurations: { [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 32768 } },
     mcp: { command: 'mcp-bin', args: ['--x'], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}', SCRUM4ME_WORKER_CAPABILITIES: 'code_edit' } },
     waitSeconds: 1,
     workerLog: { dir: join(dir, 'worker-logs'), pool: 'harness', instance: 'max2' },
@@ -99,24 +99,17 @@ function workerConfig(dir: string, baseUrl: string, over: Record<string, unknown
   return p
 }
 
-function writeProbe(out: string, baseUrl: string) {
-  const d = probeDir(out, MODEL)
-  mkdirSync(d, { recursive: true })
-  writeFileSync(join(d, 'probe.json'), JSON.stringify({ baseUrl, model: MODEL, tool_calling: 'reliable' }))
-}
-
-/** `harness worker --once` in a fresh dir, with a reliable probe for `baseUrl` unless `probe: false`. */
-async function harnessWorker(o: { baseUrl?: string; config?: Record<string, unknown>; flags?: string[]; probe?: boolean } = {}) {
+/** `harness worker --once` in a fresh dir. */
+async function harnessWorker(o: { baseUrl?: string; config?: Record<string, unknown>; flags?: string[] } = {}) {
   const baseUrl = o.baseUrl ?? 'http://127.0.0.1:1/v1'
   const dir = tmp('cli-worker-key')
   const out = join(dir, 'runs')
-  if (o.probe !== false) writeProbe(out, baseUrl)
   const code = await main(['worker', '--config', workerConfig(dir, baseUrl, o.config), '--out', out, '--once', ...(o.flags ?? [])])
   return { code, out, logDir: join(dir, 'worker-logs'), text: output.join('') }
 }
 
 async function answeringModel(content = 'Hier is je antwoord.'): Promise<Fake> {
-  model = await startFakeModelServer([{ body: completion({ content, model: MODEL }) }])
+  model = await startFakeModelServer([{ body: completion({ content, model: MODEL }) }], { ids: [TEST_CONFIGURATION] })
   return model
 }
 
@@ -144,18 +137,7 @@ describe('harness worker --api-key-env', () => {
       expect(m.requests[0].headers.authorization).toBe(`Bearer ${KEY}`)
     })
 
-    it('lets the key win over a model.apiKey in the worker config, which stays as it was loaded', async () => {
-      const m = await answeringModel()
-      setEnv(KEY_VAR, KEY)
-      claims = [{ job: ideaChatPayload() }]
-      const config = { model: { baseUrl: m.baseUrl, name: MODEL, apiKey: CONFIG_KEY } }
-      const { code } = await harnessWorker({ baseUrl: m.baseUrl, config, flags: ['--api-key-env', KEY_VAR] })
-      expect(code).toBe(0)
-      expect(m.requests[0].headers.authorization).toBe(`Bearer ${KEY}`)
-      expect(workerDeps[0].config.model.apiKey).toBe(CONFIG_KEY) // the flag only reaches the client
-    })
-
-    it('hands the key to the model client only: not to the config of the worker, the run dir, the run-log or the output', async () => {
+    it('hands the key to the model clients and the LiteLLM check only: not to the config of the worker, the run dir, the run-log or the output', async () => {
       const m = await answeringModel()
       setEnv(KEY_VAR, KEY)
       claims = [{ job: ideaChatPayload() }]
@@ -165,8 +147,8 @@ describe('harness worker --api-key-env', () => {
       expect(m.requests[0].headers.authorization).toBe(`Bearer ${KEY}`)
       const runLog = runLogText(logDir)
       expect(runLog).toContain('config job_id=job1')
+      expect(m.modelsRequests[0].headers.authorization).toBe(`Bearer ${KEY}`) // the LiteLLM check used it too
       expect(workerDeps).toHaveLength(1)
-      expect(workerDeps[0].config.model).not.toHaveProperty('apiKey')
       expect(JSON.stringify(workerDeps[0].config)).not.toContain(KEY)
       expect(runLog).not.toContain(KEY)
       expect(dirContains(out, KEY), 'trace.jsonl and the other files of the run dir').toBe(false)
@@ -195,17 +177,18 @@ describe('harness worker --api-key-env', () => {
       setEnv(KEY_VAR, value)
       claims = [{ timeout: true }]
       const { code, text } = await harnessWorker({ flags: ['--api-key-env', KEY_VAR] })
-      expect(code).toBe(1)
+      expect(code).toBe(78)
       expect(text).toContain(KEY_VAR)
       expect(text).toContain('Usage:') // only a UsageError prints the usage
       expect(stdioCalls).toHaveLength(0)
     })
 
-    it('ahead of the probe gate: the variable is reported even where no probe exists', async () => {
-      const { code, text } = await harnessWorker({ probe: false, flags: ['--api-key-env', KEY_VAR] })
-      expect(code).toBe(1)
+    it('ahead of the LiteLLM check: no request reaches LiteLLM', async () => {
+      const m = await answeringModel()
+      const { code, text } = await harnessWorker({ baseUrl: m.baseUrl, flags: ['--api-key-env', KEY_VAR] })
+      expect(code).toBe(78)
       expect(text).toContain(KEY_VAR)
-      expect(text).not.toContain('PROBE_REQUIRED')
+      expect(m.modelsRequests).toHaveLength(0)
       expect(stdioCalls).toHaveLength(0)
     })
 
@@ -214,7 +197,7 @@ describe('harness worker --api-key-env', () => {
       setEnv(name, KEY)
       claims = [{ timeout: true }]
       const { code, text } = await harnessWorker({ flags: ['--api-key-env', name] })
-      expect(code).toBe(1)
+      expect(code).toBe(78)
       expect(text).toContain(name)
       expect(text).toContain('Usage:')
       expect(text).not.toContain(KEY)
@@ -225,7 +208,7 @@ describe('harness worker --api-key-env', () => {
       setEnv(KEY_VAR, SHORT_KEY)
       claims = [{ timeout: true }]
       const { code, text } = await harnessWorker({ flags: ['--api-key-env', KEY_VAR] })
-      expect(code).toBe(1)
+      expect(code).toBe(78)
       expect(text).toContain(KEY_VAR)
       expect(text).toContain('Usage:')
       expect(text).not.toContain(SHORT_KEY)
@@ -234,8 +217,7 @@ describe('harness worker --api-key-env', () => {
   })
 })
 
-describe('resolveWorkerModel', () => {
-  const block = { baseUrl: 'http://127.0.0.1:4000/v1', name: 'qwen3.8-27b' }
+describe('resolveWorkerApiKey', () => {
   const env = { [KEY_VAR]: KEY }
 
   /** The message of the UsageError that `fn` throws; fails the test on any other outcome. */
@@ -251,44 +233,27 @@ describe('resolveWorkerModel', () => {
   }
 
   describe('without --api-key-env', () => {
-    it('returns the model block itself, a model.apiKey included', () => {
-      expect(resolveWorkerModel(block, undefined, env)).toBe(block)
-      const withKey = { ...block, apiKey: CONFIG_KEY }
-      expect(resolveWorkerModel(withKey, undefined, env)).toBe(withKey)
+    it('returns no key', () => {
+      expect(resolveWorkerApiKey(undefined, env)).toBeUndefined()
     })
   })
 
   describe('with a usable variable', () => {
-    it('returns a copy of the block that holds the key, and leaves the block it was given as it was', () => {
-      const frozen = Object.freeze({ ...block })
-      const resolved = resolveWorkerModel(frozen, KEY_VAR, env)
-      expect(resolved).toEqual({ ...block, apiKey: KEY })
-      expect(resolved).not.toBe(frozen)
-      expect(frozen).not.toHaveProperty('apiKey')
-    })
-
-    it('lets the key win over a model.apiKey', () => {
-      const withKey = Object.freeze({ ...block, apiKey: CONFIG_KEY })
-      expect(resolveWorkerModel(withKey, KEY_VAR, env).apiKey).toBe(KEY)
-      expect(withKey.apiKey).toBe(CONFIG_KEY)
-    })
-
-    it('keeps the other fields of the block', () => {
-      const full = { ...block, reasoningEffort: 'none' as const, extraBody: { temperature: 0.2 } }
-      expect(resolveWorkerModel(full, KEY_VAR, env)).toEqual({ ...full, apiKey: KEY })
+    it('returns the value of the variable', () => {
+      expect(resolveWorkerApiKey(KEY_VAR, env)).toBe(KEY)
     })
 
     it('reads the env it is given, not process.env', () => {
       setEnv(KEY_VAR, 'process-env-value-that-must-not-be-used')
-      expect(resolveWorkerModel(block, KEY_VAR, env).apiKey).toBe(KEY)
+      expect(resolveWorkerApiKey(KEY_VAR, env)).toBe(KEY)
     })
 
     it.each(['LITELLM_MASTER_KEY', 'OPENROUTER_API_KEY', 'litellm_master_key'])('accepts the secret-like name %s', (name) => {
-      expect(resolveWorkerModel(block, name, { [name]: KEY }).apiKey).toBe(KEY)
+      expect(resolveWorkerApiKey(name, { [name]: KEY })).toBe(KEY)
     })
 
     it('accepts a value of exactly 8 characters', () => {
-      expect(resolveWorkerModel(block, KEY_VAR, { [KEY_VAR]: MIN_KEY }).apiKey).toBe(MIN_KEY)
+      expect(resolveWorkerApiKey(KEY_VAR, { [KEY_VAR]: MIN_KEY })).toBe(MIN_KEY)
     })
   })
 
@@ -297,18 +262,18 @@ describe('resolveWorkerModel', () => {
       ['is unset', {}],
       ['is empty', { [KEY_VAR]: '' }],
     ])('when the variable %s', (_what, source) => {
-      const message = usageErrorOf(() => resolveWorkerModel(block, KEY_VAR, source))
+      const message = usageErrorOf(() => resolveWorkerApiKey(KEY_VAR, source))
       expect(message).toContain(KEY_VAR)
       expect(message).toMatch(/not set/)
     })
 
     // A shell variable that expanded to nothing gives `--api-key-env ''`: no reason to run without a key.
     it('when the name of the variable is empty, instead of taking that for "no option"', () => {
-      expect(usageErrorOf(() => resolveWorkerModel(block, '', env))).toMatch(/needs the name of an environment variable/)
+      expect(usageErrorOf(() => resolveWorkerApiKey('', env))).toMatch(/needs the name of an environment variable/)
     })
 
     it.each(['LITELLM', 'LITELLM_KEY_FILE', 'LITELLMKEY'])('when the name %s is not one the redaction treats as secret, without printing the value', (name) => {
-      const message = usageErrorOf(() => resolveWorkerModel(block, name, { [name]: KEY }))
+      const message = usageErrorOf(() => resolveWorkerApiKey(name, { [name]: KEY }))
       expect(message).toContain(name)
       expect(message).toMatch(/does not look like a secret name/)
       expect(message).not.toContain(KEY)
@@ -317,13 +282,13 @@ describe('resolveWorkerModel', () => {
     // collectSecretEntries finds the password of a URL under any name, but as `<NAME> (url-wachtwoord)`: not the name itself.
     it('when the only secret in the value is a URL password under a name that is not secret-like', () => {
       const value = 'https://litellm:pw-fake-0123456789@gateway.example/v1'
-      const message = usageErrorOf(() => resolveWorkerModel(block, 'LITELLM', { LITELLM: value }))
+      const message = usageErrorOf(() => resolveWorkerApiKey('LITELLM', { LITELLM: value }))
       expect(message).toMatch(/does not look like a secret name/)
       expect(message).not.toContain('pw-fake-0123456789')
     })
 
     it('when the value is shorter than 8 characters, without printing it', () => {
-      const message = usageErrorOf(() => resolveWorkerModel(block, KEY_VAR, { [KEY_VAR]: SHORT_KEY }))
+      const message = usageErrorOf(() => resolveWorkerApiKey(KEY_VAR, { [KEY_VAR]: SHORT_KEY }))
       expect(message).toContain(KEY_VAR)
       expect(message).toMatch(/shorter than 8 characters/)
       expect(message).not.toContain(SHORT_KEY)

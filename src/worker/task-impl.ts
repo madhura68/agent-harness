@@ -9,6 +9,7 @@ import type { ClaimResult, LogArgs, StatusUpdate } from './control.js'
 import { buildScript, containerName, killLeftoverContainers, runInContainer } from './containers.js'
 import { startHeartbeat } from './heartbeat.js'
 import { commitAll, diffGitAdmin, snapshotGitAdmin, type GitAdminSnapshot } from './host-git.js'
+import { failBeforeRunning, limitsFor, modelClientFor, modelSpecFor, resolveJobConfiguration } from './job-configuration.js'
 import type { RunLog } from './run-log.js'
 import { createTaskTools, type VerifyRun } from './task-tools.js'
 import type { JobOutcome, WorkerDeps } from './worker.js'
@@ -19,7 +20,7 @@ import type { JobOutcome, WorkerDeps } from './worker.js'
 
 const nullableText = z.string().nullable().optional()
 
-/** The TASK_IMPLEMENTATION payload from scrum4me-mcp wait_for_job (source COPILOT); prompt_text and the rest are ignored. */
+/** The TASK_IMPLEMENTATION payload from scrum4me-mcp wait_for_job (source COPILOT); prompt_text and the rest are ignored, but `config` (the configuration and the cost ceiling of the job) is read by job-configuration.ts. */
 export const TaskPayloadSchema = z.object({
   job_id: z.string(),
   kind: z.literal('TASK_IMPLEMENTATION'),
@@ -193,6 +194,11 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     return closeFailed(`payload ongeldig: ${parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')}`, 'PAYLOAD_INVALID')
   }
   const p = parsed.data
+  // The job's own configuration and cost ceiling, from its payload: one that this worker does not have fails this job only, and like an
+  // invalid payload it leaves the task alone (nothing below this line has run).
+  const resolved = resolveJobConfiguration(config, claim.payload)
+  if (!resolved.ok) return failBeforeRunning(deps, jobId, runLog, resolved.failure)
+  const job = resolved.job
   runLog?.worktree(p.worktree_path)
   const task = config.task
   if (!task) return closeFailed('worker heeft geen task-config', 'NO_TASK_CONFIG')
@@ -321,7 +327,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     if (lost) return abandon()
     if (!inProgress.ok) return await failPath(`update_task_status in_progress mislukt: ${inProgress.message ?? 'onbekend'}`, 'JOB_FAILED')
     runLog?.step('task_status in_progress')
-    await logStep('implementation', { content: `lokaal model start: ${config.model.name}, recept ${repoUrl}` })
+    await logStep('implementation', { content: `lokaal model start: ${job.name}, recept ${repoUrl}` })
     const beforePrepare = interrupted()
     if (beforePrepare) return await beforePrepare
 
@@ -350,14 +356,14 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
       profile: 'tools',
       system: TASK_SYSTEM_PROMPT,
       prompt: renderTaskPrompt(p),
-      model: config.model,
+      model: modelSpecFor(config, job),
       tools: { server: { command: 'shared', args: [] }, allow: ['list_files', 'read_file', 'write_file', 'edit_file', 'search', 'run_tests', ...config.allow] },
-      limits: task.limits,
+      limits: limitsFor(task.limits, job),
     }
     let result: RunResult
     try {
       result = await runManifest(manifest, {
-        client: deps.modelClient,
+        client: modelClientFor(deps.modelClients, job.name),
         trace,
         connectRegistry: async (signal) => {
           const docs = await deps.registryView(signal)
@@ -425,7 +431,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     const done: StatusUpdate = {
       status: 'done',
       summary: buildSummary(result.answer ?? '', recipe.verify),
-      model_id: result.model.reported ?? config.model.name,
+      model_id: result.model.reported ?? job.name,
       ...(result.usage.source === 'provider_reported' ? { input_tokens: result.usage.inputTokens, output_tokens: result.usage.outputTokens } : {}),
     }
     const outcome = await control.updateStatus(jobId, done)

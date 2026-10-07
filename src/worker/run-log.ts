@@ -20,7 +20,10 @@ export type RunLogOutcome = 'done' | 'failed' | 'abandoned'
 export type RunLogInit = {
   jobId: string
   kind: string // claim.kind
+  /** The configuration of the job (its name) and the LiteLLM address it is called at. */
   model: { name: string; baseUrl: string }
+  costMode: string // 'local' | 'hosted', or 'onbekend' for a job whose configuration is not one of this worker's
+  maxCostUsd: string // the ceiling of the job as a decimal string, or 'ontbrekend'
   version: string // 'agent-harness@<package.json-versie>'
   secrets: readonly string[] // uit collectSecretValues
   cwd?: string // voor harness.run_start; standaard process.cwd(), worktree() overschrijft het
@@ -193,7 +196,9 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
   // a usable (now-disabled) RunLog, per the same one-log-line contract as any later write failure.
   try {
     appendMetaLine(`claimed job_id=${jobId}`)
-    appendMetaLine(`config job_id=${jobId} runtime=HARNESS kind=${init.kind} model=${init.model.name} base_url=${init.model.baseUrl}`)
+    appendMetaLine(
+      `config job_id=${jobId} runtime=HARNESS kind=${init.kind} model=${init.model.name} configuration=${init.model.name} cost_mode=${init.costMode} max_cost_usd=${init.maxCostUsd} base_url=${init.model.baseUrl}`,
+    )
   } catch (err) {
     failOnce(err)
   }
