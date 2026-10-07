@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createCostGuard, formatNanos, parseCeilingNanos, statusCost, type CostMode } from '../src/cost.js'
 import type { Manifest } from '../src/manifest.js'
@@ -48,6 +50,7 @@ async function run(
     tools: { server: { command: 'unused', args: [] }, allow: ['echo'] },
     limits: { ...limits, ...(opts.maxWallSeconds ? { maxWallSeconds: opts.maxWallSeconds } : {}) },
   }
+  const trace = openTrace(tmp('cost'), m.id)
   const guard = createCostGuard({ mode: opts.mode ?? 'hosted', ceilingNanos: parseCeilingNanos(opts.ceiling ?? '1'), configuration: CONFIGURATION })
   // Counts the calls that reach the client, also those that never reach the server (a call on an aborted signal).
   const real = createModelClient({ baseUrl: fake.baseUrl, name: CONFIGURATION })
@@ -55,14 +58,14 @@ async function run(
   const client: ModelClient = { complete: (...args) => { completeCalls++; return real.complete(...args) } }
   const result = await runManifest(m, {
     client,
-    trace: openTrace(tmp('cost'), m.id),
+    trace,
     connectRegistry: async () => connectRegistry(mcp.client, ['echo']),
     costGuard: guard,
     ...(opts.retryOnce !== undefined ? { retryOnce: opts.retryOnce } : {}),
     ...(opts.afterAnswer ? { afterAnswer: opts.afterAnswer } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
   })
-  return { result, guard, requests: fake.requests, mcpCalls: mcp.calls, completeCalls: () => completeCalls }
+  return { result, guard, trace, requests: fake.requests, mcpCalls: mcp.calls, completeCalls: () => completeCalls }
 }
 
 describe('runManifest — the cost ceiling', () => {
@@ -125,6 +128,15 @@ describe('runManifest — the cost ceiling', () => {
     const r = await run([final(0.01)], { ceiling: '0.0000000001' }) // rounds down to 0 nanos
     expect(r.result.status).toBe('completed')
     expect(r.requests).toHaveLength(1)
+  })
+
+  it('never stops a local configuration on money, whatever its ceiling is (decision 13): not even a ceiling that is 0 nanos', async () => {
+    const r = await run([tool(5), tool(5), final(5)], { mode: 'local', ceiling: '0.0000000001' })
+    expect(r.result.status).toBe('completed')
+    expect(r.requests).toHaveLength(3)
+    const guard = createCostGuard({ mode: 'local', ceilingNanos: 0n, configuration: CONFIGURATION })
+    guard.afterResponse({ message: { content: 'x', toolCalls: [] }, finishReason: 'stop', usage: { source: 'provider_reported', inputTokens: 1, outputTokens: 1, costUsd: 5 }, model: undefined, durationMs: 1 })
+    expect(guard.beforeRequest()).toBeUndefined()
   })
 
   it('never counts the amounts of a local configuration (decision 13)', async () => {
@@ -228,6 +240,15 @@ describe('runManifest — one retry on a hosted storing', () => {
     expect(r.requests[1].body).toEqual(r.requests[0].body) // the same request
     expect(r.result.usage.turns).toBe(1) // a retry is no extra turn
     expect(r.guard.summary().responses).toBe(1)
+  })
+
+  it.each(storingen)('hosted: %s writes one model_retry event to the trace (attempt 1, with the kind of the failure)', async (_name, storing) => {
+    const r = await run([storing, ok], { retryOnce: true })
+    const events = readFileSync(join(r.trace.dir, 'trace.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as { type: string; attempt?: number; kind?: string })
+    const retries = events.filter((e) => e.type === 'model_retry')
+    expect(retries).toHaveLength(1)
+    expect(retries[0].attempt).toBe(1)
+    expect(typeof retries[0].kind).toBe('string')
   })
 
   it.each(storingen)('hosted: %s twice is MODEL_ERROR after exactly two requests', async (_name, storing) => {

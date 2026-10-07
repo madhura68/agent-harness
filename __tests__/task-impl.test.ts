@@ -352,7 +352,7 @@ describe('runTaskJob — green path', () => {
     expect(String(done?.summary)).toBe('src/greet.ts toegevoegd; tests groen.\n\nVerify: groen (npm test)')
     const commit = t.mcp.calls.find((c) => c.name === 'log_commit')?.args
     expect(commit).toMatchObject({ commit_hash: await git(t.worktree, ['rev-parse', 'HEAD']), commit_message: 'feat: voeg greet() toe', task_id: 'task-1', story_id: 'story-1' })
-    expect(t.mcp.calls.find((c) => c.name === 'log_implementation')?.args.content).toBe(`lokaal model start: ${TEST_CONFIGURATION}, recept https://git.example/repo.git`)
+    expect(t.mcp.calls.find((c) => c.name === 'log_implementation')?.args.content).toBe(`model start: ${TEST_CONFIGURATION}, recept https://git.example/repo.git`)
     expect(t.docker.runs().map((a) => a[a.indexOf('--name') + 1])).toEqual(['harness-job1-prepare-1', 'harness-job1-verify-2'])
     const containers = traceOf(t.out).filter((e) => e.type === 'container')
     expect(containers.map((e) => [e.kind, e.source])).toEqual([['prepare', 'prepare'], ['verify', 'gate']])
@@ -1036,9 +1036,9 @@ describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
     expect(manifestOf(t.out, 2).manifest.limits).toMatchObject({ contextTokens: 1100 })
     // The log line of the task names the configuration.
     expect(t.mcp.calls.filter((c) => c.name === 'log_implementation').map((c) => c.args.content)).toEqual([
-      'lokaal model start: fast-local, recept https://git.example/repo.git',
-      'lokaal model start: deep-hosted, recept https://git.example/repo.git',
-      'lokaal model start: tiny, recept https://git.example/repo.git',
+      'model start: fast-local, recept https://git.example/repo.git',
+      'model start: deep-hosted, recept https://git.example/repo.git',
+      'model start: tiny, recept https://git.example/repo.git',
     ])
   })
 
@@ -1076,6 +1076,7 @@ describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
   it.each([
     ['missing', { runtime: 'HARNESS', model: TEST_CONFIGURATION }, 'COST_LIMIT_MISSING: ontbrekend'],
     ["'0'", harnessConfig(TEST_CONFIGURATION, '0'), 'COST_LIMIT_MISSING: 0'],
+    ["'0.0000000001' (0 nanos)", harnessConfig(TEST_CONFIGURATION, '0.0000000001'), 'COST_LIMIT_MISSING: 0.0000000001'],
     ["'abc'", harnessConfig(TEST_CONFIGURATION, 'abc'), 'COST_LIMIT_MISSING: abc'],
     ["'1e-2'", harnessConfig(TEST_CONFIGURATION, '1e-2'), 'COST_LIMIT_MISSING: 1e-2'],
     ['-1', harnessConfig(TEST_CONFIGURATION, -1), 'COST_LIMIT_MISSING: -1'],

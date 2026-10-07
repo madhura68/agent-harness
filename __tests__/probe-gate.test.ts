@@ -110,6 +110,12 @@ describe('probeVerdict', () => {
     expect(verdict.reasons[0]).toContain(step)
   })
 
+  // R15, a deliberate ruling: a step that has no answer at all (an empty list) has nothing to be wrong about; whether the model can use tools
+  // is decided by tool_calling, which is reliable here. The pin keeps this from changing by accident.
+  it('accepts a hosted probe in which a step has no answer at all (costsUsd is empty) while tool_calling is reliable (R15)', () => {
+    expect(probeVerdict(probeOf({ d_nonexistent_tool: [] }), HOSTED)).toEqual({ accepted: true, reasons: [] })
+  })
+
   it('does not accept a hosted probe from a file without costs per answer (the shape before M45-2d)', () => {
     expect(probeVerdict(probeOf({ c_two_tools: undefined }), HOSTED).accepted).toBe(false)
   })

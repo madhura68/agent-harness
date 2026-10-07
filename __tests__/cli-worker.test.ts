@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 import type { ServerSpec } from '../src/types.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep, type HealthSetup } from './fakes/fake-scrum4me-mcp.js'
@@ -12,6 +13,8 @@ import { dirContains, tmp } from './helpers.js'
 const stdioCalls: ServerSpec[] = []
 let claims: ClaimStep[] = []
 let health: HealthSetup = {}
+/** When set, the `health` call of the connected client throws this (a transport failure; the tool answers are the fake's own). */
+let healthThrows: Error | undefined
 let fakeMcp: Awaited<ReturnType<typeof startFakeScrum4meMcp>> | undefined
 // Set fresh on every connectStdioClient call: lets a test assert the harness itself closed the MCP
 // child (Fix 2 / cmdWorker's `finally`), independent of this test file's own afterEach cleanup below.
@@ -24,6 +27,15 @@ vi.mock('../src/tools/registry.js', async (importActual) => {
     connectStdioClient: vi.fn(async (server: ServerSpec) => {
       stdioCalls.push(server)
       fakeMcp = await startFakeScrum4meMcp({ claims, health })
+      if (healthThrows) {
+        const client = fakeMcp.client
+        const original = client.callTool.bind(client)
+        const thrown = healthThrows
+        client.callTool = (async (params: Parameters<typeof original>[0], ...rest: unknown[]) => {
+          if (params.name === 'health') throw thrown
+          return (original as (...a: unknown[]) => unknown)(params, ...rest)
+        }) as typeof client.callTool
+      }
       const closeSpy = vi.fn(fakeMcp.close)
       lastCloseSpy = closeSpy
       return { client: fakeMcp.client, close: closeSpy }
@@ -40,6 +52,7 @@ beforeEach(() => {
   stdioCalls.length = 0
   claims = []
   health = {}
+  healthThrows = undefined
   stderr = []
   process.env.TEST_LITELLM_MASTER_KEY = 'test-master-key-0123456789' // `worker` needs --api-key-env; runWorkerCli passes it
   vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true })
@@ -279,6 +292,19 @@ describe('harness worker — start check and exit codes (M45-2d)', () => {
     expect(fakeMcp?.calls.map((c) => c.name).filter((n) => n !== 'health')).toEqual([])
     expect(stderr.join('')).toContain(`STARTCHECK_FAILED: de MCP kent HARNESS niet (health.runtimes=${shown})`)
     expect(lastCloseSpy).toHaveBeenCalledTimes(1) // the MCP child does not outlive the refusal
+  })
+
+  it.each([
+    ['a request timeout of the SDK', new McpError(ErrorCode.RequestTimeout, 'Request timed out')],
+    ['a transport error', new Error('socket hang up')],
+  ])('exits 1 (restart), not 78, when the health call itself fails with %s', async (_what, thrown) => {
+    healthThrows = thrown
+    claims = [{ job: ideaChatPayload() }]
+    const code = await start()
+    expect(code).toBe(1)
+    expect(waitCalls()).toBe(0)
+    expect(stderr.join('')).not.toContain('STARTCHECK_FAILED')
+    expect(lastCloseSpy).toHaveBeenCalledTimes(1)
   })
 
   it('calls health once before the first wait_for_job when runtimes contains HARNESS, and the loop starts', async () => {

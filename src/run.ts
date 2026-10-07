@@ -279,7 +279,10 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
           if (aborted()) return ABORTED
           if (signal.aborted || now() >= deadline) return { status: 'timed_out' }
           if (!(err instanceof ModelError)) throw err
-          if (deps.retryOnce && attempt === 1 && isStoring(err)) continue
+          if (deps.retryOnce && attempt === 1 && isStoring(err)) {
+            trace.event({ type: 'model_retry', attempt, kind: err.detail?.kind ?? 'unknown', ...(err.detail?.status !== undefined ? { status: err.detail.status } : {}) })
+            continue
+          }
           return { status: 'failed', error: { code: 'MODEL_ERROR', message: err.message } }
         }
       }

@@ -47,7 +47,8 @@ function claimedConfig(payload: unknown): Record<string, unknown> {
 function parseMaxCostUsd(value: unknown): string | undefined {
   if (typeof value !== 'string' || !/[1-9]/.test(value)) return undefined
   try {
-    parseCeilingNanos(value)
+    // A ceiling that rounds down to 0 nanos (more than nine decimals, all zero up to the ninth) would stop a hosted job after its first call: no ceiling.
+    if (parseCeilingNanos(value) === 0n) return undefined
   } catch {
     return undefined
   }

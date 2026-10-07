@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process'
+import { spawnGroup } from './spawn-group'
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -65,7 +65,7 @@ const hostCmds = (): string[] => calls().map((c) => c.split('|').slice(0, 2).joi
 const stopCalls = (): string[] => calls().filter((c) => c.includes('agent-harness-ops.sh stop'))
 
 function run(bash = process.env.OPS_BASH ?? 'bash') {
-  const res = spawnSync(bash, [SCRIPT], {
+  const res = spawnGroup(bash, [SCRIPT], {
     env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin`, FAKE_DIR: fake, TMPDIR: tmp, HOME: dir },
     encoding: 'utf8',
     timeout: 30000,

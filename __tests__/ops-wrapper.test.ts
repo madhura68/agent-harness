@@ -1,5 +1,5 @@
-import { spawnSync } from 'node:child_process'
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawnGroup } from './spawn-group'
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -41,7 +41,7 @@ let dir: string
 let log: string
 
 function setup(): void {
-  dir = mkdtempSync(join(tmpdir(), 'ops-wrapper-'))
+  dir = mkdtempSync(join(realpathSync(tmpdir()), 'ops-wrapper-'))
   log = join(dir, 'calls.log')
   writeFileSync(log, '')
   mkdirSync(join(dir, 'bin'))
@@ -62,7 +62,7 @@ exit 0`
     writeStub(naam, body)
   }
   for (const naam of FILE_SHIMS) {
-    const failHook = naam === 'mv' ? '\nif [ -n "$STUB_MV_FAIL" ]; then exit 1; fi' : ''
+    const failHook = naam === 'mv' ? '\nif [ -n "$STUB_MV_FAIL" ]; then exit 1; fi' : naam === 'chmod' ? '\nif [ -n "$STUB_CHMOD_FAIL" ] && [ "$1" = "$STUB_CHMOD_FAIL" ]; then exit 1; fi' : ''
     writeStub(naam, `${logLine}${failHook}\nfor d in /usr/bin /bin; do [ -x "$d/\${0##*/}" ] && exec "$d/\${0##*/}" "$@"; done\nexit 127`)
   }
 }
@@ -87,13 +87,13 @@ function env(extra: Record<string, string> = {}): Record<string, string> {
 }
 
 function run(args: string[], opts: { input?: string; env?: Record<string, string>; timeout?: number } = {}): { code: number | null; stdout: string; stderr: string; signal: NodeJS.Signals | null } {
-  const res = spawnSync(process.env.OPS_BASH ?? 'bash', [SCRIPT, ...args], { input: opts.input ?? '', env: env(opts.env), encoding: 'utf8', timeout: opts.timeout })
+  const res = spawnGroup(process.env.OPS_BASH ?? 'bash', [SCRIPT, ...args], { input: opts.input ?? '', env: env(opts.env), encoding: 'utf8', timeout: opts.timeout })
   return { code: res.status, stdout: res.stdout, stderr: res.stderr, signal: res.signal }
 }
 
 /** Source the wrapper and run a snippet with its helpers (the main dispatcher does not run when the file is sourced). */
 function runHelper(snippet: string, extra: Record<string, string> = {}): { code: number | null; stdout: string; stderr: string } {
-  const res = spawnSync(process.env.OPS_BASH ?? 'bash', ['-c', `source "${SCRIPT}"; ${snippet}`], { input: '', env: env(extra), encoding: 'utf8' })
+  const res = spawnGroup(process.env.OPS_BASH ?? 'bash', ['-c', `source "${SCRIPT}"; ${snippet}`], { input: '', env: env(extra), encoding: 'utf8' })
   return { code: res.status, stdout: res.stdout, stderr: res.stderr }
 }
 
@@ -166,7 +166,7 @@ describe('ops wrapper: de actielijst', () => {
     const res = runHelper('printf %s "$PATH"', { AH_PATH: '' })
     expect(res.stdout).toBe('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
     // the caller's PATH (with the stubs) is not used when AH_PATH is not set
-    const res2 = spawnSync(process.env.OPS_BASH ?? 'bash', ['-c', `unset AH_PATH; source "${SCRIPT}"; printf %s "$PATH"`], { env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin` }, encoding: 'utf8' })
+    const res2 = spawnGroup(process.env.OPS_BASH ?? 'bash', ['-c', `unset AH_PATH; source "${SCRIPT}"; printf %s "$PATH"`], { env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin` }, encoding: 'utf8' })
     expect(res2.stdout).toBe('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
     expect(runHelper('printf %s "$PATH"').stdout).toBe(`${join(dir, 'bin')}:/usr/bin:/bin`)
   })
@@ -487,6 +487,14 @@ describe('ops wrapper: install en releases (deel c)', () => {
     installStubs()
     mkdirSync(units(), { recursive: true })
     stateOf('agent-harness.service', 'inactive')
+  })
+
+  describe('install: chmod-fouten zijn 74, niet een kale exit 1', () => {
+    it('geeft 74 met een duidelijke regel als chmod van de srv-mappen faalt', () => {
+      const res = install({ STUB_CHMOD_FAIL: '755' })
+      expect(res.code, res.stderr).toBe(74)
+      expect(res.stderr).toContain('chmod')
+    })
   })
 
   describe('stilstand en lock', () => {
@@ -995,6 +1003,7 @@ exit 0`,
     mkdirSync(units(), { recursive: true })
     mkdirSync(VAR())
     stateOf('agent-harness.service', 'inactive')
+    stateOf('agent-harness-probe.service', 'inactive')
     stateOf('agent-harness-worker.service', 'inactive')
     // node: the real one, except that a flag file makes the next call fail once (an interruption inside the switch)
     rmSync(join(dir, 'bin', 'node'))
@@ -1147,6 +1156,7 @@ exit 0`,
       expect(view()).toEqual([
         'flock -n 9',
         'systemctl is-active agent-harness.service',
+        'systemctl is-active agent-harness-probe.service',
         `git ls-remote ${url} refs/heads/main`,
         `git clone ${url} ${rel}`,
         `git -C ${rel} checkout --detach ${RC}`,
@@ -1229,7 +1239,7 @@ exit 0`,
       writeFileSync(log, '')
       const res = act('release-update', { STUB_HEAD: RC })
       expect(res.code, res.stderr).toBe(0)
-      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', `git ls-remote https://git.example.invalid/janpeter/agent-harness.git refs/heads/main`, 'systemctl daemon-reload'])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service', `git ls-remote https://git.example.invalid/janpeter/agent-harness.git refs/heads/main`, 'systemctl daemon-reload'])
       expect(current()).toBe(`releases/${RC}`)
       expect(read(prevFile())).toBe(`${RB}\n`)
     })
@@ -1240,7 +1250,7 @@ exit 0`,
       writeFileSync(log, '')
       const res = act('release-update', { STUB_HEAD: RC })
       expect(res.code, res.stderr).toBe(0)
-      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', `git ls-remote https://git.example.invalid/janpeter/agent-harness.git refs/heads/main`, 'systemctl daemon-reload'])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service', `git ls-remote https://git.example.invalid/janpeter/agent-harness.git refs/heads/main`, 'systemctl daemon-reload'])
       expect(read(prevFile())).toBe(`${RB}\n`)
       expect(res.stdout).not.toContain('→')
     })
@@ -1291,7 +1301,7 @@ exit 0`,
       expect(res.code, res.stderr).toBe(0)
       expect(current()).toBe(`releases/${RA}`)
       expect(read(prevFile())).toBe(`${RA}\n`)
-      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl daemon-reload'])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service', 'systemctl daemon-reload'])
       expect(stubCalls().filter((c) => /^(git|npm|docker|curl) /.test(c))).toEqual([])
       expect(res.stdout).toContain(`${RB} → ${RA}`)
       expect(readdirSync(VAR()).sort()).toEqual(['release.prev'])
@@ -1303,7 +1313,7 @@ exit 0`,
       writeFileSync(log, '')
       const res = act('release-rollback')
       expect(res.code, res.stderr).toBe(0)
-      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl daemon-reload'])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service', 'systemctl daemon-reload'])
       expect(current()).toBe(`releases/${RA}`)
       expect(read(prevFile())).toBe(`${RA}\n`)
     })
@@ -1328,7 +1338,7 @@ exit 0`,
       writeFileSync(log, '')
       const res = act('release-rollback')
       expect(res.code, res.stderr).toBe(0)
-      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl daemon-reload'])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service', 'systemctl daemon-reload'])
       expect(current()).toBe(`releases/${RA}`)
       expect(read(prevFile())).toBe(`${RA}\n`)
     })
@@ -1608,7 +1618,7 @@ exit 0`,
       expect(mode(sentinel())).toBe('600')
     }
     const mkfifo = (p: string): void => {
-      expect(spawnSync('mkfifo', [p]).status).toBe(0)
+      expect(spawnGroup('mkfifo', [p]).status).toBe(0)
     }
     const timed = (action: string, extra: Record<string, string> = {}) => {
       const res = run([action], { env: dEnv(extra), timeout: 20000 })
@@ -1787,6 +1797,7 @@ describe('ops wrapper: litellm-up, litellm-upgrade en status (deel e)', () => {
     mkdirSync(units(), { recursive: true })
     mkdirSync(VAR())
     stateOf('agent-harness.service', 'inactive')
+    stateOf('agent-harness-probe.service', 'inactive')
     stateOf('agent-harness-worker.service', 'inactive')
     writeStub(
       'systemctl',
@@ -1795,6 +1806,8 @@ if [ "$1" = is-active ]; then
   if [ -f "$STUB_STATE/$2" ]; then s=$(cat "$STUB_STATE/$2"); echo "$s"; [ "$s" = active ] && exit 0; exit 3; fi
   echo unknown; exit 4
 fi
+if [ "$1" = is-active ] && [ -n "$STUB_SYSTEMCTL_SLEEP" ]; then sleep "$STUB_SYSTEMCTL_SLEEP"; fi
+if [ "$1" = daemon-reload ] && [ -n "$STUB_RELOAD_RC" ]; then exit "$STUB_RELOAD_RC"; fi
 if [ "$1" = restart ] && [ -n "$STUB_RESTART_RC" ]; then exit "$STUB_RESTART_RC"; fi
 if [ "$1" = enable ] && [ -n "$STUB_ENABLE_RC" ]; then exit "$STUB_ENABLE_RC"; fi
 exit 0`,
@@ -1809,7 +1822,7 @@ case "$1" in
       *' up '*) exit "\${STUB_UP_RC:-0}" ;;
     esac
     exit 0 ;;
-  inspect) [ -n "$STUB_INSPECT_RC" ] && exit "$STUB_INSPECT_RC"; echo 'running|ghcr.io/berriai/litellm@sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf|sha256:0f1e2d3c'; exit 0 ;;
+  inspect) [ -n "$STUB_DOCKER_SLEEP" ] && sleep "$STUB_DOCKER_SLEEP"; [ -n "$STUB_INSPECT_RC" ] && exit "$STUB_INSPECT_RC"; echo 'running|ghcr.io/berriai/litellm@sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf|sha256:0f1e2d3c'; exit 0 ;;
   image) echo 'ghcr.io/berriai/litellm@sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf'; exit 0 ;;
 esac
 exit 0`,
@@ -1835,6 +1848,8 @@ exit 0`,
       'git',
       `${LOG_LINE}
 mcp=; if [ "$1" = -C ]; then mcp=1; shift 2; fi
+while [ "$1" = -c ]; do shift 2; done
+[ -n "$STUB_GIT_SLEEP" ] && sleep "$STUB_GIT_SLEEP"
 case "$1" in
   rev-parse) echo "$STUB_MCP_HEAD"; exit 0 ;;
   ls-remote)
@@ -1845,6 +1860,32 @@ case "$1" in
 esac
 exit 0`,
     )
+  })
+
+  describe('probe-unit en systemctl-fouten', () => {
+    it.each(['release-update', 'release-rollback', 'litellm-upgrade'])('%s weigert met 75 als agent-harness-probe.service draait, zonder iets te veranderen', (actie) => {
+      ready()
+      writeFileSync(join(VAR(), 'release.prev'), `${SHA}\n`)
+      stateOf('agent-harness-probe.service', 'active')
+      const res = act(actie)
+      expect(res.code, res.stderr).toBe(75)
+      expect(res.stderr).toContain('agent-harness-probe.service')
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service'])
+    })
+
+    it('litellm-upgrade geeft 74 met een duidelijke regel als systemctl daemon-reload faalt (geen kale set -e-exit 1)', () => {
+      ready()
+      const res = act('litellm-upgrade', { STUB_RELOAD_RC: '1' })
+      expect(res.code, res.stderr).toBe(74)
+      expect(res.stderr).toContain('daemon-reload')
+    })
+
+    it('release-update geeft 74 als daemon-reload na het installeren van de units faalt', () => {
+      ready()
+      const res = act('release-update', { STUB_HEAD: SHA, STUB_RELOAD_RC: '1' })
+      expect(res.code, res.stderr).toBe(74)
+      expect(res.stderr).toContain('daemon-reload')
+    })
   })
 
   describe('litellm-up', () => {
@@ -2038,6 +2079,7 @@ exit 0`,
       expect(view()).toEqual([
         'flock -n 9',
         'systemctl is-active agent-harness.service',
+        'systemctl is-active agent-harness-probe.service',
         'systemctl daemon-reload',
         `systemctl restart ${BRIDGE}`,
         `docker compose -p litellm -f ${COMPOSE()} pull`,
@@ -2090,7 +2132,7 @@ exit 0`,
       rmSync(srv('current'))
       const res = act('litellm-upgrade')
       expect(res.code, res.stderr).toBe(66)
-      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service'])
     })
 
     it('controleert eerst álle bronnen: een ontbrekend bronbestand laat elk doel en elke unit onaangeroerd, zonder daemon-reload of docker', () => {
@@ -2103,7 +2145,7 @@ exit 0`,
       expect(read(etc('litellm', 'config.yaml'))).toBe('# oude config\n')
       expect(read(units(BRIDGE))).toBe('# oude brug\n')
       expect(readdirSync(etc()).filter((f) => f.includes('.bak-'))).toEqual([])
-      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service'])
     })
 
     describe('bronnen worden als root gelezen, binnen de release (geen symlink-uitweg)', () => {
@@ -2131,7 +2173,7 @@ exit 0`,
         const res = act('litellm-upgrade')
         expect(res.code, res.stderr).toBe(66)
         nergensGekopieerd()
-        expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+        expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-probe.service'])
       })
 
       it('weigert (66) een release waarin deploy/max2 een symlink naar een map buiten de release is', () => {
@@ -2185,7 +2227,7 @@ exit 0`,
         writeFileSync(pad, 'x'.repeat(2 * 1024 * 1024))
         expect(act('litellm-upgrade').code).toBe(66)
         rmSync(pad)
-        expect(spawnSync('mkfifo', [pad]).status).toBe(0)
+        expect(spawnGroup('mkfifo', [pad]).status).toBe(0)
         const res = act('litellm-upgrade')
         expect(res.signal).toBeNull()
         expect(res.code).toBe(66)
@@ -2243,7 +2285,7 @@ exit 0`,
       expect(res.stdout).toContain(`mcp origin/main: ${SHA2}`)
       // git draait als de eigenaar van de checkout, nooit als root
       const gitCalls = view().filter((c) => c.includes(' git '))
-      expect(gitCalls).toEqual([`OWNER git -C ${MCP()} rev-parse HEAD`, `OWNER git -C ${MCP()} ls-remote origin refs/heads/main`])
+      expect(gitCalls).toEqual([`OWNER git -C ${MCP()} rev-parse HEAD`, `OWNER git -C ${MCP()} -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 ls-remote origin refs/heads/main`])
     })
 
     it('toont de stand van de units, de LiteLLM-container met image-digest en de modelnamen', () => {
@@ -2278,7 +2320,7 @@ exit 0`,
         const [naam, ...rest] = norm.split(' ')
         if (naam === 'systemctl') expect(norm).toMatch(/^systemctl is-active /)
         else if (naam === 'docker') expect(rest[0] === 'inspect' || (rest[0] === 'image' && rest[1] === 'inspect'), norm).toBe(true)
-        else if (naam === 'OWNER' || naam === 'git') expect(norm).toMatch(/^(OWNER )?git -C \S+ (rev-parse HEAD|ls-remote origin refs\/heads\/main)$/)
+        else if (naam === 'OWNER' || naam === 'git') expect(norm).toMatch(/^(OWNER )?git -C \S+ (rev-parse HEAD|-c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 ls-remote origin refs\/heads\/main)$/)
         else if (naam === 'curl') expect(norm).toBe(MODELS_CALL)
         else throw new Error(`onverwachte aanroep: ${norm}`)
       }
@@ -2332,6 +2374,78 @@ exit 0`,
       expect(res.stdout).toContain(`current: ${SHA}`)
     })
 
+    describe('status hangt nooit: harness.json en de probe-mappen komen uit mappen van janpeter, en de externe aanroepen hebben een limiet', () => {
+      it('hangt niet op een FIFO als harness.json', () => {
+        full()
+        rmSync(etc('harness.json'))
+        expect(spawnGroup('mkfifo', [etc('harness.json')]).status).toBe(0)
+        const res = act('status')
+        expect(res.signal).toBeNull()
+        expect(res.code, res.stderr).toBe(0)
+        expect(res.stdout).toMatch(/probe: \(harness\.json onleesbaar/)
+      })
+
+      it('weigert een te grote harness.json en een symlink als harness.json, en toont niets daaruit', () => {
+        full()
+        rmSync(etc('harness.json'))
+        writeFileSync(etc('harness.json'), JSON.stringify({ configurations: { 'gsq-lokaal': {} }, pad: 'x'.repeat(2000000) }))
+        expect(act('status').stdout).toMatch(/probe: \(harness\.json onleesbaar/)
+        rmSync(etc('harness.json'))
+        const geheim = join(dir, 'geheim-harness.json')
+        writeFileSync(geheim, JSON.stringify({ configurations: { [SECRET_SENTINEL.replace('sk-', '')]: {} } }))
+        symlinkSync(geheim, etc('harness.json'))
+        const res = act('status')
+        expect(res.stdout).toMatch(/probe: \(harness\.json onleesbaar/)
+        expect(res.stdout).not.toContain('niet-kopieren')
+      })
+
+      it('volgt geen symlink als probe-<naam>-map en toont niets uit het doel', () => {
+        full()
+        const elders = join(dir, 'elders')
+        mkdirSync(elders)
+        writeFileSync(join(elders, 'probe.json'), JSON.stringify({ accepted: true, hash: HEX64, ranAt: SECRET_SENTINEL }))
+        rmSync(join(RUNS(), 'probe-gsq-lokaal'), { recursive: true })
+        symlinkSync(elders, join(RUNS(), 'probe-gsq-lokaal'))
+        const res = act('status')
+        expect(res.code, res.stderr).toBe(0)
+        expect(res.stdout).toMatch(/probe gsq-lokaal: \(onleesbaar/)
+        expect(res.stdout).not.toContain(SECRET_SENTINEL)
+        expect(res.stdout).toMatch(/probe qwen3\.8-or: accepted=false/)
+      })
+
+      it('volgt geen symlink als runs-map en toont niets uit het doel', () => {
+        full()
+        const echt = join(dir, 'echte-runs')
+        renameSync(RUNS(), echt)
+        symlinkSync(echt, RUNS())
+        const res = act('status')
+        expect(res.code, res.stderr).toBe(0)
+        expect(res.stdout).toMatch(/probe gsq-lokaal: \(onleesbaar/)
+        expect(res.stdout).not.toContain(`hash=${HEX64}`)
+      })
+
+      it.each([
+        ['git', { STUB_GIT_SLEEP: '30' }],
+        ['docker', { STUB_DOCKER_SLEEP: '30' }],
+        ['systemctl', { STUB_SYSTEMCTL_SLEEP: '30' }],
+      ])('is binnen de limiet klaar als %s blijft slapen, en meldt de rest', (_naam, extra) => {
+        full()
+        const t0 = Date.now()
+        const res = act('status', { AH_STATUS_TIMEOUT: '1', ...extra })
+        expect(Date.now() - t0).toBeLessThan(20000)
+        expect(res.signal).toBeNull()
+        expect(res.code, res.stderr).toBe(0)
+        expect(res.stdout).toContain(`current: ${SHA}`)
+        expect(res.stdout).toMatch(/probe gsq-lokaal: accepted=true/)
+      })
+
+      it('geeft ls-remote een lage-snelheidslimiet mee', () => {
+        full()
+        act('status')
+        expect(view().filter((c) => c.startsWith('OWNER') && c.includes('ls-remote'))).toEqual([`OWNER git -C ${MCP()} -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 ls-remote origin refs/heads/main`])
+      })
+    })
+
     describe('probe.json komt uit een map van janpeter: alleen gevalideerde velden, nooit een symlink of FIFO', () => {
       it('volgt geen symlink naar een geheim bestand en toont niets daaruit', () => {
         full()
@@ -2349,7 +2463,7 @@ exit 0`,
         full()
         const pad = join(RUNS(), 'probe-gsq-lokaal', 'probe.json')
         rmSync(pad)
-        expect(spawnSync('mkfifo', [pad]).status).toBe(0)
+        expect(spawnGroup('mkfifo', [pad]).status).toBe(0)
         const res = act('status')
         expect(res.signal).toBeNull()
         expect(res.stdout).toMatch(/probe gsq-lokaal: \(onleesbaar/)

@@ -350,7 +350,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     if (lost) return abandon()
     if (!inProgress.ok) return await failPath(`update_task_status in_progress mislukt: ${inProgress.message ?? 'onbekend'}`, 'JOB_FAILED')
     runLog?.step('task_status in_progress')
-    await logStep('implementation', { content: `lokaal model start: ${job.name}, recept ${repoUrl}` })
+    await logStep('implementation', { content: `model start: ${job.name}, recept ${repoUrl}` })
     const beforePrepare = interrupted()
     if (beforePrepare) return await beforePrepare
 

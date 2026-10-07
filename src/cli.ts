@@ -448,9 +448,10 @@ async function cmdWorker(values: Values): Promise<number> {
     try {
       startCheck = await checkHarnessRuntime(client)
     } catch (err) {
-      // A lost child is a case for a restart (1). Any other failure of the call itself is a refusal like a tool error: the same start fails the same way.
-      if (mcpLost) return EXIT_RESTART
-      startCheck = { ok: false, line: `STARTCHECK_FAILED: de MCP kent HARNESS niet (health.runtimes=ontbrekend): health-aanroep mislukt (${err instanceof Error ? err.message : String(err)})` }
+      // The call itself failed (a lost child, an SDK request timeout, any other transport error): that says nothing about the MCP's runtimes, and
+      // a new start can succeed, so it is a restart (1). Only an answer that lacks HARNESS (checkHarnessRuntime returns it) is a refusal (78).
+      process.stderr.write(`health-aanroep van de startcontrole mislukt (${err instanceof Error ? err.message : String(err)}); herstart\n`)
+      return EXIT_RESTART
     }
     if (!startCheck.ok) {
       process.stderr.write(`${startCheck.line}\n`)

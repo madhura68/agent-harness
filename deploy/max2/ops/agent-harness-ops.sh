@@ -9,12 +9,12 @@
 #   status | install | stop | start | probe | release-update | release-rollback | mcp-update | mcp-rollback
 #   | litellm-up | litellm-upgrade | provider-key <NAME>
 #
-# Exit codes: 0 ok; 1 the mcp-stable checkout is not clean after the MCP install (git status --porcelain); 64 unknown action, extra argument,
+# Exit codes: 0 ok; 1 the mcp-stable checkout is not clean after the MCP install (git status --porcelain; no other failure ends in 1); 64 unknown action, extra argument,
 #   unknown NAME or unusable value (a master key that curl --config could read as another option included); 66 a needed directory or source
 #   file is missing, a source file is a symlink or lies outside the release or is no plain file of a sane size, a release is not built, or
 #   the master key is missing; 73 the lock file, the lock or a file could not be created or written; 74 a release could not be built, switched
-#   or looked up, a git/npm step of the MCP checkout failed, or a docker/systemctl/curl step of the LiteLLM actions failed (LiteLLM not
-#   healthy included); 75 busy (another action holds the lock), the worker is not at a standstill, or a precondition of the action does not
+#   or looked up, a git/npm step of the MCP checkout failed, a docker/systemctl/curl step of the LiteLLM actions failed (LiteLLM not
+#   healthy included), or a systemctl daemon-reload or a chmod/chown of install failed; 75 busy (another action holds the lock), the worker is not at a standstill (release-update, release-rollback and litellm-upgrade also need agent-harness-probe.service stopped), or a precondition of the action does not
 #   hold (no release.prev or mcp.prev, a dirty mcp-stable checkout before an update, a state file that is not a full commit). `probe` returns
 #   the exit code of `systemctl start agent-harness-probe.service`; `stop` that of `systemctl stop`; `status` always 0 (it only reports).
 #
@@ -83,6 +83,8 @@ AH_RUNS_DIR="${AH_RUNS_DIR:-/var/lib/agent-harness/runs}"
 AH_LITELLM_URL="${AH_LITELLM_URL:-http://127.0.0.1:4000}"
 AH_HEALTH_TRIES="${AH_HEALTH_TRIES:-60}"
 AH_HEALTH_SLEEP="${AH_HEALTH_SLEEP:-2}"
+# `status` never hangs: every external call of it (git, docker, systemctl) gets this many seconds (see bounded).
+AH_STATUS_TIMEOUT="${AH_STATUS_TIMEOUT:-20}"
 AH_RELEASE_PREV="$AH_STATE_DIR/release.prev"
 AH_MCP_BUILT="$AH_STATE_DIR/mcp.built"
 AH_MCP_PREV="$AH_STATE_DIR/mcp.prev"
@@ -118,6 +120,20 @@ usage_fail() {
 owner_run() { runuser -u "$AH_OWNER" -- env HOME="$AH_OWNER_HOME" GIT_TERMINAL_PROMPT=0 "$@"; }
 owner_git() { owner_run git "$@"; }
 owner_npm() { owner_run npm "$@"; }
+
+# A command with a hard time limit, for `status` (which must never hang): the command runs in its own process group, and when
+# AH_STATUS_TIMEOUT seconds pass the whole group is killed and the exit code is 124. Stdout is passed on; stdin and stderr are not
+# (callers that want stderr redirect it themselves). Node is used because `timeout` is GNU only and is no part of macOS.
+BOUNDED_JS='const { spawn } = require("child_process");
+const secs = Number(process.argv[1]);
+const c = spawn(process.argv[2], process.argv.slice(3), { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+const out = [];
+c.stdout.on("data", (d) => out.push(d));
+c.on("error", () => process.exit(127));
+const t = setTimeout(() => { try { process.kill(-c.pid, "SIGKILL"); } catch (e) {} process.exit(124); }, secs * 1000);
+c.on("close", (code) => { clearTimeout(t); process.stdout.write(Buffer.concat(out)); process.exit(code === null ? 128 : code); });'
+bounded() { node -e "$BOUNDED_JS" "$AH_STATUS_TIMEOUT" "$@"; }
+owner_git_bounded() { bounded runuser -u "$AH_OWNER" -- env HOME="$AH_OWNER_HOME" GIT_TERMINAL_PROMPT=0 git "$@"; }
 
 # Exit 75 unless every given unit is `inactive` or `failed`.
 require_standstill() {
@@ -307,7 +323,7 @@ install_units() {
   for unit in "$UNIT_HARNESS" "$UNIT_PROBE"; do
     install_file "$AH_CURRENT/deploy/max2/$unit" "$AH_UNIT_DIR/$unit" 644
   done
-  systemctl daemon-reload
+  systemctl daemon-reload || die 74 "systemctl daemon-reload mislukt (na het installeren van de units)"
   printf 'units %s en %s geïnstalleerd\n' "$UNIT_HARNESS" "$UNIT_PROBE"
 }
 
@@ -316,7 +332,7 @@ install_units() {
 # definition (`failed`) until then, and `enable --now` in litellm-up would start that one.
 install_bridge_unit() {
   if install_replacing "$AH_CURRENT/deploy/max2/litellm/$UNIT_BRIDGE" "$AH_UNIT_DIR/$UNIT_BRIDGE" 644; then
-    systemctl daemon-reload
+    systemctl daemon-reload || die 74 "systemctl daemon-reload mislukt (na de brug-unit)"
   fi
 }
 
@@ -491,11 +507,11 @@ ensure_master_key() {
     key=""
     printf 'masterkey aangemaakt in %s\n' "$AH_LITELLM_ENV"
   else
-    chmod 600 "$AH_LITELLM_ENV"
+    chmod 600 "$AH_LITELLM_ENV" || die 74 "chmod 600 van $AH_LITELLM_ENV mislukt"
     printf 'masterkey bestaat al in %s; ongewijzigd\n' "$AH_LITELLM_ENV"
   fi
   if [[ -e $AH_HARNESS_ENV ]]; then
-    chmod 600 "$AH_HARNESS_ENV"
+    chmod 600 "$AH_HARNESS_ENV" || die 74 "chmod 600 van $AH_HARNESS_ENV mislukt"
     printf '%s bestaat al; ongewijzigd\n' "$AH_HARNESS_ENV"
   else
     make_temp_beside "$AH_HARNESS_ENV"
@@ -591,42 +607,50 @@ litellm_compose() { # $@ = docker compose arguments after -p/-f
 # --- actions --------------------------------------------------------------------------------------------------------
 
 # The node program of `status`: per configuration of harness.json the stored probe result, from <runs>/probe-<name>/probe.json (the
-# directory name is made the way probeDir in the harness makes it). That file lives in a directory of the owner, so it is read like a
-# state file (O_NOFOLLOW|O_NONBLOCK, a plain file of at most 1 MiB) and only validated fields are printed: accepted must be a boolean,
-# the hash 64 hexadecimal characters, the time an ISO timestamp (else the modification time of the file). Nothing is hashed here: the gate
-# of the worker does that, per job.
+# directory name is made the way probeDir in the harness makes it). Both files live in directories of the owner, so nothing blocks and
+# nothing is followed: harness.json and probe.json are opened with O_NOFOLLOW|O_NONBLOCK, fstat must say regular file of at most 1 MiB, and
+# they are read from the descriptor (a FIFO, a huge file or a link is "onleesbaar", never a hang). The runs directory must be its own real
+# path and probe-<name> must be a real directory directly in it (realpath equals the joined path): a link in the way is "onleesbaar". Only
+# validated fields are printed: accepted must be a boolean, the hash 64 hexadecimal characters, the time an ISO timestamp (else the
+# modification time of the file). Nothing is hashed here: the gate of the worker does that, per job.
 STATUS_PROBES_JS='const fs = require("fs"), path = require("path");
 const cfgPath = process.argv[1], runs = process.argv[2];
+const MAX = 1048576;
+function readSmall(file) { // { text, mtime }; throws when the file is no plain file of at most MAX bytes, a link or a FIFO included
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > MAX) throw new Error("geen gewoon bestand");
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < st.size) { const n = fs.readSync(fd, buf, off, st.size - off, off); if (n === 0) break; off += n; }
+    return { text: buf.toString("utf8", 0, off), mtime: st.mtime };
+  } finally { try { fs.closeSync(fd); } catch (e) {} }
+}
 let names;
 try {
-  names = Object.keys(JSON.parse(fs.readFileSync(cfgPath, "utf8")).configurations || {});
+  names = Object.keys(JSON.parse(readSmall(cfgPath).text).configurations || {});
 } catch (e) {
   process.stdout.write("probe: (" + (e && e.code === "ENOENT" ? "harness.json ontbreekt" : "harness.json onleesbaar") + ")\n");
   process.exit(0);
 }
+let realRuns = null, runsMissing = false;
+try { const r = fs.realpathSync(runs); if (r === path.resolve(runs)) realRuns = r; } catch (e) { runsMissing = e && e.code === "ENOENT"; }
 for (const name of names) {
   if (!/^[a-z0-9][a-z0-9.-]{0,63}$/.test(name)) { process.stdout.write("probe: (een configuratienaam in harness.json is ongeldig)\n"); continue; }
-  const file = path.join(runs, "probe-" + name.toLowerCase().replace(/[^a-z0-9.-]+/g, "-"), "probe.json");
   let line;
-  let fd;
   try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    if (runsMissing) throw Object.assign(new Error("runs ontbreekt"), { code: "ENOENT" });
+    if (realRuns === null) throw Object.assign(new Error("runs is geen echte map"), { code: "ELINK" });
+    const dirName = path.join(realRuns, "probe-" + name.toLowerCase().replace(/[^a-z0-9.-]+/g, "-"));
+    if (fs.realpathSync(dirName) !== dirName) throw Object.assign(new Error("probe-map is een link"), { code: "ELINK" });
+    const f = readSmall(path.join(dirName, "probe.json"));
+    const j = JSON.parse(f.text);
+    if (!j || typeof j.accepted !== "boolean" || typeof j.hash !== "string" || !/^[0-9a-f]{64}$/.test(j.hash)) throw new Error("onvolledig");
+    const time = typeof j.ranAt === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,16}Z$/.test(j.ranAt) ? j.ranAt : f.mtime.toISOString();
+    line = "accepted=" + j.accepted + " hash=" + j.hash + " tijd=" + time;
   } catch (e) {
     line = e && (e.code === "ENOENT" || e.code === "ENOTDIR") ? "(geen probe-uitslag)" : "(onleesbaar)";
-  }
-  if (fd !== undefined) {
-    try {
-      const st = fs.fstatSync(fd);
-      if (!st.isFile() || st.size > 1048576) throw new Error("geen gewoon bestand");
-      const buf = Buffer.alloc(st.size);
-      let off = 0;
-      while (off < st.size) { const n = fs.readSync(fd, buf, off, st.size - off, off); if (n === 0) break; off += n; }
-      const j = JSON.parse(buf.toString("utf8", 0, off));
-      if (!j || typeof j.accepted !== "boolean" || typeof j.hash !== "string" || !/^[0-9a-f]{64}$/.test(j.hash)) throw new Error("onvolledig");
-      const time = typeof j.ranAt === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,16}Z$/.test(j.ranAt) ? j.ranAt : st.mtime.toISOString();
-      line = "accepted=" + j.accepted + " hash=" + j.hash + " tijd=" + time;
-    } catch (e) { line = "(onleesbaar)"; }
-    try { fs.closeSync(fd); } catch (e) {}
   }
   process.stdout.write("probe " + name + ": " + line + "\n");
 }'
@@ -667,7 +691,7 @@ action_status() {
 
   if [[ ! -d $AH_MCP_DIR ]]; then
     printf 'mcp-stable HEAD: (checkout ontbreekt: %s)\n' "$AH_MCP_DIR"
-  elif head=$(owner_git -C "$AH_MCP_DIR" rev-parse HEAD 2>/dev/null) && [[ $head =~ $sha_re ]]; then
+  elif head=$(owner_git_bounded -C "$AH_MCP_DIR" rev-parse HEAD 2>/dev/null) && [[ $head =~ $sha_re ]]; then
     printf 'mcp-stable HEAD: %s\n' "$head"
   else
     printf 'mcp-stable HEAD: (onleesbaar: git rev-parse mislukte)\n'
@@ -678,7 +702,7 @@ action_status() {
     printf 'mcp origin/main: (checkout ontbreekt: %s)\n' "$AH_MCP_DIR"
   else
     rc=0
-    out=$(owner_git -C "$AH_MCP_DIR" ls-remote origin refs/heads/main 2>/dev/null) || rc=$?
+    out=$(owner_git_bounded -C "$AH_MCP_DIR" -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 ls-remote origin refs/heads/main 2>/dev/null) || rc=$?
     remote=""
     read -r remote _ <<<"$out" || true
     if ((rc == 0)) && [[ $remote =~ $sha_re ]]; then
@@ -689,17 +713,17 @@ action_status() {
   fi
 
   for unit in "$UNIT_HARNESS" "$UNIT_PROBE" "$UNIT_WORKER" "$UNIT_BRIDGE"; do
-    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    state=$(bounded systemctl is-active "$unit" 2>/dev/null || true)
     printf 'unit %s: %s\n' "$unit" "${state:-onbekend}"
   done
 
-  if info=$(docker inspect --format '{{.State.Status}}|{{.Config.Image}}|{{.Image}}' "$LITELLM_CONTAINER" 2>/dev/null) && [[ -n $info ]]; then
+  if info=$(bounded docker inspect --format '{{.State.Status}}|{{.Config.Image}}|{{.Image}}' "$LITELLM_CONTAINER" 2>/dev/null) && [[ -n $info ]]; then
     state=${info%%|*}
     cfg_image=${info#*|}
     image_id=${cfg_image#*|}
     cfg_image=${cfg_image%%|*}
     printf 'litellm container: %s, image %s\n' "$state" "$cfg_image"
-    digests=$(docker image inspect --format '{{join .RepoDigests " "}}' "$image_id" 2>/dev/null || true)
+    digests=$(bounded docker image inspect --format '{{join .RepoDigests " "}}' "$image_id" 2>/dev/null || true)
     printf 'litellm image-digest: %s\n' "${digests:-(onbekend)}"
   else
     printf 'litellm container: (niet gevonden of docker niet bereikbaar)\n'
@@ -725,8 +749,8 @@ action_install() {
   umask 022
 
   mkdir -p "$AH_SRV" "$AH_RELEASES" || die 73 "mappen onder $AH_SRV konden niet worden gemaakt"
-  chmod 755 "$AH_SRV" "$AH_RELEASES"
-  chown "$AH_OWNER" "$AH_RELEASES"
+  chmod 755 "$AH_SRV" "$AH_RELEASES" || die 74 "chmod 755 van $AH_SRV en $AH_RELEASES mislukt"
+  chown "$AH_OWNER" "$AH_RELEASES" || die 74 "chown $AH_OWNER van $AH_RELEASES mislukt"
   if [[ -e $AH_CURRENT || -L $AH_CURRENT ]]; then
     printf 'release bestaat; bijwerken via release-update\n'
   else
@@ -737,7 +761,7 @@ action_install() {
   install_units
 
   mkdir -p "$AH_ETC" "$AH_LITELLM_DIR" || die 73 "map $AH_LITELLM_DIR kon niet worden gemaakt"
-  chmod 755 "$AH_LITELLM_DIR"
+  chmod 755 "$AH_LITELLM_DIR" || die 74 "chmod 755 van $AH_LITELLM_DIR mislukt"
   install_file_if_missing "$AH_CURRENT/deploy/max2/harness.json" "$AH_HARNESS_JSON" 644
   install_file_if_missing "$AH_CURRENT/deploy/max2/litellm/config.yaml" "$AH_LITELLM_DIR/config.yaml" 644
   install_file_if_missing "$AH_CURRENT/deploy/max2/litellm/compose.yml" "$AH_LITELLM_DIR/compose.yml" 644
@@ -775,7 +799,7 @@ action_probe() {
 # value, the switch is made, the units follow.
 action_release_update() {
   local old new
-  require_standstill "$UNIT_HARNESS"
+  require_standstill "$UNIT_HARNESS" "$UNIT_PROBE"
   require_state_dir
   read_current_release
   old=$CURRENT_COMMIT
@@ -799,7 +823,7 @@ action_release_update() {
 # units are installed. Going forward again is release-update.
 action_release_rollback() {
   local old prev
-  require_standstill "$UNIT_HARNESS"
+  require_standstill "$UNIT_HARNESS" "$UNIT_PROBE"
   read_state_commit "$AH_RELEASE_PREV"
   prev=$STATE_COMMIT
   [[ -n $prev ]] || die 75 "release.prev ontbreekt (zoals na de eerste installatie); er is geen release om naar terug te gaan"
@@ -890,7 +914,7 @@ action_litellm_up() {
 # it. Run litellm-up first on a host that never ran LiteLLM: the bridge restart waits for the network br-litellm.
 action_litellm_upgrade() {
   local max2="$AH_CURRENT/deploy/max2" f
-  require_standstill "$UNIT_HARNESS"
+  require_standstill "$UNIT_HARNESS" "$UNIT_PROBE"
   [[ -d $max2 ]] || die 66 "$max2 ontbreekt (eerst install of release-update)"
   for f in harness.json litellm/config.yaml litellm/compose.yml "litellm/$UNIT_BRIDGE"; do
     release_read "$max2/$f" >/dev/null
@@ -902,7 +926,7 @@ action_litellm_upgrade() {
   install_replacing "$max2/litellm/config.yaml" "$AH_LITELLM_DIR/config.yaml" 644 || true
   install_replacing "$max2/litellm/compose.yml" "$AH_LITELLM_DIR/compose.yml" 644 || true
   install_replacing "$max2/litellm/$UNIT_BRIDGE" "$AH_UNIT_DIR/$UNIT_BRIDGE" 644 || true
-  systemctl daemon-reload
+  systemctl daemon-reload || die 74 "systemctl daemon-reload mislukt (na de nieuwe bestanden)"
   systemctl restart "$UNIT_BRIDGE" || die 74 "systemctl restart $UNIT_BRIDGE mislukt"
   litellm_compose pull || die 74 "docker compose pull mislukt"
   litellm_compose up -d --force-recreate || die 74 "docker compose up -d --force-recreate mislukt"

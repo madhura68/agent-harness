@@ -88,6 +88,7 @@ export function createCostGuard(opts: { mode: CostMode; ceilingNanos: bigint; co
 
   return {
     beforeRequest() {
+      if (mode === 'local') return undefined // decision 13: a local configuration never stops on money, whatever the ceiling is
       return responses > 0 && totalNanos >= ceilingNanos ? limitStop() : undefined
     },
     afterResponse(res) {
