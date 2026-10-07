@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 // The root ops wrapper (deploy/max2/ops/agent-harness-ops.sh), driven as a black box with bash. Every command it may call
 // (systemctl, runuser, git, npm, docker, curl, flock) is a stub on PATH that logs its argv; the file tools it uses (mktemp, mv,
 // chmod, ...) are logging shims that exec the real binary, so a secret in an argv shows up in the log. Paths are the wrapper's
-// path variables, pointed at a temp dir (in production sudo's env_reset keeps a caller from doing that).
+// path variables (and AH_PATH, the wrapper's fixed PATH), pointed at a temp dir (in production sudo's env_reset keeps a caller from
+// doing that). `bash` is the one on the test PATH (macOS: 3.2); set OPS_BASH=/path/to/bash to run the same tests under another bash.
 
 const SCRIPT = fileURLToPath(new URL('../deploy/max2/ops/agent-harness-ops.sh', import.meta.url))
 
@@ -27,6 +28,8 @@ const ACTIONS = [
 ] as const
 const LOCK_FREE = ['status', 'stop']
 const LOCKED = ACTIONS.filter((a) => !LOCK_FREE.includes(a))
+/** Every invocation that takes the lock: the locked actions and provider-key with a valid name. */
+const LOCKED_CASES: string[][] = [...LOCKED.map((a) => [a]), ['provider-key', 'OPENROUTER_API_KEY']]
 const COMMAND_STUBS = ['systemctl', 'runuser', 'git', 'npm', 'docker', 'curl', 'flock']
 const FILE_SHIMS = ['mktemp', 'mv', 'chmod', 'rm', 'cat', 'sed', 'awk', 'grep', 'tee', 'env', 'id', 'dirname', 'basename', 'cp', 'ln', 'mkdir', 'touch', 'printf']
 
@@ -45,7 +48,7 @@ function setup(): void {
   const logLine = `printf '%s' "\${0##*/}" >> "$STUB_LOG"; for a in "$@"; do printf ' %s' "$a" >> "$STUB_LOG"; done; printf '\\n' >> "$STUB_LOG"`
   for (const naam of COMMAND_STUBS) {
     let body = logLine
-    if (naam === 'flock') body += '\nif [ -n "$STUB_FLOCK_BUSY" ]; then exit 1; fi\nexit 0'
+    if (naam === 'flock') body += '\nif [ -n "$STUB_FLOCK_RC" ]; then exit "$STUB_FLOCK_RC"; fi\nif [ -n "$STUB_FLOCK_BUSY" ]; then exit 1; fi\nexit 0'
     if (naam === 'systemctl') {
       body += `\nif [ "$1" = is-active ]; then
   if [ -f "$STUB_STATE/$2" ]; then s=$(cat "$STUB_STATE/$2"); echo "$s"; [ "$s" = active ] && exit 0; exit 3; fi
@@ -71,6 +74,7 @@ function writeStub(naam: string, body: string): void {
 function env(extra: Record<string, string> = {}): Record<string, string> {
   return {
     PATH: `${join(dir, 'bin')}:/usr/bin:/bin`,
+    AH_PATH: `${join(dir, 'bin')}:/usr/bin:/bin`,
     HOME: dir,
     STUB_LOG: log,
     STUB_STATE: join(dir, 'state'),
@@ -81,13 +85,13 @@ function env(extra: Record<string, string> = {}): Record<string, string> {
 }
 
 function run(args: string[], opts: { input?: string; env?: Record<string, string> } = {}): { code: number | null; stdout: string; stderr: string } {
-  const res = spawnSync('bash', [SCRIPT, ...args], { input: opts.input ?? '', env: env(opts.env), encoding: 'utf8' })
+  const res = spawnSync(process.env.OPS_BASH ?? 'bash', [SCRIPT, ...args], { input: opts.input ?? '', env: env(opts.env), encoding: 'utf8' })
   return { code: res.status, stdout: res.stdout, stderr: res.stderr }
 }
 
 /** Source the wrapper and run a snippet with its helpers (the main dispatcher does not run when the file is sourced). */
 function runHelper(snippet: string, extra: Record<string, string> = {}): { code: number | null; stdout: string; stderr: string } {
-  const res = spawnSync('bash', ['-c', `source "${SCRIPT}"; ${snippet}`], { input: '', env: env(extra), encoding: 'utf8' })
+  const res = spawnSync(process.env.OPS_BASH ?? 'bash', ['-c', `source "${SCRIPT}"; ${snippet}`], { input: '', env: env(extra), encoding: 'utf8' })
   return { code: res.status, stdout: res.stdout, stderr: res.stderr }
 }
 
@@ -136,11 +140,12 @@ describe('ops wrapper: de actielijst', () => {
   })
 
   it('neemt voor elke actie behalve status en stop eerst de exclusieve flock (flock -n 9) en roept verder geen stub aan', () => {
-    for (const actie of LOCKED) {
+    for (const args of LOCKED_CASES) {
       writeFileSync(log, '')
-      run([actie])
-      expect(stubCalls(), actie).toEqual(['flock -n 9'])
-      expect(existsSync(join(dir, 'ops.lock')), actie).toBe(true)
+      rmSync(join(dir, 'ops.lock'), { force: true })
+      run(args, { input: `${FAKE_KEY}\n` })
+      expect(stubCalls(), args.join(' ')).toEqual(['flock -n 9'])
+      expect(existsSync(join(dir, 'ops.lock')), args.join(' ')).toBe(true)
     }
     for (const actie of LOCK_FREE) {
       writeFileSync(log, '')
@@ -148,19 +153,39 @@ describe('ops wrapper: de actielijst', () => {
       expect(stubCalls(), actie).toEqual([])
     }
   })
+
+  it('begint met #!/bin/bash en zet een vaste standaard-PATH die alleen een eigen variabele (AH_PATH) kan vervangen', () => {
+    expect(readFileSync(SCRIPT, 'utf8').split('\n')[0]).toBe('#!/bin/bash')
+    const res = runHelper('printf %s "$PATH"', { AH_PATH: '' })
+    expect(res.stdout).toBe('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
+    // the caller's PATH (with the stubs) is not used when AH_PATH is not set
+    const res2 = spawnSync(process.env.OPS_BASH ?? 'bash', ['-c', `unset AH_PATH; source "${SCRIPT}"; printf %s "$PATH"`], { env: { PATH: `${join(dir, 'bin')}:/usr/bin:/bin` }, encoding: 'utf8' })
+    expect(res2.stdout).toBe('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin')
+    expect(runHelper('printf %s "$PATH"').stdout).toBe(`${join(dir, 'bin')}:/usr/bin:/bin`)
+  })
 })
 
 describe('ops wrapper: één actie tegelijk', () => {
   it('geeft 75 voor elke actie behalve status en stop als de lock bezet is, zonder git-, npm-, docker-, systemctl- of runuser-aanroep', () => {
-    for (const actie of LOCKED) {
+    for (const args of LOCKED_CASES) {
       writeFileSync(log, '')
-      const res = run(actie === 'provider-key' ? [actie, 'OPENROUTER_API_KEY'] : [actie], { env: { STUB_FLOCK_BUSY: '1' }, input: `${FAKE_KEY}\n` })
-      expect(res.code, actie).toBe(75)
-      expect(stubCalls(), actie).toEqual(['flock -n 9'])
+      const res = run(args, { env: { STUB_FLOCK_BUSY: '1' }, input: `${FAKE_KEY}\n` })
+      expect(res.code, args.join(' ')).toBe(75)
+      expect(res.stderr, args.join(' ')).toContain('een andere actie loopt al')
+      expect(stubCalls(), args.join(' ')).toEqual(['flock -n 9'])
     }
-    writeFileSync(log, '')
-    expect(run(['provider-key', 'OPENROUTER_API_KEY'], { env: { STUB_FLOCK_BUSY: '1' }, input: `${FAKE_KEY}\n` }).code).toBe(75)
     expect(existsSync(litellmEnv())).toBe(false)
+  })
+
+  it('meldt een flock-fout die geen "bezet" is (rc 127, 2) apart met exit 73 en de rc, en niet als bezet', () => {
+    for (const rc of ['127', '2']) {
+      for (const args of LOCKED_CASES) {
+        const res = run(args, { env: { STUB_FLOCK_RC: rc }, input: `${FAKE_KEY}\n` })
+        expect(res.code, `${args.join(' ')} rc=${rc}`).toBe(73)
+        expect(res.stderr).toContain(`lock kon niet worden genomen (rc=${rc})`)
+        expect(res.stderr).not.toContain('een andere actie loopt al')
+      }
+    }
   })
 
   it('laat status en stop vrij: ze nemen de lock niet, en een bezette lock houdt ze niet tegen', () => {
@@ -301,13 +326,69 @@ describe('ops wrapper: provider-key', () => {
     expect(calls().length).toBeGreaterThan(0) // the shims did see the file commands
   })
 
-  it('weigert een lege waarde en een waarde met een stuurteken (exit 64) en laat het bestand ongemoeid', () => {
+  it('laat een toegestane waarde met / & + = - _ . : letterlijk landen, bij toevoegen en bij vervangen, en de rest gelijk', () => {
+    const waarde = 'sk-or-v1/ab+c=d&e.f_g:h'
+    writeFileSync(litellmEnv(), `${MASTER}\nOPENAI_API_KEY=blijft\n`, { mode: 0o600 })
+    let res = run(['provider-key', 'OPENROUTER_API_KEY'], { input: `${waarde}\n` })
+    expect(res.code, res.stderr).toBe(0)
+    expect(readFileSync(litellmEnv(), 'utf8')).toBe(`${MASTER}\nOPENAI_API_KEY=blijft\nOPENROUTER_API_KEY=${waarde}\n`)
+    res = run(['provider-key', 'OPENROUTER_API_KEY'], { input: `${waarde}\n` })
+    expect(res.code, res.stderr).toBe(0)
+    expect(readFileSync(litellmEnv(), 'utf8')).toBe(`${MASTER}\nOPENAI_API_KEY=blijft\nOPENROUTER_API_KEY=${waarde}\n`)
+    expect(mode(litellmEnv())).toBe('600')
+    expect(res.stdout + res.stderr).not.toContain(waarde)
+    expect(readFileSync(log, 'utf8')).not.toContain(waarde)
+  })
+
+  // Compose reads an env_file value with interpolation and quoting, so these would silently become another key.
+  const REFUSED: Array<[string, string]> = [
+    ['dollar', 'QZXV$cd'],
+    ['dollar met haakjes', 'QZXV$(id)cd'],
+    ['dollar met accolades', 'QZXV${HOME}cd'],
+    ['enkele quote', "QZXV'cd"],
+    ['dubbele quote', 'QZXV"cd'],
+    ['backtick', 'QZXV`cd'],
+    ['hekje', 'QZXV#cd'],
+    ['spatie', 'QZXV cd'],
+    ['spatie vooraan', ' QZXVcd'],
+    ['spatie achteraan', 'QZXVcd '],
+    ['tab', 'QZXV\tcd'],
+    ['backslash', 'QZXV\\cd'],
+    ['stuurteken', 'QZXV\u0007cd'],
+    ['carriage return', 'QZXV\rcd'],
+    ['vijandige mix', 'QZXV/b&c\\1$HOME $(id)'],
+  ]
+
+  it.each(REFUSED)('weigert een waarde met %s (exit 64), noemt de reden maar nooit de waarde, en schrijft niets', (_klasse, waarde) => {
     writeFileSync(litellmEnv(), `${MASTER}\n`, { mode: 0o600 })
-    for (const input of ['', '\n', 'abc\u0007def\n', 'abc\rdef\n']) {
-      const res = run(['provider-key', 'OPENROUTER_API_KEY'], { input })
-      expect(res.code, JSON.stringify(input)).toBe(64)
-      expect(res.stderr).not.toContain('abc')
-    }
+    const res = run(['provider-key', 'OPENROUTER_API_KEY'], { input: `${waarde}\n` })
+    expect(res.code).toBe(64)
+    expect(res.stderr).toMatch(/provider-key|waarde/)
+    expect(res.stdout + res.stderr).not.toContain('QZXV')
+    expect(res.stdout + res.stderr).not.toContain('HOME')
+    expect(readFileSync(litellmEnv(), 'utf8')).toBe(`${MASTER}\n`)
+    expect(readdirSync(join(dir, 'etc'))).toEqual(['litellm.env'])
+    expect(readFileSync(log, 'utf8')).not.toContain('QZXV')
+  })
+
+  it.each([
+    ['een tweede regel', `${FAKE_KEY}\nanders-geheim\n`],
+    ['een tweede lege regel', `${FAKE_KEY}\n\n`],
+    ['een tweede regel zonder newline', `${FAKE_KEY}\nanders-geheim`],
+    ['een eerste lege regel met data erna', `\n${FAKE_KEY}\n`],
+  ])('weigert een invoer met %s (exit 64) en schrijft niets', (_klasse, input) => {
+    writeFileSync(litellmEnv(), `${MASTER}\n`, { mode: 0o600 })
+    const res = run(['provider-key', 'OPENROUTER_API_KEY'], { input })
+    expect(res.code).toBe(64)
+    expect(res.stdout + res.stderr).not.toContain('anders-geheim')
+    secretFree(res)
+    expect(readFileSync(litellmEnv(), 'utf8')).toBe(`${MASTER}\n`)
+    expect(readdirSync(join(dir, 'etc'))).toEqual(['litellm.env'])
+  })
+
+  it('weigert een lege waarde en een lege invoer (exit 64) en laat het bestand ongemoeid', () => {
+    writeFileSync(litellmEnv(), `${MASTER}\n`, { mode: 0o600 })
+    for (const input of ['', '\n']) expect(run(['provider-key', 'OPENROUTER_API_KEY'], { input }).code, JSON.stringify(input)).toBe(64)
     expect(readFileSync(litellmEnv(), 'utf8')).toBe(`${MASTER}\n`)
     expect(readdirSync(join(dir, 'etc'))).toEqual(['litellm.env'])
   })

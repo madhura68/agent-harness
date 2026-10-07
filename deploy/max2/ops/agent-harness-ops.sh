@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # agent-harness-ops.sh: the root ops wrapper of the harness deployment on max2 (M45-2d).
 #
 # Installed as /usr/local/lib/agent-harness/ops/agent-harness-ops.sh (root:root 0755, not writable by ops-agent) and called as
@@ -15,8 +15,9 @@
 #
 # Rules this file keeps:
 # - git and npm only through `runuser` as the checkout owner (owner_git, owner_npm); never git as root in a checkout.
-# - All paths are variables with fixed defaults. sudo's env_reset wipes the caller's environment, so a caller cannot
-#   override them in production; the tests set them.
+# - All paths are variables with fixed defaults (AH_ETC, AH_LITELLM_ENV, AH_LOCK, AH_OWNER), and so is PATH: the script sets
+#   a fixed PATH itself instead of relying on sudo's secure_path (AH_PATH replaces it). sudo's env_reset wipes the caller's
+#   environment, so a caller cannot override any of these in production; the tests set them (and put stubs on AH_PATH).
 # - Standstill (require_standstill) means `systemctl is-active <unit>` says `inactive` or `failed`. Every other answer
 #   counts as running, `activating` (the restart pause after exit 1) included.
 # - One action at a time: every action except `status` and `stop` first takes an exclusive `flock -n` on the lock file;
@@ -29,6 +30,9 @@
 # arguments differ. Lock-free actions are the `status|stop` case in `main`; nothing else needs to change.
 
 set -euo pipefail
+
+PATH="${AH_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+export PATH
 
 AH_ETC="${AH_ETC:-/etc/agent-harness}"
 AH_LITELLM_ENV="${AH_LITELLM_ENV:-$AH_ETC/litellm.env}"
@@ -80,7 +84,13 @@ require_standstill() {
 # One action at a time: hold an exclusive lock on fd 9 until this process exits.
 take_lock() {
   { exec 9>"$AH_LOCK"; } 2>/dev/null || die 73 "lockbestand $AH_LOCK is niet te openen"
-  flock -n 9 || die 75 "een andere actie loopt al (lock $AH_LOCK)"
+  local rc=0
+  flock -n 9 || rc=$?
+  case $rc in
+    0) ;;
+    1) die 75 "een andere actie loopt al (lock $AH_LOCK)" ;;
+    *) die 73 "lock kon niet worden genomen (rc=$rc)" ;;
+  esac
 }
 
 # A file that a crash cannot leave half written: `make_temp_beside <target>` creates a temporary file in the target's own
@@ -116,8 +126,11 @@ action_litellm_upgrade() { not_implemented litellm-upgrade e; }
 
 # provider-key <NAME>: the value comes from stdin without echo; the line NAME=value in litellm.env is replaced (the first
 # one, later duplicates are dropped) or appended. Only shell builtins touch the value, so it is in no argv.
+# Compose reads an env_file value with interpolation and quoting, so a value with $ ' " ` # a space, a tab or a backslash
+# would silently reach LiteLLM as another key: such a value is refused (64), as is an empty one, a control character or more
+# than one line. The message names the reason, never the value; nothing is written.
 action_provider_key() {
-  local name=$1 value="" line found=0 old_umask
+  local name=$1 value="" extra="" line found=0 old_umask rc
   [[ -d $AH_ETC ]] || die 66 "map $AH_ETC ontbreekt (eerst install)"
   if [[ -e $AH_LITELLM_ENV && ! -r $AH_LITELLM_ENV ]]; then die 66 "$AH_LITELLM_ENV is niet leesbaar"; fi
 
@@ -128,7 +141,17 @@ action_provider_key() {
     IFS= read -rs value || true
   fi
   [[ -n $value ]] || die 64 "geen waarde op stdin"
-  [[ $value != *[[:cntrl:]]* ]] || die 64 "de waarde bevat een stuurteken"
+  # Data after the first line (a multi-line paste) is refused. -t keeps an interactive terminal from waiting; read returns 1 at
+  # end of input and more than 128 on a timeout, so any other status is a failure of read itself and also refuses.
+  rc=0
+  IFS= read -rs -t 1 extra || rc=$?
+  if ((rc == 0)) || [[ -n $extra ]] || ((rc != 1 && rc < 129)); then die 64 "meer dan één regel op stdin; er is niets geschreven"; fi
+  [[ $value != *[[:cntrl:]]* ]] || die 64 "de waarde bevat een stuurteken; er is niets geschreven"
+  case $value in
+    *'$'* | *"'"* | *'"'* | *'`'* | *'#'* | *' '* | *\\*)
+      die 64 "de waarde bevat een teken dat compose in een env_file anders leest (\$ ' \" \` # spatie of \\); er is niets geschreven"
+      ;;
+  esac
 
   old_umask=$(umask)
   umask 077
