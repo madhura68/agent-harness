@@ -10,11 +10,13 @@
 #   | litellm-up | litellm-upgrade | provider-key <NAME>
 #
 # Exit codes: 0 ok; 1 the mcp-stable checkout is not clean after the MCP install (git status --porcelain); 64 unknown action, extra argument,
-#   unknown NAME or unusable value; 66 a needed directory or source file is missing, a source file is a symlink, or a release is not built;
-#   70 the action is not built yet; 73 a file could not be created; 74 a release could not be built, switched or looked up, or a git/npm step of
-#   the MCP checkout failed; 75 busy (another action holds the lock), the worker is not at a standstill, or a precondition of the action does not
-#   hold (no release.prev or mcp.prev, a dirty mcp-stable checkout before an update, a state file that is not a full commit). `probe` returns the
-#   exit code of `systemctl start agent-harness-probe.service`.
+#   unknown NAME or unusable value (a master key that curl --config could read as another option included); 66 a needed directory or source
+#   file is missing, a source file is a symlink or lies outside the release or is no plain file of a sane size, a release is not built, or
+#   the master key is missing; 73 the lock file, the lock or a file could not be created or written; 74 a release could not be built, switched
+#   or looked up, a git/npm step of the MCP checkout failed, or a docker/systemctl/curl step of the LiteLLM actions failed (LiteLLM not
+#   healthy included); 75 busy (another action holds the lock), the worker is not at a standstill, or a precondition of the action does not
+#   hold (no release.prev or mcp.prev, a dirty mcp-stable checkout before an update, a state file that is not a full commit). `probe` returns
+#   the exit code of `systemctl start agent-harness-probe.service`; `stop` that of `systemctl stop`; `status` always 0 (it only reports).
 #
 # Rules this file keeps:
 # - git and npm only through `runuser` as the checkout owner (owner_git, owner_npm); never git as root in a checkout. runuser
@@ -45,9 +47,17 @@
 # Every release/mcp action is written so that a repetition after success, and a rerun after an interruption between any two
 # writes, ends in the outcome the plan states (see each action).
 #
-# Adding an action: write `action_<name with _>()` (it replaces the not_implemented line), use the helpers below
-# (require_standstill, owner_git, owner_npm, make_temp_beside, publish_temp), and add its name to the case lists in `main` only if its
-# arguments differ. Lock-free actions are the `status|stop` case in `main`; nothing else needs to change.
+# Adding an action: write `action_<name with _>()`, use the helpers below (require_standstill, owner_git, owner_npm, make_temp_beside,
+# publish_temp), and add its name to the case lists in `main`. Lock-free actions are the `status|stop` case in `main`.
+#
+# Release files (install, litellm-upgrade): root never reads a source by a checked path. The release is built by the owner, so any
+# directory or file in it may be a symlink that a commit put there. release_read resolves the source in node and refuses unless the
+# real path stays inside the real path of `current`, the last component is no symlink and the file is a plain file of at most 1 MiB,
+# opened with O_NOFOLLOW|O_NONBLOCK and read from the descriptor.
+#
+# LiteLLM (litellm-up, litellm-upgrade, status): the master key is read as root from harness-litellm.env and reaches curl as a `header`
+# line of a config on stdin (`curl --config -`), written by the printf builtin: never in an argv, never printed. Only the model names
+# (`.data[].id`, held to a safe pattern) leave the response.
 
 set -euo pipefail
 
@@ -69,6 +79,10 @@ AH_HARNESS_JSON="${AH_HARNESS_JSON:-$AH_ETC/harness.json}"
 AH_HARNESS_ENV="${AH_HARNESS_ENV:-$AH_ETC/harness-litellm.env}"
 AH_REPO_URL="${AH_REPO_URL:-https://git.jp-visser.nl/janpeter/agent-harness.git}"
 AH_STATE_DIR="${AH_STATE_DIR:-/var/lib/agent-harness}"
+AH_RUNS_DIR="${AH_RUNS_DIR:-/var/lib/agent-harness/runs}"
+AH_LITELLM_URL="${AH_LITELLM_URL:-http://127.0.0.1:4000}"
+AH_HEALTH_TRIES="${AH_HEALTH_TRIES:-60}"
+AH_HEALTH_SLEEP="${AH_HEALTH_SLEEP:-2}"
 AH_RELEASE_PREV="$AH_STATE_DIR/release.prev"
 AH_MCP_BUILT="$AH_STATE_DIR/mcp.built"
 AH_MCP_PREV="$AH_STATE_DIR/mcp.prev"
@@ -80,6 +94,8 @@ UNIT_PROBE="agent-harness-probe.service"
 UNIT_BRIDGE="litellm-ollama-bridge.service"
 # The old service: the mcp-* actions need it at a standstill too (its MCP checkout is the one they change).
 UNIT_WORKER="agent-harness-worker.service"
+LITELLM_PROJECT="litellm"
+LITELLM_CONTAINER="litellm"
 
 PROVIDER_KEY_NAMES="OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY"
 
@@ -95,10 +111,6 @@ die() {
 # Never echoes the input: an argument may be a secret someone pasted in the wrong place.
 usage_fail() {
   die 64 "onbekende actie of ongeldige argumenten. Toegestaan: status install stop start probe release-update release-rollback mcp-update mcp-rollback litellm-up litellm-upgrade, en provider-key <${PROVIDER_KEY_NAMES// /|}>"
-}
-
-not_implemented() { # $1 = action, $2 = the plan part that builds it
-  die 70 "$1: nog niet geïmplementeerd (deel $2)"
 }
 
 # A command as the checkout owner, never as root, with the owner's HOME (runuser keeps root's HOME=/root) and without a git
@@ -199,18 +211,59 @@ swap_current() { # $1 = commit
   printf 'current wijst naar release %s\n' "$commit"
 }
 
-# A source that root copies out of a release the owner built must be a plain file: a symlink there could point at any file root
-# can read (say litellm.env) and root would copy its content into a world-readable target.
-require_plain_file() { # $1 = source
-  [[ ! -L $1 ]] || die 66 "bronbestand $1 is een symlink; niet gekopieerd"
-  [[ -f $1 ]] || die 66 "bronbestand $1 ontbreekt"
+# The node program of release_read: argv[1] is the release root (`current`), argv[2] the source. Exit codes: 2 missing, 3 the last
+# component is a symlink, 4 the real path leaves the release (a directory on the way is a symlink), 5 no plain file of at most 1 MiB or
+# not safely openable. The content goes to stdout in one write, after every check; the descriptor is compared with the path again after
+# the open, which narrows a swap in between (the owner could still win a race on a path inside the release; that needs a swap on the
+# very microsecond, and the owner is in group sudo on max2 anyway: this guards against what a commit can contain).
+READ_RELEASE_JS='const fs = require("fs"), path = require("path");
+const root = process.argv[1], file = process.argv[2];
+let rootReal, dirReal, real;
+try {
+  rootReal = fs.realpathSync(root);
+  dirReal = fs.realpathSync(path.dirname(file));
+  real = fs.realpathSync(file);
+} catch (e) { process.exit(e.code === "ENOENT" || e.code === "ENOTDIR" ? 2 : 5); }
+if (real !== path.join(dirReal, path.basename(file))) process.exit(3);
+if (real !== rootReal && !real.startsWith(rootReal + path.sep)) process.exit(4);
+let fd;
+try {
+  fd = fs.openSync(real, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+} catch (e) { process.exit(e.code === "ENOENT" ? 2 : 5); }
+try {
+  const st = fs.fstatSync(fd);
+  if (!st.isFile() || st.size > 1048576) process.exit(5);
+  const again = fs.statSync(real);
+  if (again.dev !== st.dev || again.ino !== st.ino) process.exit(5);
+  const buf = Buffer.alloc(st.size);
+  let off = 0;
+  while (off < st.size) {
+    const n = fs.readSync(fd, buf, off, st.size - off, off);
+    if (n === 0) break;
+    off += n;
+  }
+  fs.writeSync(1, buf, 0, off);
+} catch (e) { process.exit(5); }'
+
+# Writes the content of a source in the release (a path under $AH_CURRENT) to stdout; anything but a plain file inside the release is 66.
+# Call it with the output redirected (`release_read src >file`) or to /dev/null as a check; die exits the whole script.
+release_read() { # $1 = source
+  local rc=0
+  node -e "$READ_RELEASE_JS" "$AH_CURRENT" "$1" || rc=$?
+  case $rc in
+    0) ;;
+    2) die 66 "bronbestand $1 ontbreekt" ;;
+    3) die 66 "bronbestand $1 is een symlink; niet gekopieerd" ;;
+    4) die 66 "bronbestand $1 ligt buiten de release (een map of bestand onderweg is een symlink); niet gekopieerd" ;;
+    5) die 66 "bronbestand $1 is geen gewoon bestand van hooguit 1 MiB (of niet veilig te openen); niet gekopieerd" ;;
+    *) die 74 "bronbestand $1 kon niet worden gelezen (node rc=$rc)" ;;
+  esac
 }
 
-# Copy a file with a temp file beside the target and an atomic rename, so a crash leaves the old file or the new one.
+# Fill a temp file beside the target with a release file, atomically published (a crash leaves the old file or the new one).
 install_file() { # $1 = source, $2 = target, $3 = mode
-  require_plain_file "$1"
   make_temp_beside "$2"
-  cat -- "$1" >"$TEMP_FILE"
+  release_read "$1" >"$TEMP_FILE" || die 73 "schrijven naar het tijdelijke bestand voor $2 mislukt"
   publish_temp "$2" "$3"
 }
 
@@ -221,6 +274,29 @@ install_file_if_missing() { # $1 = source, $2 = target, $3 = mode
     install_file "$1" "$2" "$3"
     printf '%s geplaatst\n' "$2"
   fi
+}
+
+# Like install_file, but a target that differs is first copied to <target>.bak-<timestamp>, and one that is identical is left alone.
+# Returns 0 when it placed or replaced the target and 1 when it was already identical, so call it as `if install_replacing ...` or
+# `|| true` (set -e).
+install_replacing() { # $1 = source, $2 = target, $3 = mode
+  local dst=$2 backup
+  make_temp_beside "$dst"
+  release_read "$1" >"$TEMP_FILE" || die 73 "schrijven naar het tijdelijke bestand voor $dst mislukt"
+  if [[ -f $dst ]] && cmp -s -- "$TEMP_FILE" "$dst"; then
+    rm -f -- "$TEMP_FILE"
+    TEMP_FILE=""
+    printf '%s is al actueel\n' "$dst"
+    return 1
+  fi
+  if [[ -e $dst ]]; then
+    backup="$dst.bak-$(date +%Y%m%d%H%M%S)"
+    cp -p -- "$dst" "$backup" || die 73 "back-up van $dst maken mislukt"
+    printf '%s bewaard als %s\n' "$dst" "$backup"
+  fi
+  publish_temp "$dst" "$3"
+  printf '%s vervangen door die uit current\n' "$dst"
+  return 0
 }
 
 # The shared "units installeren" step: both worker units from current to the unit directory, then daemon-reload. Never enable,
@@ -239,20 +315,9 @@ install_units() {
 # enabled"), with a back-up of the one it replaces. daemon-reload follows a replacement: systemd keeps the loaded increment-1
 # definition (`failed`) until then, and `enable --now` in litellm-up would start that one.
 install_bridge_unit() {
-  local src="$AH_CURRENT/deploy/max2/litellm/$UNIT_BRIDGE" dst="$AH_UNIT_DIR/$UNIT_BRIDGE" backup
-  require_plain_file "$src"
-  if [[ -f $dst ]] && cmp -s -- "$src" "$dst"; then
-    printf '%s is al actueel\n' "$dst"
-    return 0
+  if install_replacing "$AH_CURRENT/deploy/max2/litellm/$UNIT_BRIDGE" "$AH_UNIT_DIR/$UNIT_BRIDGE" 644; then
+    systemctl daemon-reload
   fi
-  if [[ -e $dst ]]; then
-    backup="$dst.bak-$(date +%Y%m%d%H%M%S)"
-    cp -p -- "$dst" "$backup" || die 73 "back-up van $dst maken mislukt"
-    printf '%s bewaard als %s\n' "$dst" "$backup"
-  fi
-  install_file "$src" "$dst" 644
-  systemctl daemon-reload
-  printf '%s vervangen door die uit current\n' "$dst"
 }
 
 # --- origin/main, state files and the MCP checkout (release-* and mcp-*) ------------------------------------------------------
@@ -442,9 +507,215 @@ ensure_master_key() {
   umask "$old_umask"
 }
 
+# --- LiteLLM: master key, health and model names (litellm-up, litellm-upgrade, status) -----------------------------------------
+
+# A master key that curl --config can carry as one `header` value: LiteLLM's `sk-` plus hex, or anything of that character class.
+# A quote, backslash, space or control character could end the value and start another curl option, so they are refused.
+KEY_RE='^[A-Za-z0-9._~+/=:-]+$'
+
+# 66 when harness-litellm.env has no LITELLM_MASTER_KEY, 64 when it holds one curl --config cannot carry safely. The value is
+# dropped again at once; fetch_models reads it itself.
+require_master_key() {
+  read_env_value "$AH_HARNESS_ENV" LITELLM_MASTER_KEY
+  if [[ -z $ENV_VALUE ]]; then
+    die 66 "LITELLM_MASTER_KEY ontbreekt in $AH_HARNESS_ENV (eerst install)"
+  fi
+  if [[ ! $ENV_VALUE =~ $KEY_RE ]]; then
+    ENV_VALUE=""
+    die 64 "de masterkey in $AH_HARNESS_ENV bevat een teken dat curl --config anders leest; niet gebruikt"
+  fi
+  ENV_VALUE=""
+}
+
+# The node program that reads the /v1/models response on stdin and prints the model names (`.data[].id`), space separated, and
+# nothing else: an id must match a safe pattern, so no control character or other field of the response leaves the wrapper.
+MODELS_JS='let s = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (d) => { s += d; if (s.length > 1048576) process.exit(3); });
+process.stdin.on("end", () => {
+  let j;
+  try { j = JSON.parse(s); } catch (e) { process.exit(3); }
+  if (!j || !Array.isArray(j.data)) process.exit(3);
+  const ids = [];
+  for (const m of j.data) {
+    if (m && typeof m.id === "string" && /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,127}$/.test(m.id)) ids.push(m.id);
+  }
+  process.stdout.write(ids.join(" "));
+});'
+
+# Sets MODELS_LINE to the model names LiteLLM knows. Returns 2 when there is no usable master key, 3 when LiteLLM did not answer or
+# the answer is no model list. The key stays in a shell variable and goes to curl through printf (a builtin) into `--config -`.
+MODELS_LINE=""
+fetch_models() {
+  local key rc=0
+  MODELS_LINE=""
+  read_env_value "$AH_HARNESS_ENV" LITELLM_MASTER_KEY
+  key=$ENV_VALUE
+  ENV_VALUE=""
+  if [[ -z $key || ! $key =~ $KEY_RE ]]; then
+    key=""
+    return 2
+  fi
+  MODELS_LINE=$(printf 'header = "Authorization: Bearer %s"\n' "$key" | curl -fsS --max-time 10 --config - "$AH_LITELLM_URL/v1/models" | node -e "$MODELS_JS") || rc=$?
+  key=""
+  ((rc == 0)) || { MODELS_LINE=""; return 3; }
+}
+
+print_models() { # for litellm-up and litellm-upgrade: a failure is 74
+  local rc=0
+  fetch_models || rc=$?
+  case $rc in
+    0) printf 'litellm modellen: %s\n' "${MODELS_LINE:-(geen)}" ;;
+    2) die 66 "de masterkey in $AH_HARNESS_ENV ontbreekt of is onbruikbaar" ;;
+    *) die 74 "de modellen van LiteLLM ($AH_LITELLM_URL/v1/models) zijn niet op te vragen" ;;
+  esac
+}
+
+# Waits for /health/liveliness (no key needed): AH_HEALTH_TRIES tries, AH_HEALTH_SLEEP seconds apart. Not healthy is 74.
+wait_litellm_healthy() {
+  local i
+  for ((i = 1; i <= AH_HEALTH_TRIES; i++)); do
+    if curl -fsS --max-time 5 -o /dev/null "$AH_LITELLM_URL/health/liveliness" 2>/dev/null; then
+      printf 'LiteLLM is gezond (/health/liveliness)\n'
+      return 0
+    fi
+    ((i == AH_HEALTH_TRIES)) || sleep "$AH_HEALTH_SLEEP"
+  done
+  die 74 "LiteLLM gaf geen 200 op $AH_LITELLM_URL/health/liveliness binnen $AH_HEALTH_TRIES pogingen"
+}
+
+litellm_compose() { # $@ = docker compose arguments after -p/-f
+  docker compose -p "$LITELLM_PROJECT" -f "$AH_LITELLM_DIR/compose.yml" "$@"
+}
+
 # --- actions --------------------------------------------------------------------------------------------------------
 
-action_status() { not_implemented status e; }
+# The node program of `status`: per configuration of harness.json the stored probe result, from <runs>/probe-<name>/probe.json (the
+# directory name is made the way probeDir in the harness makes it). That file lives in a directory of the owner, so it is read like a
+# state file (O_NOFOLLOW|O_NONBLOCK, a plain file of at most 1 MiB) and only validated fields are printed: accepted must be a boolean,
+# the hash 64 hexadecimal characters, the time an ISO timestamp (else the modification time of the file). Nothing is hashed here: the gate
+# of the worker does that, per job.
+STATUS_PROBES_JS='const fs = require("fs"), path = require("path");
+const cfgPath = process.argv[1], runs = process.argv[2];
+let names;
+try {
+  names = Object.keys(JSON.parse(fs.readFileSync(cfgPath, "utf8")).configurations || {});
+} catch (e) {
+  process.stdout.write("probe: (" + (e && e.code === "ENOENT" ? "harness.json ontbreekt" : "harness.json onleesbaar") + ")\n");
+  process.exit(0);
+}
+for (const name of names) {
+  if (!/^[a-z0-9][a-z0-9.-]{0,63}$/.test(name)) { process.stdout.write("probe: (een configuratienaam in harness.json is ongeldig)\n"); continue; }
+  const file = path.join(runs, "probe-" + name.toLowerCase().replace(/[^a-z0-9.-]+/g, "-"), "probe.json");
+  let line;
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  } catch (e) {
+    line = e && (e.code === "ENOENT" || e.code === "ENOTDIR") ? "(geen probe-uitslag)" : "(onleesbaar)";
+  }
+  if (fd !== undefined) {
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.size > 1048576) throw new Error("geen gewoon bestand");
+      const buf = Buffer.alloc(st.size);
+      let off = 0;
+      while (off < st.size) { const n = fs.readSync(fd, buf, off, st.size - off, off); if (n === 0) break; off += n; }
+      const j = JSON.parse(buf.toString("utf8", 0, off));
+      if (!j || typeof j.accepted !== "boolean" || typeof j.hash !== "string" || !/^[0-9a-f]{64}$/.test(j.hash)) throw new Error("onvolledig");
+      const time = typeof j.ranAt === "string" && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,16}Z$/.test(j.ranAt) ? j.ranAt : st.mtime.toISOString();
+      line = "accepted=" + j.accepted + " hash=" + j.hash + " tijd=" + time;
+    } catch (e) { line = "(onleesbaar)"; }
+    try { fs.closeSync(fd); } catch (e) {}
+  }
+  process.stdout.write("probe " + name + ": " + line + "\n");
+}'
+
+# One state file for `status`: the commit, "(geen)" when the file is missing, "(onleesbaar ...)" for anything else. Never exits.
+status_state() { # $1 = label, $2 = file
+  local out="" line rc=0
+  out=$(node -e "$STATE_READ_JS" "$2" 2>/dev/null) || rc=$?
+  case $rc in
+    0)
+      line=${out%%$'\n'*}
+      if [[ $line =~ ^[0-9a-f]{40}$ ]]; then
+        printf '%s: %s\n' "$1" "$line"
+      else
+        printf '%s: (onleesbaar: geen volledige commit)\n' "$1"
+      fi
+      ;;
+    2) printf '%s: (geen)\n' "$1" ;;
+    *) printf '%s: (onleesbaar: geen gewoon bestand van een paar bytes)\n' "$1" ;;
+  esac
+}
+
+# `status`: read-only and without the lock; every part reports its own failure and the exit code is 0. It prints the commits (current,
+# release.prev, mcp-stable HEAD, mcp.built, mcp.prev, origin/main of scrum4me-mcp), the unit states, the LiteLLM container with its image
+# digest, the model names, and per configuration the stored probe result. No secret: the master key only travels to curl.
+action_status() {
+  local target out unit info state cfg_image image_id digests head remote rc
+  local re='^releases/([0-9a-f]{40})$' sha_re='^[0-9a-f]{40}$'
+
+  if [[ ! -e $AH_CURRENT && ! -L $AH_CURRENT ]]; then
+    printf 'current: (geen)\n'
+  elif [[ -L $AH_CURRENT ]] && target=$(readlink -- "$AH_CURRENT") && [[ $target =~ $re ]]; then
+    printf 'current: %s\n' "${BASH_REMATCH[1]}"
+  else
+    printf 'current: (onleesbaar: geen symlink naar releases/<commit>)\n'
+  fi
+  status_state release.prev "$AH_RELEASE_PREV"
+
+  if [[ ! -d $AH_MCP_DIR ]]; then
+    printf 'mcp-stable HEAD: (checkout ontbreekt: %s)\n' "$AH_MCP_DIR"
+  elif head=$(owner_git -C "$AH_MCP_DIR" rev-parse HEAD 2>/dev/null) && [[ $head =~ $sha_re ]]; then
+    printf 'mcp-stable HEAD: %s\n' "$head"
+  else
+    printf 'mcp-stable HEAD: (onleesbaar: git rev-parse mislukte)\n'
+  fi
+  status_state mcp.built "$AH_MCP_BUILT"
+  status_state mcp.prev "$AH_MCP_PREV"
+  if [[ ! -d $AH_MCP_DIR ]]; then
+    printf 'mcp origin/main: (checkout ontbreekt: %s)\n' "$AH_MCP_DIR"
+  else
+    rc=0
+    out=$(owner_git -C "$AH_MCP_DIR" ls-remote origin refs/heads/main 2>/dev/null) || rc=$?
+    remote=""
+    read -r remote _ <<<"$out" || true
+    if ((rc == 0)) && [[ $remote =~ $sha_re ]]; then
+      printf 'mcp origin/main: %s\n' "$remote"
+    else
+      printf 'mcp origin/main: (niet bereikbaar)\n'
+    fi
+  fi
+
+  for unit in "$UNIT_HARNESS" "$UNIT_PROBE" "$UNIT_WORKER" "$UNIT_BRIDGE"; do
+    state=$(systemctl is-active "$unit" 2>/dev/null || true)
+    printf 'unit %s: %s\n' "$unit" "${state:-onbekend}"
+  done
+
+  if info=$(docker inspect --format '{{.State.Status}}|{{.Config.Image}}|{{.Image}}' "$LITELLM_CONTAINER" 2>/dev/null) && [[ -n $info ]]; then
+    state=${info%%|*}
+    cfg_image=${info#*|}
+    image_id=${cfg_image#*|}
+    cfg_image=${cfg_image%%|*}
+    printf 'litellm container: %s, image %s\n' "$state" "$cfg_image"
+    digests=$(docker image inspect --format '{{join .RepoDigests " "}}' "$image_id" 2>/dev/null || true)
+    printf 'litellm image-digest: %s\n' "${digests:-(onbekend)}"
+  else
+    printf 'litellm container: (niet gevonden of docker niet bereikbaar)\n'
+  fi
+
+  rc=0
+  fetch_models || rc=$?
+  case $rc in
+    0) printf 'litellm modellen: %s\n' "${MODELS_LINE:-(geen)}" ;;
+    2) printf 'litellm modellen: (masterkey ontbreekt of is onbruikbaar in %s)\n' "$AH_HARNESS_ENV" ;;
+    *) printf 'litellm modellen: (niet op te vragen)\n' ;;
+  esac
+
+  node -e "$STATUS_PROBES_JS" "$AH_HARNESS_JSON" "$AH_RUNS_DIR" 2>/dev/null || printf 'probe: (onleesbaar: node faalde)\n'
+  return 0
+}
 
 # The first set-up, idempotent: directories, the first release from origin/main, the units, the LiteLLM files and the bridge
 # unit, the master key. A second run changes nothing that exists: no git or npm call, and no file, key or release replaced
@@ -598,8 +869,46 @@ action_mcp_rollback() {
   printf '%s → %s\n' "${old:-onbekend}" "$prev"
 }
 
-action_litellm_up() { not_implemented litellm-up e; }
-action_litellm_upgrade() { not_implemented litellm-upgrade e; }
+# litellm-up: compose up -d (it makes the network `litellm`), then the installed bridge unit enabled and started (no copy: install and
+# litellm-upgrade place it), wait for /health/liveliness, print the model names. Every precondition is checked first, so a missing
+# file or key leaves LiteLLM as it was. The worker need not be at a standstill: this does not replace any file.
+action_litellm_up() {
+  [[ -f $AH_LITELLM_DIR/compose.yml ]] || die 66 "$AH_LITELLM_DIR/compose.yml ontbreekt (eerst install)"
+  [[ -f $AH_UNIT_DIR/$UNIT_BRIDGE ]] || die 66 "unit $AH_UNIT_DIR/$UNIT_BRIDGE ontbreekt (eerst install)"
+  require_master_key
+  litellm_compose up -d || die 74 "docker compose up -d mislukt"
+  systemctl enable --now "$UNIT_BRIDGE" || die 74 "systemctl enable --now $UNIT_BRIDGE mislukt"
+  wait_litellm_healthy
+  print_models
+}
+
+# litellm-upgrade: needs the worker at a standstill and the lock. From `current` it replaces harness.json, config.yaml, compose.yml and the
+# bridge unit (harness.json and config.yaml carry the same configuration names, so they go together; 0644, the previous one kept as
+# <file>.bak-<timestamp>), after every source has been checked: a bad source leaves every target as it was. Then daemon-reload, restart
+# of the bridge, pull and `up -d --force-recreate` (config.yaml is only a bind mount, so a plain `up -d` would leave the old container
+# on the old config), wait for liveliness, print the model names. The flow upgrade_litellm runs the probes and starts the service after
+# it. Run litellm-up first on a host that never ran LiteLLM: the bridge restart waits for the network br-litellm.
+action_litellm_upgrade() {
+  local max2="$AH_CURRENT/deploy/max2" f
+  require_standstill "$UNIT_HARNESS"
+  [[ -d $max2 ]] || die 66 "$max2 ontbreekt (eerst install of release-update)"
+  for f in harness.json litellm/config.yaml litellm/compose.yml "litellm/$UNIT_BRIDGE"; do
+    release_read "$max2/$f" >/dev/null
+  done
+  [[ -d $AH_ETC && -d $AH_LITELLM_DIR && -d $AH_UNIT_DIR ]] || die 66 "$AH_LITELLM_DIR of $AH_UNIT_DIR ontbreekt (eerst install)"
+  require_master_key
+  umask 022
+  install_replacing "$max2/harness.json" "$AH_HARNESS_JSON" 644 || true
+  install_replacing "$max2/litellm/config.yaml" "$AH_LITELLM_DIR/config.yaml" 644 || true
+  install_replacing "$max2/litellm/compose.yml" "$AH_LITELLM_DIR/compose.yml" 644 || true
+  install_replacing "$max2/litellm/$UNIT_BRIDGE" "$AH_UNIT_DIR/$UNIT_BRIDGE" 644 || true
+  systemctl daemon-reload
+  systemctl restart "$UNIT_BRIDGE" || die 74 "systemctl restart $UNIT_BRIDGE mislukt"
+  litellm_compose pull || die 74 "docker compose pull mislukt"
+  litellm_compose up -d --force-recreate || die 74 "docker compose up -d --force-recreate mislukt"
+  wait_litellm_healthy
+  print_models
+}
 
 # provider-key <NAME>: the value comes from stdin without echo; the line NAME=value in litellm.env is replaced (the first
 # one, later duplicates are dropped) or appended. Only shell builtins touch the value, so it is in no argv.

@@ -5,6 +5,7 @@ Standalone agent-harness v0: een CLI die een lokaal (OpenAI-compatibel) model zo
 - Ontwerp: [docs/specs/2026-09-26-agent-harness-v0-design.md](docs/specs/2026-09-26-agent-harness-v0-design.md)
 - Plan: [docs/plans/M1-agent-harness-v0.md](docs/plans/M1-agent-harness-v0.md)
 - Recept en praktijkbewijs tegen max2: [docs/runbooks/probe-and-run-max2.md](docs/runbooks/probe-and-run-max2.md)
+- De productiedienst op max2 (releases, ops-wrapper, LiteLLM, probe, bijwerken en terugzetten): [docs/runbooks/harness-service-max2.md](docs/runbooks/harness-service-max2.md)
 
 ## Installeren
 
@@ -77,9 +78,9 @@ Ontwerp en plan: [docs/specs/2026-09-26-idea-chat-local-llm-design.md](docs/spec
 
 ## Worker-modus (TASK_IMPLEMENTATION via een lokaal model)
 
-Dezelfde worker claimt met een `task`-blok in de config ook `TASK_IMPLEMENTATION`-jobs met `required_capability: 'local_llm'` (`kind = 'TASK_IMPLEMENTATION' AND source = 'COPILOT' AND sprint_run_id IS NULL`). Per taak draait de harness `prepare`- en `verify`-commando's (uit een per-repo recept) in wegwerp-Dockercontainers, laat het model werken met zes worktools (`list_files`, `read_file`, `write_file`, `edit_file`, `search`, `run_tests`) begrensd tot de worktree, en commit zelf — deterministisch, nooit het model — pas na een groene verify en een schone scan van de git-administratie. Push gebeurt door de scrum4me-MCP zelf, met een `GIT_ASKPASS`-script ([`deploy/max2/forgejo-askpass.sh`](deploy/max2/forgejo-askpass.sh)) dat het Forgejo-token alleen aan `git.jp-visser.nl` geeft.
+Dezelfde worker claimt met een `task`-blok in de config ook `TASK_IMPLEMENTATION`-jobs: als runtime `HARNESS` (zie hierboven) claimt hij via `wait_for_job` de jobs van die runtime, `kind = 'TASK_IMPLEMENTATION'` ook (de oude identiteit `local_llm` met `required_capability: 'local_llm'` is die van de oude dienst, zie hieronder). Per taak draait de harness `prepare`- en `verify`-commando's (uit een per-repo recept) in wegwerp-Dockercontainers, laat het model werken met zes worktools (`list_files`, `read_file`, `write_file`, `edit_file`, `search`, `run_tests`) begrensd tot de worktree, en commit zelf — deterministisch, nooit het model — pas na een groene verify en een schone scan van de git-administratie. Push gebeurt door de scrum4me-MCP zelf, met een `GIT_ASKPASS`-script ([`deploy/max2/forgejo-askpass.sh`](deploy/max2/forgejo-askpass.sh)) dat het Forgejo-token alleen aan `git.jp-visser.nl` geeft.
 
-Tot deze harness met een `task`-blok op max2 draait, wordt geen taak met `local_llm` gedispatcht (zie het runbook).
+Op max2 draait de oude dienst (`agent-harness-worker.service`, identiteit `local_llm`) tot 2e naast de nieuwe `agent-harness.service` (identiteit `HARNESS`, LiteLLM, releases en een ops-wrapper; geïnstalleerd, nog niet gestart). Installeren, bijwerken, terugzetten en de probe staan in [docs/runbooks/harness-service-max2.md](docs/runbooks/harness-service-max2.md); zolang de oude dienst draait, wordt een taak met `local_llm` volgens het oude runbook gedispatcht (zie het runbook).
 
 Ontwerp en plan: [docs/specs/2026-09-27-task-implementation-local-llm-design.md](docs/specs/2026-09-27-task-implementation-local-llm-design.md), [docs/plans/M3-task-implementation-local-llm.md](docs/plans/M3-task-implementation-local-llm.md). Recept, faalredenen en opruimen: [docs/runbooks/task-worker.md](docs/runbooks/task-worker.md).
 

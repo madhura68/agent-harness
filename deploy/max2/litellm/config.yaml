@@ -10,7 +10,7 @@ model_list:
       api_key: "none"
       timeout: 600
   # Hosted: OpenRouter at BF16, no data collection, no silent fallback. extra_body is merged into every request
-  # of this deployment; the trial measures whether the provider block actually reaches OpenRouter.
+  # of this deployment. The trial of increment 1 measured that the provider block reaches OpenRouter (docs/runbooks/litellm-max2.md).
   - model_name: qwen3.8-or
     litellm_params:
       model: openrouter/qwen/qwen3.8-27b

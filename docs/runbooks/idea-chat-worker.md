@@ -8,6 +8,8 @@ last_updated: 2026-10-05
 
 Recept voor `harness worker` en het live bewijs van M2 ([spec](../specs/2026-09-26-idea-chat-local-llm-design.md), [plan](../plans/M2-idea-chat-local-llm.md)).
 
+> **Sinds M45-2d** is er een nieuwe productiedienst op max2 (`agent-harness.service`, runtime `HARNESS`, via LiteLLM, met releases en een ops-wrapper). Die staat geïnstalleerd en gestopt; deze oude dienst (`agent-harness-worker.service`, identiteit `local_llm`, direct tegen Ollama) blijft tot 2e. Installeren, bijwerken, terugzetten en de probe van de nieuwe dienst: [harness-service-max2.md](harness-service-max2.md).
+
 Sinds M3 kan dezelfde worker ook `TASK_IMPLEMENTATION`-jobs met `required_capability: 'local_llm'` claimen (een `task`-blok in de config); zie [task-worker.md](task-worker.md) voor dat recept, de faalredenen en de volgorde-eis.
 
 ## Voorwaarden
@@ -45,7 +47,7 @@ cd ~/Development/scrum4me-mcp-stable && git pull --ff-only && git submodule upda
 sudo systemctl restart agent-harness-worker
 ```
 
-Ander model: eerst `node dist/cli.js probe --base-url http://127.0.0.1:11434/v1 --model <naam> --out /var/lib/agent-harness/runs`, dan `worker.json` aanpassen en herstarten. Een job op een configuratie zonder aanvaarde probe van de huidige hash faalt met `CONFIGURATION_NOT_PROBED`; de worker zelf start wel.
+Ander model: een config in `/etc/agent-harness/worker.json` aanpassen en herstarten; de worker controleert per job de probe van die configuratie. Probe eerst met `node dist/cli.js probe --config <config.json> --configuration <naam> --out /var/lib/agent-harness/runs --api-key-env <VAR>` (niet met `--base-url`: dat schrijft een uitslag zonder hash, en de gate eist een aanvaarde `probe-<naam>/probe.json` van de huidige hash). Een job op een configuratie zonder aanvaarde probe van de huidige hash faalt met `CONFIGURATION_NOT_PROBED`; de worker zelf start wel. Voor de nieuwe dienst staat dit in [harness-service-max2.md](harness-service-max2.md).
 
 Bewijs: job `cmujtwnbj001qvz7rn2ytmgct` (IDEA-224, 2026-09-27 13:02) DONE in 12 s door de service (token `agent-harness-local-llm-max2`, `model_id qwen3.8-gsq-rco:27b-iq3_s-text`); beantwoordde beide openstaande berichten, ook dat van de eerder mislukte beurt.
 
@@ -120,7 +122,7 @@ npm run dev -- worker --config <worker.json> --out runs --api-key-env LITELLM_MA
 
 **Gedrag.** De waarde gaat mee als `Authorization: Bearer …`. Ze wint van een `model.apiKey` in de config, zoals bij `harness run`, en gaat alleen naar de model-client: de config die het run-log, het manifest en de trace zien, blijft zoals hij geladen is. Zonder de optie verandert er niets.
 
-**Wat de worker weigert.** De optie wordt gelezen direct na het laden van de config, vóór het MCP-kindproces. Een gebruiksfout volgt (exit 1, de naam van de variabele in de melding, nooit de waarde) als:
+**Wat de worker weigert.** De optie wordt gelezen direct na het laden van de config, vóór het MCP-kindproces. Een gebruiksfout volgt (exit 78, voordat er iets start; de naam van de variabele in de melding, nooit de waarde) als:
 - de variabele niet gezet of leeg is;
 - de naam niet als geheim telt, bijvoorbeeld `LITELLM` (`LITELLM_MASTER_KEY` en `MODEL_API_KEY` wel): dezelfde namen als onder *Controle op geheimen* hierboven;
 - de waarde korter is dan 8 tekens.

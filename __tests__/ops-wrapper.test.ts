@@ -30,10 +30,6 @@ const LOCK_FREE = ['status', 'stop']
 const LOCKED = ACTIONS.filter((a) => !LOCK_FREE.includes(a))
 /** Every invocation that takes the lock: the locked actions and provider-key with a valid name. */
 const LOCKED_CASES: string[][] = [...LOCKED.map((a) => [a]), ['provider-key', 'OPENROUTER_API_KEY']]
-/** Actions that are built in an earlier part (own describe blocks); the rest still answers 70. */
-const BUILT = ['install', 'stop', 'start', 'probe', 'release-update', 'release-rollback', 'mcp-update', 'mcp-rollback']
-const NOT_BUILT = ACTIONS.filter((a) => !BUILT.includes(a))
-const NOT_BUILT_LOCKED_CASES = LOCKED_CASES.filter((c) => !BUILT.includes(c[0]))
 const COMMAND_STUBS = ['systemctl', 'runuser', 'git', 'npm', 'docker', 'curl', 'flock']
 const FILE_SHIMS = ['mktemp', 'mv', 'chmod', 'rm', 'cat', 'sed', 'awk', 'grep', 'tee', 'env', 'id', 'dirname', 'basename', 'cp', 'ln', 'mkdir', 'touch', 'printf']
 
@@ -137,29 +133,31 @@ describe('ops wrapper: de actielijst', () => {
     expect(calls()).toEqual([])
   })
 
-  it('kent alle elf acties: elke actie die nog niet is gebouwd (status, litellm-up, litellm-upgrade) geeft 70 met een duidelijke regel, de rest van de wrapper blijft ongemoeid', () => {
-    expect(NOT_BUILT).toEqual(['status', 'litellm-up', 'litellm-upgrade'])
-    for (const actie of NOT_BUILT) {
+  it('kent alle elf acties en geeft nergens meer 70: geen enkele actie is nog "niet geïmplementeerd"', () => {
+    for (const actie of ACTIONS) {
       const res = run([actie])
-      expect(res.code, actie).toBe(70)
-      expect(res.stderr, actie).toMatch(new RegExp(`${actie}: nog niet geïmplementeerd \\(deel [de]\\)`))
+      expect(res.code, actie).not.toBe(70)
+      expect(res.stderr, actie).not.toContain('nog niet geïmplementeerd')
     }
-    expect(run(['install']).stderr).not.toContain('nog niet geïmplementeerd')
+    const bron = readFileSync(SCRIPT, 'utf8')
+    expect(bron).not.toContain('not_implemented')
+    expect(bron).not.toContain('nog niet geïmplementeerd')
   })
 
-  it('neemt voor elke actie behalve status en stop eerst de exclusieve flock (flock -n 9) en roept verder geen stub aan', () => {
-    for (const args of NOT_BUILT_LOCKED_CASES) {
+  it('neemt voor elke actie behalve status en stop eerst de exclusieve flock (flock -n 9) en maakt het lockbestand aan', () => {
+    for (const args of LOCKED_CASES) {
       writeFileSync(log, '')
       rmSync(join(dir, 'ops.lock'), { force: true })
       run(args, { input: `${FAKE_KEY}\n` })
-      expect(stubCalls(), args.join(' ')).toEqual(['flock -n 9'])
+      expect(stubCalls()[0], args.join(' ')).toBe('flock -n 9')
       expect(existsSync(join(dir, 'ops.lock')), args.join(' ')).toBe(true)
     }
     for (const actie of LOCK_FREE) {
       writeFileSync(log, '')
+      rmSync(join(dir, 'ops.lock'), { force: true })
       run([actie])
-      // status is not built yet; stop only asks systemd to stop the service
-      expect(stubCalls(), actie).toEqual(actie === 'stop' ? ['systemctl stop agent-harness.service'] : [])
+      expect(stubCalls().filter((c) => c.startsWith('flock')), actie).toEqual([])
+      expect(existsSync(join(dir, 'ops.lock')), actie).toBe(false)
     }
   })
 
@@ -202,8 +200,9 @@ describe('ops wrapper: één actie tegelijk', () => {
       writeFileSync(log, '')
       const res = run([actie], { env: { STUB_FLOCK_BUSY: '1' } })
       expect(res.code, actie).not.toBe(75)
-      // status is not built yet (no calls); stop only asks systemd to stop the service
-      expect(stubCalls(), actie).toEqual(actie === 'stop' ? ['systemctl stop agent-harness.service'] : [])
+      expect(stubCalls().filter((c) => c.startsWith('flock')), actie).toEqual([])
+      // stop only asks systemd to stop the service
+      if (actie === 'stop') expect(stubCalls()).toEqual(['systemctl stop agent-harness.service'])
     }
   })
 })
@@ -1738,6 +1737,653 @@ exit 0`,
         expect(res.code, res.stderr).toBe(0)
         expect(lstatSync(builtFile()).isFile()).toBe(true)
         expect(read(builtFile())).toBe(`${RA}\n`)
+      })
+    })
+  })
+})
+
+// --- litellm-up, litellm-upgrade en status (deel e) ----------------------------------------------------------------------------
+
+const MASTER = `sk-${'ab'.repeat(24)}` // an obviously fake master key of the real shape
+const BRIDGE = 'litellm-ollama-bridge.service'
+const HEALTH_CALL = 'curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:4000/health/liveliness'
+const MODELS_CALL = 'curl -fsS --max-time 10 --config - http://127.0.0.1:4000/v1/models'
+const SECRET_SENTINEL = 'sk-niet-kopieren-uit-een-symlink'
+const HEX64 = 'ab12cd34'.repeat(8)
+
+describe('ops wrapper: litellm-up, litellm-upgrade en status (deel e)', () => {
+  const me = userInfo().username
+  const OWNER = `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 `
+  const COMPOSE = (): string => etc('litellm', 'compose.yml')
+  const VAR = (): string => join(dir, 'var')
+  const RUNS = (): string => join(VAR(), 'runs')
+  const MCP = (): string => join(dir, 'mcp')
+  const read = (p: string): string => readFileSync(p, 'utf8')
+  const src = (...p: string[]): string => join(REPO_MAX2, ...p)
+  const eEnv = (extra: Record<string, string> = {}): Record<string, string> =>
+    installEnv({ AH_STATE_DIR: VAR(), AH_RUNS_DIR: RUNS(), AH_MCP_DIR: MCP(), AH_HEALTH_TRIES: '3', AH_HEALTH_SLEEP: '0', STUB_MCP_HEAD: SHA, STUB_MCP_REMOTE: SHA2, ...extra })
+  const act = (action: string, extra: Record<string, string> = {}) => run([action], { env: eEnv(extra), timeout: 30000 })
+  const everything = (res: { stdout: string; stderr: string }): string => `${res.stdout}\n${res.stderr}\n${readFileSync(log, 'utf8')}`
+  const curlConfigs = (): string[] => readdirSync(join(dir, 'state')).filter((f) => f.startsWith('curl-config.')).map((f) => read(join(dir, 'state', f)))
+  /** The calls that matter for order (the file shims are not counted). */
+  const view = (): string[] => stubCalls().map((c) => c.replace(OWNER, 'OWNER '))
+
+  /** current -> a built release with the repo's deploy files, and everything install leaves: etc files, key files, the bridge unit. */
+  function ready(): void {
+    mkdirSync(srv('releases'), { recursive: true })
+    fakeRelease(SHA)
+    symlinkSync(`releases/${SHA}`, srv('current'))
+    mkdirSync(etc('litellm'), { recursive: true })
+    writeFileSync(etc('harness.json'), read(src('harness.json')))
+    writeFileSync(etc('litellm', 'config.yaml'), read(src('litellm', 'config.yaml')))
+    writeFileSync(etc('litellm', 'compose.yml'), read(src('litellm', 'compose.yml')))
+    writeFileSync(units(BRIDGE), read(src('litellm', BRIDGE)))
+    writeFileSync(litellmEnv(), `LITELLM_MASTER_KEY=${MASTER}\n`, { mode: 0o600 })
+    writeFileSync(harnessEnv(), `LITELLM_MASTER_KEY=${MASTER}\n`, { mode: 0o600 })
+  }
+
+  beforeEach(() => {
+    installStubs()
+    mkdirSync(units(), { recursive: true })
+    mkdirSync(VAR())
+    stateOf('agent-harness.service', 'inactive')
+    stateOf('agent-harness-worker.service', 'inactive')
+    writeStub(
+      'systemctl',
+      `${LOG_LINE}
+if [ "$1" = is-active ]; then
+  if [ -f "$STUB_STATE/$2" ]; then s=$(cat "$STUB_STATE/$2"); echo "$s"; [ "$s" = active ] && exit 0; exit 3; fi
+  echo unknown; exit 4
+fi
+if [ "$1" = restart ] && [ -n "$STUB_RESTART_RC" ]; then exit "$STUB_RESTART_RC"; fi
+if [ "$1" = enable ] && [ -n "$STUB_ENABLE_RC" ]; then exit "$STUB_ENABLE_RC"; fi
+exit 0`,
+    )
+    writeStub(
+      'docker',
+      `${LOG_LINE}
+case "$1" in
+  compose)
+    case " $* " in
+      *' pull '*) exit "\${STUB_PULL_RC:-0}" ;;
+      *' up '*) exit "\${STUB_UP_RC:-0}" ;;
+    esac
+    exit 0 ;;
+  inspect) [ -n "$STUB_INSPECT_RC" ] && exit "$STUB_INSPECT_RC"; echo 'running|ghcr.io/berriai/litellm@sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf|sha256:0f1e2d3c'; exit 0 ;;
+  image) echo 'ghcr.io/berriai/litellm@sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf'; exit 0 ;;
+esac
+exit 0`,
+    )
+    // curl: the config on stdin (--config -) is recorded in STUB_STATE; liveliness fails STUB_HEALTH_FAILS times first
+    writeStub(
+      'curl',
+      `${LOG_LINE}
+for a in "$@"; do if [ "$a" = - ]; then cat > "$STUB_STATE/curl-config.$$"; fi; done
+case "$*" in
+  *liveliness*)
+    n=$(cat "$STUB_STATE/health-count" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$STUB_STATE/health-count"
+    if [ "$n" -le "\${STUB_HEALTH_FAILS:-0}" ]; then exit 22; fi
+    echo '"I am alive!"'; exit 0 ;;
+  */v1/models*)
+    if [ -n "$STUB_MODELS_RC" ]; then exit "$STUB_MODELS_RC"; fi
+    if [ -f "$STUB_STATE/models.json" ]; then cat "$STUB_STATE/models.json"; else echo '{"object":"list","data":[{"id":"gsq-lokaal"},{"id":"qwen3.8-or"}]}'; fi
+    exit 0 ;;
+esac
+exit 0`,
+    )
+    writeStub(
+      'git',
+      `${LOG_LINE}
+mcp=; if [ "$1" = -C ]; then mcp=1; shift 2; fi
+case "$1" in
+  rev-parse) echo "$STUB_MCP_HEAD"; exit 0 ;;
+  ls-remote)
+    if [ -n "$STUB_LSREMOTE_RC" ]; then exit "$STUB_LSREMOTE_RC"; fi
+    if [ -n "$mcp" ]; then printf '%s\\trefs/heads/main\\n' "$STUB_MCP_REMOTE"; else printf '%s\\trefs/heads/main\\n' "$STUB_HEAD"; fi
+    exit 0 ;;
+  clone) mkdir -p "$3" && cp -R "$STUB_SRC_DEPLOY" "$3/deploy"; exit $? ;;
+esac
+exit 0`,
+    )
+  })
+
+  describe('litellm-up', () => {
+    it('draait compose up -d, start de geïnstalleerde brug-unit (enable --now), wacht op liveliness en vraagt de modellen, in die volgorde', () => {
+      ready()
+      writeFileSync(units(BRIDGE), '# eigen brug-unit, niet uit current\n') // litellm-up kopieert geen unit: wat er staat blijft staan
+      const unitsVoor = readdirSync(units()).sort()
+      const res = act('litellm-up')
+      expect(res.code, res.stderr).toBe(0)
+      expect(view()).toEqual([
+        'flock -n 9',
+        `docker compose -p litellm -f ${COMPOSE()} up -d`,
+        `systemctl enable --now ${BRIDGE}`,
+        HEALTH_CALL,
+        MODELS_CALL,
+      ])
+      // geen kopie van de unit, geen back-up en geen daemon-reload
+      expect(readdirSync(units()).sort()).toEqual(unitsVoor)
+      expect(read(units(BRIDGE))).toBe('# eigen brug-unit, niet uit current\n')
+    })
+
+    it('vraagt geen stilstand van de dienst: litellm-up werkt ook als agent-harness.service draait', () => {
+      ready()
+      stateOf('agent-harness.service', 'active')
+      const res = act('litellm-up')
+      expect(res.code, res.stderr).toBe(0)
+      expect(stubCalls().filter((c) => c.startsWith('systemctl is-active'))).toEqual([])
+    })
+
+    it('drukt alleen de modelnamen af: geen ander veld, geen stuurtekens, geen id met een vreemd teken', () => {
+      ready()
+      writeFileSync(
+        join(dir, 'state', 'models.json'),
+        JSON.stringify({ object: 'list', data: [{ id: 'gsq-lokaal', owned_by: 'lekt-niet-uit' }, { id: 'raar\u001b[31mid' }, { id: 'qwen3.8-or', extra: 'lekt-ook-niet' }, { x: 1 }, { id: 42 }] }),
+      )
+      const res = act('litellm-up')
+      expect(res.code, res.stderr).toBe(0)
+      expect(res.stdout).toContain('gsq-lokaal')
+      expect(res.stdout).toContain('qwen3.8-or')
+      for (const verboden of ['lekt-niet-uit', 'lekt-ook-niet', 'raar', '\u001b', 'owned_by']) expect(res.stdout + res.stderr, verboden).not.toContain(verboden)
+    })
+
+    it('geeft de masterkey alleen via curl --config op stdin: hij staat in geen argv van een stub en niet in stdout of stderr', () => {
+      ready()
+      const res = act('litellm-up')
+      expect(res.code, res.stderr).toBe(0)
+      expect(everything(res)).not.toContain(MASTER)
+      expect(everything(res)).not.toContain('sk-')
+      const configs = curlConfigs()
+      expect(configs).toHaveLength(1)
+      expect(configs[0]).toContain(`Bearer ${MASTER}`)
+      // de modellenaanroep draagt de sleutel niet; alleen de health-aanroep loopt zonder --config
+      expect(calls().filter((c) => c.startsWith('curl')).filter((c) => c.includes('/health/liveliness'))).toEqual([HEALTH_CALL])
+    })
+
+    it('probeert liveliness opnieuw tot het slaagt, binnen het aantal pogingen', () => {
+      ready()
+      const res = act('litellm-up', { STUB_HEALTH_FAILS: '2' })
+      expect(res.code, res.stderr).toBe(0)
+      expect(calls().filter((c) => c === HEALTH_CALL)).toHaveLength(3)
+    })
+
+    it('geeft 74 als liveliness nooit slaagt, zonder de modellen op te vragen en zonder de sleutel te lekken', () => {
+      ready()
+      const res = act('litellm-up', { STUB_HEALTH_FAILS: '99' })
+      expect(res.code).toBe(74)
+      expect(res.stderr).toContain('liveliness')
+      expect(calls().filter((c) => c === HEALTH_CALL)).toHaveLength(3)
+      expect(calls().some((c) => c.includes('/v1/models'))).toBe(false)
+      expect(everything(res)).not.toContain(MASTER)
+    })
+
+    it('geeft 74 als de modellen niet op te vragen zijn (bijvoorbeeld 401), en lekt de sleutel niet', () => {
+      ready()
+      const res = act('litellm-up', { STUB_MODELS_RC: '22' })
+      expect(res.code).toBe(74)
+      expect(everything(res)).not.toContain(MASTER)
+    })
+
+    it('geeft 74 als compose up faalt, zonder de brug te starten', () => {
+      ready()
+      const res = act('litellm-up', { STUB_UP_RC: '1' })
+      expect(res.code).toBe(74)
+      expect(stubCalls().some((c) => c.startsWith('systemctl enable'))).toBe(false)
+    })
+
+    it('geeft 74 als enable --now faalt', () => {
+      ready()
+      expect(act('litellm-up', { STUB_ENABLE_RC: '1' }).code).toBe(74)
+    })
+
+    it.each([
+      ['compose.yml', () => rmSync(etc('litellm', 'compose.yml'))],
+      ['de brug-unit', () => rmSync(units(BRIDGE))],
+      ['harness-litellm.env', () => rmSync(harnessEnv())],
+      ['de sleutel in harness-litellm.env', () => writeFileSync(harnessEnv(), 'ANDERS=1\n')],
+      ['een niet-lege sleutel', () => writeFileSync(harnessEnv(), 'LITELLM_MASTER_KEY=\n')],
+    ])('geeft 66 als %s ontbreekt, vóór elke docker-, systemctl- of curl-aanroep', (_naam, breek) => {
+      ready()
+      breek()
+      const res = act('litellm-up')
+      expect(res.code, res.stderr).toBe(66)
+      expect(view()).toEqual(['flock -n 9'])
+    })
+
+    it.each([['aanhalingsteken', 'sk-ab"cd'], ['carriage return', 'sk-ab\r'], ['spatie', 'sk-ab cd'], ['backslash', 'sk-ab\\cd']])(
+      'weigert (64) een masterkey met %s: curl --config zou er een andere optie van maken',
+      (_naam, sleutel) => {
+        ready()
+        writeFileSync(harnessEnv(), `LITELLM_MASTER_KEY=${sleutel}\n`)
+        const res = act('litellm-up')
+        expect(res.code, res.stderr).toBe(64)
+        expect(everything(res)).not.toContain('sk-ab')
+        expect(view()).toEqual(['flock -n 9'])
+      },
+    )
+  })
+
+  describe('litellm-upgrade', () => {
+    /** Old content in every target, so that an upgrade has something to back up. */
+    function oldTargets(): void {
+      writeFileSync(etc('harness.json'), '{"oud":"harness"}\n')
+      writeFileSync(etc('litellm', 'config.yaml'), '# oude config\n')
+      writeFileSync(etc('litellm', 'compose.yml'), '# oude compose\n')
+      writeFileSync(units(BRIDGE), '# oude brug\n')
+    }
+    const backups = (d: string, prefix: string): string[] => readdirSync(d).filter((f) => f.startsWith(`${prefix}.bak-`))
+
+    it.each(['active', 'activating', 'deactivating', ''])('weigert (75) bij toestand %j, zonder docker, daemon-reload of bestandswijziging', (toestand) => {
+      ready()
+      oldTargets()
+      stateOf('agent-harness.service', toestand)
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(75)
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+      expect(read(etc('harness.json'))).toBe('{"oud":"harness"}\n')
+      expect(read(units(BRIDGE))).toBe('# oude brug\n')
+    })
+
+    it.each(['inactive', 'failed'])('gaat bij %s door', (toestand) => {
+      ready()
+      stateOf('agent-harness.service', toestand)
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(0)
+    })
+
+    it('geeft 75 bij een bezette lock, vóór elke andere aanroep', () => {
+      ready()
+      const res = act('litellm-upgrade', { STUB_FLOCK_BUSY: '1' })
+      expect(res.code).toBe(75)
+      expect(view()).toEqual(['flock -n 9'])
+    })
+
+    it('kopieert harness.json, config.yaml, compose.yml en de brug-unit uit current (0644) en bewaart de vorige als back-up', () => {
+      ready()
+      oldTargets()
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(0)
+      const doelen: Array<[string, string, string]> = [
+        [etc('harness.json'), src('harness.json'), '{"oud":"harness"}\n'],
+        [etc('litellm', 'config.yaml'), src('litellm', 'config.yaml'), '# oude config\n'],
+        [etc('litellm', 'compose.yml'), src('litellm', 'compose.yml'), '# oude compose\n'],
+        [units(BRIDGE), src('litellm', BRIDGE), '# oude brug\n'],
+      ]
+      for (const [doel, bron, oud] of doelen) {
+        expect(read(doel), doel).toBe(read(bron))
+        expect(mode(doel), doel).toBe('644')
+        const back = backups(join(doel, '..'), doel.split('/').pop()!)
+        expect(back, doel).toHaveLength(1)
+        expect(read(join(doel, '..', back[0])), doel).toBe(oud)
+      }
+      expect(readdirSync(etc()).filter((f) => f.includes('.tmp') || f.startsWith('.'))).toEqual([])
+    })
+
+    it('maakt geen back-up van een bestand dat al gelijk is of nog niet bestaat', () => {
+      ready()
+      rmSync(etc('litellm', 'compose.yml'))
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(0)
+      expect(read(etc('litellm', 'compose.yml'))).toBe(read(src('litellm', 'compose.yml')))
+      expect(readdirSync(etc()).filter((f) => f.includes('.bak-'))).toEqual([])
+      expect(readdirSync(etc('litellm')).filter((f) => f.includes('.bak-'))).toEqual([])
+      expect(readdirSync(units()).filter((f) => f.includes('.bak-'))).toEqual([])
+    })
+
+    it('doet daemon-reload, herstart de brug, pull en up -d --force-recreate (zelfde -p en -f als litellm-up), wacht op liveliness en vraagt de modellen, in die volgorde', () => {
+      ready()
+      oldTargets()
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(0)
+      expect(view()).toEqual([
+        'flock -n 9',
+        'systemctl is-active agent-harness.service',
+        'systemctl daemon-reload',
+        `systemctl restart ${BRIDGE}`,
+        `docker compose -p litellm -f ${COMPOSE()} pull`,
+        `docker compose -p litellm -f ${COMPOSE()} up -d --force-recreate`,
+        HEALTH_CALL,
+        MODELS_CALL,
+      ])
+      // zelfde -p en -f als litellm-up
+      writeFileSync(log, '')
+      expect(act('litellm-up').code).toBe(0)
+      expect(view()[1]).toBe(`docker compose -p litellm -f ${COMPOSE()} up -d`)
+    })
+
+    it('drukt alleen de modelnamen af en geeft de masterkey alleen via curl --config op stdin', () => {
+      ready()
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(0)
+      expect(res.stdout).toContain('gsq-lokaal')
+      expect(everything(res)).not.toContain(MASTER)
+      expect(curlConfigs()).toHaveLength(1)
+      expect(curlConfigs()[0]).toContain(`Bearer ${MASTER}`)
+    })
+
+    it('raakt git, npm en runuser niet aan: alles komt uit current', () => {
+      ready()
+      act('litellm-upgrade')
+      expect(stubCalls().filter((c) => /^(git|npm|runuser) /.test(c))).toEqual([])
+    })
+
+    it.each([
+      ['de herstart van de brug', { STUB_RESTART_RC: '1' }, 'pull'],
+      ['pull', { STUB_PULL_RC: '1' }, 'up'],
+      ['up -d --force-recreate', { STUB_UP_RC: '1' }, 'liveliness'],
+    ])('geeft 74 als %s faalt en gaat daarna niet verder', (_naam, extra, volgende) => {
+      ready()
+      const res = act('litellm-upgrade', extra)
+      expect(res.code, res.stderr).toBe(74)
+      expect(calls().some((c) => c.includes(volgende === 'liveliness' ? '/health/liveliness' : ` ${volgende}`))).toBe(false)
+    })
+
+    it('geeft 74 als LiteLLM na de herstart niet gezond wordt', () => {
+      ready()
+      const res = act('litellm-upgrade', { STUB_HEALTH_FAILS: '99' })
+      expect(res.code).toBe(74)
+      expect(calls().some((c) => c.includes('/v1/models'))).toBe(false)
+    })
+
+    it('geeft 66 zonder current, vóór elke wijziging', () => {
+      ready()
+      rmSync(srv('current'))
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(66)
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+    })
+
+    it('controleert eerst álle bronnen: een ontbrekend bronbestand laat elk doel en elke unit onaangeroerd, zonder daemon-reload of docker', () => {
+      ready()
+      oldTargets()
+      rmSync(srv('current', 'deploy', 'max2', 'litellm', 'compose.yml'))
+      const res = act('litellm-upgrade')
+      expect(res.code, res.stderr).toBe(66)
+      expect(read(etc('harness.json'))).toBe('{"oud":"harness"}\n')
+      expect(read(etc('litellm', 'config.yaml'))).toBe('# oude config\n')
+      expect(read(units(BRIDGE))).toBe('# oude brug\n')
+      expect(readdirSync(etc()).filter((f) => f.includes('.bak-'))).toEqual([])
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+    })
+
+    describe('bronnen worden als root gelezen, binnen de release (geen symlink-uitweg)', () => {
+      const geheimDir = (): string => {
+        const geheim = join(dir, 'geheime-map')
+        mkdirSync(geheim, { recursive: true })
+        for (const f of ['config.yaml', 'compose.yml', BRIDGE]) writeFileSync(join(geheim, f), `${SECRET_SENTINEL}\n`, { mode: 0o600 })
+        return geheim
+      }
+      const nergensGekopieerd = (): void => {
+        for (const d of [units(), etc(), etc('litellm')]) {
+          for (const f of existsSync(d) ? readdirSync(d) : []) {
+            const pad = join(d, f)
+            if (statSync(pad).isFile()) expect(read(pad), pad).not.toContain(SECRET_SENTINEL)
+          }
+        }
+      }
+
+      it('weigert (66) een release waarin deploy/max2/litellm een symlink is naar een map met een geheim bestand, en kopieert het geheim niet', () => {
+        ready()
+        oldTargets()
+        const doel = srv('releases', SHA, 'deploy', 'max2', 'litellm')
+        rmSync(doel, { recursive: true })
+        symlinkSync(geheimDir(), doel)
+        const res = act('litellm-upgrade')
+        expect(res.code, res.stderr).toBe(66)
+        nergensGekopieerd()
+        expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+      })
+
+      it('weigert (66) een release waarin deploy/max2 een symlink naar een map buiten de release is', () => {
+        ready()
+        oldTargets()
+        const doel = srv('releases', SHA, 'deploy', 'max2')
+        const buiten = join(dir, 'buiten-max2')
+        cpSync(doel, buiten, { recursive: true })
+        writeFileSync(join(buiten, 'harness.json'), `${SECRET_SENTINEL}\n`)
+        rmSync(doel, { recursive: true })
+        symlinkSync(buiten, doel)
+        const res = act('litellm-upgrade')
+        expect(res.code, res.stderr).toBe(66)
+        nergensGekopieerd()
+      })
+
+      it.each(['harness.json', 'litellm/config.yaml', 'litellm/compose.yml', `litellm/${BRIDGE}`])('weigert (66) een bronbestand dat een symlink is naar een geheim bestand buiten de release (%s)', (rel) => {
+        ready()
+        oldTargets()
+        const geheim = join(dir, 'geheim.env')
+        writeFileSync(geheim, `${SECRET_SENTINEL}\n`, { mode: 0o600 })
+        const pad = srv('releases', SHA, 'deploy', 'max2', rel)
+        rmSync(pad)
+        symlinkSync(geheim, pad)
+        const res = act('litellm-upgrade')
+        expect(res.code, res.stderr).toBe(66)
+        expect(res.stderr).toContain('symlink')
+        nergensGekopieerd()
+        expect(read(etc('harness.json'))).toBe('{"oud":"harness"}\n')
+      })
+
+      it('weigert (66) ook een symlink naar een bestand binnen de release: een bronbestand is een gewoon bestand', () => {
+        ready()
+        const pad = srv('releases', SHA, 'deploy', 'max2', 'litellm', 'config.yaml')
+        const echt = srv('releases', SHA, 'deploy', 'max2', 'litellm', 'echt.yaml')
+        writeFileSync(echt, 'model_list: []\n')
+        rmSync(pad)
+        symlinkSync('echt.yaml', pad)
+        const res = act('litellm-upgrade')
+        expect(res.code, res.stderr).toBe(66)
+        expect(res.stderr).toContain('symlink')
+      })
+
+      it('weigert (66) een bronbestand dat geen gewoon bestand is (een map) en een te groot bestand, en geeft geen hang bij een FIFO', () => {
+        ready()
+        const pad = srv('releases', SHA, 'deploy', 'max2', 'litellm', 'compose.yml')
+        rmSync(pad)
+        mkdirSync(pad)
+        expect(act('litellm-upgrade').code).toBe(66)
+        rmSync(pad, { recursive: true })
+        writeFileSync(pad, 'x'.repeat(2 * 1024 * 1024))
+        expect(act('litellm-upgrade').code).toBe(66)
+        rmSync(pad)
+        expect(spawnSync('mkfifo', [pad]).status).toBe(0)
+        const res = act('litellm-upgrade')
+        expect(res.signal).toBeNull()
+        expect(res.code).toBe(66)
+      })
+
+      it('install weigert (66) ook een symlinkte deploy/max2/litellm: het geheim komt in geen doelbestand, ook niet in een bestand dat install al had geplaatst', () => {
+        const bron = join(dir, 'deploy-src')
+        cpSync(REPO_DEPLOY, bron, { recursive: true })
+        rmSync(join(bron, 'max2', 'litellm'), { recursive: true })
+        symlinkSync(geheimDir(), join(bron, 'max2', 'litellm'))
+        const res = install({ STUB_SRC_DEPLOY: bron })
+        expect(res.code, res.stderr).toBe(66)
+        nergensGekopieerd()
+      })
+    })
+  })
+
+  describe('status', () => {
+    const writeProbe = (naam: string, inhoud: string): void => {
+      mkdirSync(join(RUNS(), `probe-${naam}`), { recursive: true })
+      writeFileSync(join(RUNS(), `probe-${naam}`, 'probe.json'), inhoud)
+    }
+    /** A full picture: two releases, mcp state, a probe result per configuration. */
+    function full(): void {
+      ready()
+      fakeRelease(SHA2)
+      writeFileSync(join(VAR(), 'release.prev'), `${SHA2}\n`)
+      writeFileSync(join(VAR(), 'mcp.built'), `${RA}\n`)
+      writeFileSync(join(VAR(), 'mcp.prev'), `${RB}\n`)
+      mkdirSync(MCP())
+      stateOf('agent-harness.service', 'active')
+      stateOf('agent-harness-probe.service', 'inactive')
+      stateOf('agent-harness-worker.service', 'active')
+      stateOf(BRIDGE, 'active')
+      writeProbe('gsq-lokaal', JSON.stringify({ accepted: true, hash: HEX64, ranAt: '2026-10-08T07:30:00.000Z', configuration: 'gsq-lokaal', reasons: [] }))
+      writeProbe('qwen3.8-or', JSON.stringify({ accepted: false, hash: HEX64, ranAt: '2026-10-08T07:31:00.000Z', reasons: ['tool_calling is partial'] }))
+    }
+
+    it('werkt zonder lock (ook met een bezette lock) en terwijl de dienst draait, en neemt de flock niet', () => {
+      full()
+      const res = act('status', { STUB_FLOCK_BUSY: '1' })
+      expect(res.code, res.stderr).toBe(0)
+      expect(stubCalls().filter((c) => c.startsWith('flock'))).toEqual([])
+    })
+
+    it('toont de commits van current, release.prev, mcp-stable (HEAD), mcp.built, mcp.prev en origin/main van scrum4me-mcp', () => {
+      full()
+      const res = act('status')
+      expect(res.code, res.stderr).toBe(0)
+      expect(res.stdout).toContain(`current: ${SHA}`)
+      expect(res.stdout).toContain(`release.prev: ${SHA2}`)
+      expect(res.stdout).toContain(`mcp-stable HEAD: ${SHA}`)
+      expect(res.stdout).toContain(`mcp.built: ${RA}`)
+      expect(res.stdout).toContain(`mcp.prev: ${RB}`)
+      expect(res.stdout).toContain(`mcp origin/main: ${SHA2}`)
+      // git draait als de eigenaar van de checkout, nooit als root
+      const gitCalls = view().filter((c) => c.includes(' git '))
+      expect(gitCalls).toEqual([`OWNER git -C ${MCP()} rev-parse HEAD`, `OWNER git -C ${MCP()} ls-remote origin refs/heads/main`])
+    })
+
+    it('toont de stand van de units, de LiteLLM-container met image-digest en de modelnamen', () => {
+      full()
+      const res = act('status')
+      expect(res.stdout).toContain('unit agent-harness.service: active')
+      expect(res.stdout).toContain('unit agent-harness-probe.service: inactive')
+      expect(res.stdout).toContain('unit agent-harness-worker.service: active')
+      expect(res.stdout).toContain(`unit ${BRIDGE}: active`)
+      expect(res.stdout).toMatch(/litellm container: running/)
+      expect(res.stdout).toContain('sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf')
+      expect(res.stdout).toMatch(/litellm modellen: gsq-lokaal qwen3\.8-or/)
+    })
+
+    it('toont per configuratie van harness.json de opgeslagen probe-uitslag (accepted, hash, tijd) uit probe.json, zonder een hash te berekenen', () => {
+      full()
+      const res = act('status')
+      expect(res.stdout).toContain(`probe gsq-lokaal: accepted=true hash=${HEX64} tijd=2026-10-08T07:30:00.000Z`)
+      expect(res.stdout).toContain(`probe qwen3.8-or: accepted=false hash=${HEX64} tijd=2026-10-08T07:31:00.000Z`)
+      // er is niets gehashed: de LiteLLM-bestanden zelf worden niet gelezen
+      expect(stubCalls().filter((c) => /sha256sum|shasum|openssl/.test(c))).toEqual([])
+    })
+
+    it('doet alleen leesaanroepen: systemctl is-active, docker inspect, git rev-parse en ls-remote, curl op /v1/models, en schrijft niets', () => {
+      full()
+      const voor = [readdirSync(etc()).sort(), readdirSync(VAR()).sort(), readdirSync(units()).sort(), readdirSync(srv()).sort()]
+      const res = act('status')
+      expect(res.code, res.stderr).toBe(0)
+      expect([readdirSync(etc()).sort(), readdirSync(VAR()).sort(), readdirSync(units()).sort(), readdirSync(srv()).sort()]).toEqual(voor)
+      for (const c of stubCalls()) {
+        const norm = c.replace(OWNER, 'OWNER ')
+        const [naam, ...rest] = norm.split(' ')
+        if (naam === 'systemctl') expect(norm).toMatch(/^systemctl is-active /)
+        else if (naam === 'docker') expect(rest[0] === 'inspect' || (rest[0] === 'image' && rest[1] === 'inspect'), norm).toBe(true)
+        else if (naam === 'OWNER' || naam === 'git') expect(norm).toMatch(/^(OWNER )?git -C \S+ (rev-parse HEAD|ls-remote origin refs\/heads\/main)$/)
+        else if (naam === 'curl') expect(norm).toBe(MODELS_CALL)
+        else throw new Error(`onverwachte aanroep: ${norm}`)
+      }
+    })
+
+    it('toont de masterkey nergens: niet in stdout, stderr of een argv, en ook geen geheim uit harness.json of de env-bestanden', () => {
+      full()
+      const res = act('status')
+      expect(everything(res)).not.toContain(MASTER)
+      expect(everything(res)).not.toContain('SCRUM4ME_TOKEN')
+      expect(everything(res)).not.toContain('sk-')
+      expect(curlConfigs()[0]).toContain(`Bearer ${MASTER}`)
+    })
+
+    it('geeft 0 en een duidelijke regel per ontbrekend onderdeel, zonder iets aan te maken', () => {
+      // niets geïnstalleerd: geen current, geen toestandsbestanden, geen harness.json, geen sleutel, geen container, geen checkout
+      rmSync(VAR(), { recursive: true })
+      const res = act('status', { STUB_INSPECT_RC: '1', STUB_MODELS_RC: '7' })
+      expect(res.code, res.stderr).toBe(0)
+      expect(res.stdout).toContain('current: (geen)')
+      expect(res.stdout).toContain('release.prev: (geen)')
+      expect(res.stdout).toContain('mcp.built: (geen)')
+      expect(res.stdout).toMatch(/mcp-stable HEAD: \(.*checkout ontbreekt/)
+      expect(res.stdout).toMatch(/litellm container: \(.*\)/)
+      expect(res.stdout).toMatch(/litellm modellen: \(.*\)/)
+      expect(res.stdout).toMatch(/probe: \(.*harness\.json/)
+      expect(existsSync(VAR())).toBe(false)
+      expect(readdirSync(etc())).toEqual([])
+    })
+
+    it('meldt een kapotte toestandsfile of current-link als onleesbaar in plaats van te stoppen', () => {
+      full()
+      writeFileSync(join(VAR(), 'release.prev'), 'geen-commit\n')
+      rmSync(join(VAR(), 'mcp.built'))
+      symlinkSync('/etc/passwd', join(VAR(), 'mcp.built'))
+      rmSync(srv('current'))
+      symlinkSync('ergens/anders', srv('current'))
+      const res = act('status')
+      expect(res.code, res.stderr).toBe(0)
+      expect(res.stdout).toMatch(/release\.prev: \(onleesbaar/)
+      expect(res.stdout).toMatch(/mcp\.built: \(onleesbaar/)
+      expect(res.stdout).toMatch(/current: \(onleesbaar/)
+      expect(res.stdout).not.toContain('root:')
+    })
+
+    it('meldt een mislukte ls-remote als niet bereikbaar en toont de rest', () => {
+      full()
+      const res = act('status', { STUB_LSREMOTE_RC: '128' })
+      expect(res.code, res.stderr).toBe(0)
+      expect(res.stdout).toMatch(/mcp origin\/main: \(niet bereikbaar/)
+      expect(res.stdout).toContain(`current: ${SHA}`)
+    })
+
+    describe('probe.json komt uit een map van janpeter: alleen gevalideerde velden, nooit een symlink of FIFO', () => {
+      it('volgt geen symlink naar een geheim bestand en toont niets daaruit', () => {
+        full()
+        const geheim = join(dir, 'geheim.json')
+        writeFileSync(geheim, JSON.stringify({ accepted: true, hash: HEX64, ranAt: SECRET_SENTINEL }))
+        rmSync(join(RUNS(), 'probe-gsq-lokaal', 'probe.json'))
+        symlinkSync(geheim, join(RUNS(), 'probe-gsq-lokaal', 'probe.json'))
+        const res = act('status')
+        expect(res.code, res.stderr).toBe(0)
+        expect(res.stdout).toMatch(/probe gsq-lokaal: \(onleesbaar/)
+        expect(res.stdout).not.toContain(SECRET_SENTINEL)
+      })
+
+      it('hangt niet op een FIFO', () => {
+        full()
+        const pad = join(RUNS(), 'probe-gsq-lokaal', 'probe.json')
+        rmSync(pad)
+        expect(spawnSync('mkfifo', [pad]).status).toBe(0)
+        const res = act('status')
+        expect(res.signal).toBeNull()
+        expect(res.stdout).toMatch(/probe gsq-lokaal: \(onleesbaar/)
+      })
+
+      it.each([
+        ['accepted is geen boolean', { accepted: 'ja', hash: HEX64, ranAt: '2026-10-08T07:30:00.000Z' }],
+        ['hash is geen 64 hexadecimale tekens', { accepted: true, hash: '\u001b[31mrood', ranAt: '2026-10-08T07:30:00.000Z' }],
+        ['hash ontbreekt', { accepted: true, ranAt: '2026-10-08T07:30:00.000Z' }],
+      ])('toont niets van een probe.json waarvan %s', (_naam, inhoud) => {
+        full()
+        writeProbe('gsq-lokaal', JSON.stringify(inhoud))
+        const res = act('status')
+        expect(res.stdout).toMatch(/probe gsq-lokaal: \(onleesbaar/)
+        expect(res.stdout).not.toContain('\u001b')
+        expect(res.stdout).not.toContain('rood')
+      })
+
+      it('toont een tijd die geen tijdstempel is niet, maar valt terug op de wijzigingstijd van het bestand', () => {
+        full()
+        writeProbe('gsq-lokaal', JSON.stringify({ accepted: true, hash: HEX64, ranAt: `${SECRET_SENTINEL}\u001b[31m` }))
+        const res = act('status')
+        expect(res.stdout).toMatch(new RegExp(`probe gsq-lokaal: accepted=true hash=${HEX64} tijd=\\d{4}-\\d{2}-\\d{2}T`))
+        expect(res.stdout).not.toContain(SECRET_SENTINEL)
+        expect(res.stdout).not.toContain('\u001b')
+      })
+
+      it('meldt "geen probe-uitslag" voor een configuratie zonder probe.json, en weigert een te groot bestand', () => {
+        full()
+        rmSync(join(RUNS(), 'probe-qwen3.8-or'), { recursive: true })
+        writeProbe('gsq-lokaal', JSON.stringify({ accepted: true, hash: HEX64, pad: 'x'.repeat(2000000) }))
+        const res = act('status')
+        expect(res.stdout).toMatch(/probe qwen3\.8-or: \(geen probe-uitslag/)
+        expect(res.stdout).toMatch(/probe gsq-lokaal: \(onleesbaar/)
       })
     })
   })
