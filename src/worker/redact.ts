@@ -83,9 +83,9 @@ export function redactDeep<T>(value: T, secrets: readonly string[]): T {
 /**
  * The worker's secret sources, ready to spread into collectSecretValues/collectSecretEntries: process.env, the resolved MCP env
  * (workerMcpEnv), the key of `--api-key-env` (the master key of LiteLLM, read from `processEnv` and counted under the fixed name
- * MODEL_API_KEY, so it is a secret whatever its variable is called) and the LiteLLM base URL (scanned like any other value, so a password embedded in it is still found). The worker and the secret
- * check both call this, so they can never select different sources.
+ * MODEL_API_KEY, so it is a secret whatever its variable is called). The LiteLLM base URL needs no source: the config schema refuses
+ * one with a password. The worker and the secret check both call this, so they can never select different sources.
  */
 export function workerSecretSources(config: WorkerConfig, processEnv: NodeJS.ProcessEnv = process.env, apiKeyEnv?: string): Array<Record<string, string | undefined>> {
-  return [processEnv, workerMcpEnv(config, processEnv), { MODEL_API_KEY: apiKeyEnv ? processEnv[apiKeyEnv] : undefined }, { LITELLM_BASE_URL: config.litellm.baseUrl }]
+  return [processEnv, workerMcpEnv(config, processEnv), { MODEL_API_KEY: apiKeyEnv ? processEnv[apiKeyEnv] : undefined }]
 }

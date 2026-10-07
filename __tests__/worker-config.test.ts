@@ -218,6 +218,13 @@ describe('litellm', () => {
     expect(issuesOf(withLitellm(rest))).toContain(`litellm.${key}`)
   })
 
+  it.each(['http://user:secret-pw-0123@127.0.0.1:4000/v1', 'http://user@127.0.0.1:4000/v1', 'http://:secret-pw-0123@127.0.0.1:4000/v1'])('refuses a baseUrl with credentials, without echoing it: %s', (baseUrl) => {
+    const issues = issuesOf(withLitellm({ ...good, baseUrl }))
+    expect(issues).toContain('litellm.baseUrl')
+    expect(issues).not.toContain('secret-pw-0123')
+    expect(issues).not.toContain('user')
+  })
+
   it('refuses a baseUrl that is no URL', () => {
     expect(issuesOf(withLitellm({ ...good, baseUrl: 'not a url' }))).toContain('litellm.baseUrl')
   })

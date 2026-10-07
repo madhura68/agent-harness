@@ -91,23 +91,19 @@ describe('collectSecretEntries', () => {
 })
 
 describe('workerSecretSources', () => {
-  const config = testWorkerConfig(
-    { mcp: { command: 'node', args: ['server.js'], env: { MCP_SECRET_TOKEN: '${MCP_SECRET_TOKEN}' } } },
-    'https://user:litellm-base-secret-01@example.com/v1',
-  )
+  const config = testWorkerConfig({ mcp: { command: 'node', args: ['server.js'], env: { MCP_SECRET_TOKEN: '${MCP_SECRET_TOKEN}' } } })
   const processEnv = {
     PROCESS_ENV_TOKEN: 'process-env-secret-0123456789',
     MCP_SECRET_TOKEN: 'mcp-secret-token-0123456789',
     LITELLM_MASTER_KEY: 'litellm-master-key-0123456789',
   }
 
-  it('provides a value from each of the sources (process.env, workerMcpEnv, the --api-key-env key, the LiteLLM address)', () => {
+  it('provides a value from each of the sources (process.env, workerMcpEnv, the --api-key-env key)', () => {
     const values = collectSecretValues(...workerSecretSources(config, processEnv, 'LITELLM_MASTER_KEY'))
 
     expect(values).toContain('process-env-secret-0123456789') // process.env
     expect(values).toContain('mcp-secret-token-0123456789') // workerMcpEnv
     expect(values).toContain('litellm-master-key-0123456789') // the key of --api-key-env
-    expect(values).toContain('litellm-base-secret-01') // password embedded in the LiteLLM baseUrl
   })
 
   it('counts the key of --api-key-env as MODEL_API_KEY, whatever its variable is called', () => {

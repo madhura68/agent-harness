@@ -8,7 +8,7 @@ import type { ZodType } from 'zod'
 import { BenchCaseSchema } from './bench/case.js'
 import { DocsetError, runDocServer } from './bench/doc-server.js'
 import { assertExtraBody, loadManifest, ManifestError, ModelSpecSchema, resolveServerEnv } from './manifest.js'
-import { createModelClient, maskKey, type ModelClient } from './model-client.js'
+import { createModelClient, type ModelClient } from './model-client.js'
 import { probeDir, runProbe } from './probe.js'
 import { runManifest } from './run.js'
 import { connectStdioClient, connectStdioRegistry, createRegistryView } from './tools/registry.js'
@@ -29,7 +29,7 @@ const USAGE = `harness — agent-harness v0
 Usage:
   harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>] [--extra-body-file <json>]
   harness run <manifest.json> --out <dir> [--skip-probe] [--api-key-env <VAR>]
-  harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe] [--api-key-env <VAR>]
+  harness worker --config <worker.json> --api-key-env <VAR> [--out <runs-dir>] [--once] [--skip-probe]
   harness check-run-logs --config <worker.json> --dir <run-logs-dir> [--api-key-env <VAR>]
   harness doc-server --dir <docset-dir> --product-id <id>
   harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]
@@ -259,24 +259,29 @@ type ModelsCheck = { ok: true } | { ok: false; exitCode: ExitCode; line: string 
 
 /**
  * The start check against LiteLLM (spec §4.1): `GET <litellm.baseUrl>/models` with the master key, and the model names it serves must be
- * exactly the configurations of the worker. Not reachable, or no usable answer: 1, because a restart may find LiteLLM up. A
- * configuration LiteLLM does not know, or a LiteLLM model without a configuration: 78, because the same two files give the same
- * mismatch at every restart. The line to print comes with the refusal; it holds both lists and never the key.
+ * exactly the configurations of the worker. Not reachable, or no usable answer (a network error, a 5xx): 1, because a restart may
+ * find LiteLLM up. A refused key (401, 403), a configuration LiteLLM does not know, or a LiteLLM model without a configuration: 78,
+ * because the same files give the same refusal at every restart. The line to print comes with the refusal; it holds both lists and never the key.
  */
 export async function checkLitellmModels(config: WorkerConfig, apiKey: string | undefined): Promise<ModelsCheck> {
   const url = `${config.litellm.baseUrl.replace(/\/+$/, '')}/models`
-  const unreachable = (why: string): ModelsCheck => ({ ok: false, exitCode: EXIT_RESTART, line: `LITELLM_UNREACHABLE: GET ${plainUrl(url)} mislukt (${maskKey(why, apiKey)})` })
+  // The reason is a status or an error name and code, never an error message: undici's messages can quote the URL, credentials included.
+  const unreachable = (why: string): ModelsCheck => ({ ok: false, exitCode: EXIT_RESTART, line: `LITELLM_UNREACHABLE: GET ${plainUrl(url)} mislukt (${why})` })
   let served: string[]
   try {
     const res = await fetch(url, { headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {}, signal: AbortSignal.timeout(LITELLM_MODELS_TIMEOUT_MS) })
+    // A refused key is refused again at every restart, so 78; the body is not shown, because it may echo the key.
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, exitCode: EXIT_NO_RESTART, line: `LITELLM_AUTH_FAILED: GET ${plainUrl(url)} gaf HTTP ${res.status}; controleer de masterkey van --api-key-env` }
+    }
     if (!res.ok) return unreachable(`HTTP ${res.status}`)
     const body: unknown = await res.json().catch(() => undefined)
     const data = (body as { data?: unknown } | null | undefined)?.data
     if (!Array.isArray(data) || data.some((m) => typeof (m as { id?: unknown } | null)?.id !== 'string')) return unreachable('antwoord is geen modellijst')
     served = data.map((m: { id: string }) => m.id)
   } catch (err) {
-    const cause = (err as { cause?: { code?: unknown } } | null)?.cause?.code
-    return unreachable(`${err instanceof Error ? err.message : String(err)}${typeof cause === 'string' ? ` ${cause}` : ''}`)
+    const code = (err as { cause?: { code?: unknown } } | null)?.cause?.code
+    return unreachable(`${err instanceof Error ? err.name : 'fout'}${typeof code === 'string' ? ` ${code}` : ''}`)
   }
   const configured = Object.keys(config.configurations)
   const notInLitellm = configured.filter((name) => !served.includes(name))
@@ -302,6 +307,8 @@ async function prepareWorker(values: Values) {
   const config = loadWorkerConfig(values.config)
   // Read before anything starts, like harness run, so a bad --api-key-env fails with no MCP process.
   // Only the model clients and the LiteLLM check get the key: `config` never holds it, so the run-log, the manifest and the trace never carry it.
+  // The master key is required: without it LiteLLM answers 401 at every start.
+  if (values['api-key-env'] === undefined) throw new UsageError('worker needs --api-key-env (the variable that holds the master key of LiteLLM)')
   const apiKey = resolveWorkerApiKey(values['api-key-env'], process.env)
   // Expand ${VAR} before anything starts; the values only travel to the MCP child process.
   const env = workerMcpEnv(config)

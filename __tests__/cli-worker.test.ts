@@ -40,6 +40,7 @@ beforeEach(() => {
   claims = []
   health = {}
   stderr = []
+  process.env.TEST_LITELLM_MASTER_KEY = 'test-master-key-0123456789' // `worker` needs --api-key-env; runWorkerCli passes it
   vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true })
   vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true })
 })
@@ -73,10 +74,13 @@ function workerConfig(dir: string, baseUrl: string, over: Record<string, unknown
 }
 
 /** `harness worker` in a fresh dir against the config of workerConfig; `baseUrl` is the LiteLLM, `flags` come after the fixed ones. */
-async function runWorkerCli(baseUrl: string, o: { flags?: string[]; config?: Record<string, unknown>; out?: string } = {}) {
+async function runWorkerCli(baseUrl: string, o: { flags?: string[]; config?: Record<string, unknown>; out?: string; withoutKey?: boolean } = {}) {
   const dir = tmp('cli-worker')
   const out = o.out ?? join(dir, 'runs')
-  const code = await main(['worker', '--config', workerConfig(dir, baseUrl, o.config), '--out', out, ...(o.flags ?? ['--once'])])
+  const flags = o.flags ?? ['--once']
+  // `worker` requires --api-key-env: it is added unless the test names it itself or wants it left out.
+  const withKey = o.withoutKey || flags.includes('--api-key-env') ? flags : [...flags, '--api-key-env', 'TEST_LITELLM_MASTER_KEY']
+  const code = await main(['worker', '--config', workerConfig(dir, baseUrl, o.config), '--out', out, ...withKey])
   return { code, dir, out }
 }
 
@@ -371,15 +375,44 @@ describe('harness worker — the LiteLLM check and the start errors (M45-2d T-20
       expect(stdioCalls).toHaveLength(1)
     })
 
-    it('sends the key of --api-key-env as a Bearer header, and no Authorization header without the flag', async () => {
+    it('sends the key of --api-key-env as a Bearer header', async () => {
       const key = 'test-master-key-0123456789'
       process.env.TEST_LITELLM_MASTER_KEY = key
       const m = await litellm()
-      claims = [{ timeout: true }, { timeout: true }]
+      claims = [{ timeout: true }]
       expect((await runWorkerCli(m.baseUrl, { flags: ['--once', '--api-key-env', 'TEST_LITELLM_MASTER_KEY'] })).code).toBe(0)
-      expect((await runWorkerCli(m.baseUrl)).code).toBe(0)
       expect(m.modelsRequests[0].headers.authorization).toBe(`Bearer ${key}`)
-      expect(m.modelsRequests[1].headers.authorization).toBeUndefined()
+    })
+
+    it('requires --api-key-env: without it exit 78 with the usage text, no request to LiteLLM and no MCP child', async () => {
+      const m = await litellm()
+      claims = [{ timeout: true }]
+      const { code } = await runWorkerCli(m.baseUrl, { withoutKey: true })
+      expect(code).toBe(78)
+      expect(stderr.join('')).toContain('--api-key-env')
+      expect(stderr.join('')).toContain('Usage:')
+      expect(m.modelsRequests).toHaveLength(0)
+      expect(stdioCalls).toHaveLength(0)
+    })
+
+    it.each([401, 403])('exits 78 on HTTP %i from /models (the key is wrong and a restart repeats it), with LITELLM_AUTH_FAILED and no MCP child', async (status) => {
+      const key = 'test-master-key-0123456789'
+      process.env.TEST_LITELLM_MASTER_KEY = key
+      model = await startFakeModelServer([], { status, body: { error: `invalid key ${key}` } })
+      const { code } = await runWorkerCli(model.baseUrl)
+      expect(code).toBe(78)
+      expect(stderr.join('')).toContain('LITELLM_AUTH_FAILED')
+      expect(stderr.join('')).toContain(`HTTP ${status}`)
+      expect(stderr.join('')).not.toContain(key)
+      expect(stdioCalls).toHaveLength(0)
+    })
+
+    it.each([500, 502, 503, 404])('keeps HTTP %i from /models at exit 1 (LiteLLM may come up), as LITELLM_UNREACHABLE', async (status) => {
+      model = await startFakeModelServer([], { status, body: { error: 'kapot' } })
+      const { code } = await runWorkerCli(model.baseUrl)
+      expect(code).toBe(1)
+      expect(stderr.join('')).toContain('LITELLM_UNREACHABLE')
+      expect(stdioCalls).toHaveLength(0)
     })
 
     it('never prints the key, also not when LiteLLM echoes it in an error', async () => {
@@ -387,16 +420,62 @@ describe('harness worker — the LiteLLM check and the start errors (M45-2d T-20
       process.env.TEST_LITELLM_MASTER_KEY = key
       model = await startFakeModelServer([], { status: 401, body: { error: `invalid key ${key}` } })
       const { code } = await runWorkerCli(model.baseUrl, { flags: ['--once', '--api-key-env', 'TEST_LITELLM_MASTER_KEY'] })
-      expect(code).toBe(1)
+      expect(code).toBe(78)
       expect(stderr.join('')).not.toContain(key)
       expect(stdioCalls).toHaveLength(0)
     })
 
     it('checks the models after the config and the key, so those errors never reach LiteLLM', async () => {
+      delete process.env.TEST_LITELLM_MASTER_KEY
       const m = await litellm()
       const { code } = await runWorkerCli(m.baseUrl, { flags: ['--once', '--api-key-env', 'TEST_LITELLM_MASTER_KEY'] })
       expect(code).toBe(78)
       expect(m.modelsRequests).toHaveLength(0)
+    })
+  })
+
+  describe('a litellm.baseUrl with credentials', () => {
+    const PASSWORD = 'pw-fake-0123456789'
+
+    it('is refused by the config (78, no MCP child, no request), and nothing of the password reaches stdout or stderr', async () => {
+      const m = await litellm()
+      const withCredentials = m.baseUrl.replace('http://', `http://litellm:${PASSWORD}@`)
+      const { code } = await runWorkerCli(withCredentials)
+      expect(code).toBe(78)
+      expect(stdioCalls).toHaveLength(0)
+      expect(m.modelsRequests).toHaveLength(0)
+      const text = stderr.join('')
+      expect(text).toContain('litellm.baseUrl')
+      expect(text).not.toContain(PASSWORD)
+      expect(text).not.toContain('litellm:')
+    })
+
+    it('also when only a username is given', async () => {
+      const m = await litellm()
+      const { code } = await runWorkerCli(m.baseUrl.replace('http://', 'http://litellm@'))
+      expect(code).toBe(78)
+      expect(stderr.join('')).toContain('litellm.baseUrl')
+    })
+
+    // The schema keeps such a URL out, but the check must not depend on that: undici refuses a credentialed URL with a message that holds it.
+    it('checkLitellmModels itself prints no URL credentials and no raw error message when the request fails', async () => {
+      const { checkLitellmModels } = await import('../src/cli.js')
+      const config = { litellm: { baseUrl: `http://litellm:${PASSWORD}@127.0.0.1:1/v1` }, configurations: { [TEST_CONFIGURATION]: {} } } as unknown as Parameters<typeof checkLitellmModels>[0]
+      const result = await checkLitellmModels(config, 'test-master-key-0123456789')
+      expect(result.ok).toBe(false)
+      const line = result.ok ? '' : result.line
+      expect(line).toContain('LITELLM_UNREACHABLE')
+      expect(line).not.toContain(PASSWORD)
+      expect(line).not.toContain('litellm:')
+      expect(line).not.toContain('@')
+    })
+
+    it('checkLitellmModels prints no URL credentials when the connection is refused either', async () => {
+      const { checkLitellmModels } = await import('../src/cli.js')
+      const config = { litellm: { baseUrl: 'http://127.0.0.1:1/v1' }, configurations: { [TEST_CONFIGURATION]: {} } } as unknown as Parameters<typeof checkLitellmModels>[0]
+      const result = await checkLitellmModels(config, undefined)
+      expect(result.ok).toBe(false)
+      expect(result.ok ? '' : result.line).toMatch(/^LITELLM_UNREACHABLE: GET http:\/\/127\.0\.0\.1:1\/v1\/models mislukt \(TypeError( [A-Z_]+)?\)$/)
     })
   })
 
@@ -419,7 +498,8 @@ describe('harness worker — the LiteLLM check and the start errors (M45-2d T-20
       ['unset', undefined],
       ['empty', ''],
     ])('a --api-key-env variable that is %s (UsageError, with the usage text)', async (_what, value) => {
-      if (value !== undefined) process.env.TEST_LITELLM_MASTER_KEY = value
+      if (value === undefined) delete process.env.TEST_LITELLM_MASTER_KEY
+      else process.env.TEST_LITELLM_MASTER_KEY = value
       const m = await litellm()
       const { code } = await runWorkerCli(m.baseUrl, { flags: ['--once', '--api-key-env', 'TEST_LITELLM_MASTER_KEY'] })
       expect(code).toBe(78)

@@ -102,6 +102,19 @@ export function findRecipe(task: TaskConfig, repoUrl: string): Recipe | undefine
 /** The name of a configuration (spec §4): also the model name the worker sends to LiteLLM. */
 export const CONFIGURATION_NAME = /^[a-z0-9][a-z0-9.-]{0,63}$/
 
+/** A URL that carries no username or password: undici refuses such a URL with a message that holds it, and a log line must not. */
+const urlWithoutCredentials = z.string().url().refine(
+  (value) => {
+    try {
+      const url = new URL(value)
+      return url.username === '' && url.password === ''
+    } catch {
+      return true // no URL at all: .url() reports that, and this check has nothing to add
+    }
+  },
+  { message: 'mag geen gebruikersnaam of wachtwoord bevatten' },
+)
+
 const absolutePath = z.string().refine((p) => isAbsolute(p), { message: 'moet een absoluut pad zijn' })
 
 /** One model setup: what the cost is counted as, the context window of the model behind it, and how it is called. */
@@ -119,7 +132,7 @@ export type Configuration = z.infer<typeof ConfigurationSchema>
 
 export const WorkerConfigSchema = z
   .strictObject({
-    litellm: z.strictObject({ baseUrl: z.string().url(), configPath: absolutePath, composePath: absolutePath }),
+    litellm: z.strictObject({ baseUrl: urlWithoutCredentials, configPath: absolutePath, composePath: absolutePath }),
     configurations: z
       .record(z.string().regex(CONFIGURATION_NAME, { message: `een configuratienaam volgt ${CONFIGURATION_NAME}` }), ConfigurationSchema)
       .refine((all) => Object.keys(all).length > 0, { message: 'minstens één configuratie is nodig' }),

@@ -123,7 +123,7 @@ describe('harness worker --api-key-env', () => {
   it('is in the usage text', async () => {
     const code = await main(['--help'])
     expect(code).toBe(0)
-    expect(output.join('')).toContain('harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe] [--api-key-env <VAR>]')
+    expect(output.join('')).toContain('harness worker --config <worker.json> --api-key-env <VAR> [--out <runs-dir>] [--once] [--skip-probe]')
   })
 
   describe('with a usable variable', () => {
