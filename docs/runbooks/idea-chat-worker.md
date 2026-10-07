@@ -14,7 +14,7 @@ Sinds M3 kan dezelfde worker ook `TASK_IMPLEMENTATION`-jobs met `required_capabi
 
 1. **scrum4me-mcp met de `local_llm`-isolatie.** De worker draait zijn MCP-kindproces uit `~/Development/scrum4me-mcp-stable`. Die checkout moet de M2-MCP-wijziging bevatten (claimfilter + `chat.pending_user_message_ids`); zonder isolatie claimt een `['local_llm']`-worker via het generieke filter ook gewone jobs. Na de merge: `git -C ~/Development/scrum4me-mcp-stable pull --ff-only && npm --prefix ~/Development/scrum4me-mcp-stable ci`.
 2. **Tunnel naar max2:** `ssh -N -L 127.0.0.1:11434:127.0.0.1:11434 max2`. Controleer vóór een proef met `curl -s http://127.0.0.1:11434/api/tags` of het model nog op max2 staat (qwen3-coder:30b was op 2026-09-27 verwijderd) en met `api/ps` welk model geladen is (`OLLAMA_MAX_LOADED_MODELS=1`: een ander model betekent een swap en een trage eerste beurt).
-3. **Probe:** `runs/probe-<model>/probe.json` met `tool_calling: reliable` voor het model uit de config (`harness probe --base-url http://127.0.0.1:11434/v1 --model qwen3.8-gsq-rco:27b-iq3_s-text --out runs`). Een ander model = eerst een nieuwe probe.
+3. **Probe:** per configuratie van de worker-config een aanvaarde `runs/probe-<configuratie>/probe.json` (`harness probe --config <harness.json> --all --out runs --api-key-env <VAR>`). Een andere configuratie of een gewijzigd LiteLLM-bestand = eerst een nieuwe probe: de worker controleert de hash per job.
 4. **Omgeving:** `SCRUM4ME_TOKEN`, `DATABASE_URL`, `DIRECT_URL` in de shell (dezelfde als de scrum4me-MCP van de Mac). Waarden nooit in config, trace of dit runbook.
 
 ## Productie: service op max2 (sinds 2026-09-27)
@@ -27,7 +27,7 @@ De worker draait als systemd-service op max2, naast Ollama: geen tunnel, altijd 
 | Code | `~/Development/agent-harness` (gebouwd: `dist/cli.js`) en `~/Development/scrum4me-mcp-stable` (MCP-kindproces via `tsx`) |
 | Config | `/etc/agent-harness/worker.json`: model `qwen3.8-gsq-rco:27b-iq3_s-text`, baseUrl `http://127.0.0.1:11434/v1`, thinking aan, `maxTurns 8`, `maxOutputTokens 4096`, `contextTokens 65536`, gelijk aan `OLLAMA_CONTEXT_LENGTH` in `/etc/systemd/system/ollama.service.d/override.conf` (zie [contextvenster](probe-and-run-max2.md#contextvenster-en-lange-beurten) en [meetproef](probe-and-run-max2.md#meetproef-contextvenster-2026-09-27)). Pas de twee altijd samen aan |
 | Secrets | `/etc/agent-harness/worker.env` (root, 0600): `SCRUM4ME_TOKEN` = eigen token `agent-harness-local-llm-max2`; `DATABASE_URL`/`DIRECT_URL` = beperkte worker-rol uit `worker-idea.env` |
-| Runs en probe | `/var/lib/agent-harness/runs/` (probe voor het model moet hier staan) |
+| Runs en probe | `/var/lib/agent-harness/runs/` (de aanvaarde probe van elke configuratie moet hier staan) |
 
 Beheer:
 
@@ -45,7 +45,7 @@ cd ~/Development/scrum4me-mcp-stable && git pull --ff-only && git submodule upda
 sudo systemctl restart agent-harness-worker
 ```
 
-Ander model: eerst `node dist/cli.js probe --base-url http://127.0.0.1:11434/v1 --model <naam> --out /var/lib/agent-harness/runs`, dan `worker.json` aanpassen en herstarten. Zonder `reliable`-probe start de worker niet (`PROBE_REQUIRED`).
+Ander model: eerst `node dist/cli.js probe --base-url http://127.0.0.1:11434/v1 --model <naam> --out /var/lib/agent-harness/runs`, dan `worker.json` aanpassen en herstarten. Een job op een configuratie zonder aanvaarde probe van de huidige hash faalt met `CONFIGURATION_NOT_PROBED`; de worker zelf start wel.
 
 Bewijs: job `cmujtwnbj001qvz7rn2ytmgct` (IDEA-224, 2026-09-27 13:02) DONE in 12 s door de service (token `agent-harness-local-llm-max2`, `model_id qwen3.8-gsq-rco:27b-iq3_s-text`); beantwoordde beide openstaande berichten, ook dat van de eerder mislukte beurt.
 
@@ -120,7 +120,7 @@ npm run dev -- worker --config <worker.json> --out runs --api-key-env LITELLM_MA
 
 **Gedrag.** De waarde gaat mee als `Authorization: Bearer …`. Ze wint van een `model.apiKey` in de config, zoals bij `harness run`, en gaat alleen naar de model-client: de config die het run-log, het manifest en de trace zien, blijft zoals hij geladen is. Zonder de optie verandert er niets.
 
-**Wat de worker weigert.** De optie wordt gelezen direct na het laden van de config, vóór de probe-gate en vóór het MCP-kindproces. Een gebruiksfout volgt (exit 1, de naam van de variabele in de melding, nooit de waarde) als:
+**Wat de worker weigert.** De optie wordt gelezen direct na het laden van de config, vóór het MCP-kindproces. Een gebruiksfout volgt (exit 1, de naam van de variabele in de melding, nooit de waarde) als:
 - de variabele niet gezet of leeg is;
 - de naam niet als geheim telt, bijvoorbeeld `LITELLM` (`LITELLM_MASTER_KEY` en `MODEL_API_KEY` wel): dezelfde namen als onder *Controle op geheimen* hierboven;
 - de waarde korter is dan 8 tekens.

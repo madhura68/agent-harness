@@ -1,7 +1,8 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { probeDir } from '../src/probe.js'
 import { createRegistryView } from '../src/tools/registry.js'
 import { createControlChannel } from '../src/worker/control.js'
 import { openRunLog } from '../src/worker/run-log.js'
@@ -9,8 +10,9 @@ import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
+import { seedProbe, seedProbes } from './fakes/probe-seed.js'
 import { TEST_CONFIGURATION, testModelClients, testRunLogInit, testWorkerConfig } from './fakes/worker-config.js'
-import { dirContains, readTrace, tmp } from './helpers.js'
+import { dirContains, jobRunDirs, readTrace, tmp } from './helpers.js'
 
 type ModelFake = Awaited<ReturnType<typeof startFakeModelServer>>
 type McpFake = Awaited<ReturnType<typeof startFakeScrum4meMcp>>
@@ -52,6 +54,7 @@ async function setup(s: Setup) {
     model.baseUrl,
   )
   const out = tmp('worker')
+  seedProbes(config, out) // every configuration has an accepted probe, unless a test takes it away (M45-2d T-2066)
   const runLogDir = tmp('runlog')
   const logs: string[] = []
   const client = mcp.client
@@ -103,7 +106,7 @@ describe('runWorker — a successful turn', () => {
       { job_id: 'job1', status: 'running' },
       { job_id: 'job1', status: 'done', summary: 'Zie de worker-runbook.', model_id: 'qwen3-coder:30b', input_tokens: 120, output_tokens: 30 },
     ])
-    const dirs = readdirSync(t.out)
+    const dirs = jobRunDirs(t.out)
     expect(dirs).toHaveLength(1)
     expect(dirs[0]).toMatch(/^job-job1-\d+$/)
     expect(existsSync(join(t.out, dirs[0], 'result.json'))).toBe(true)
@@ -156,7 +159,7 @@ describe('runWorker — a successful turn', () => {
     }
     const r = await t.run()
     expect(r.jobs.map((j) => j.outcome)).toEqual(['done', 'done'])
-    expect(readdirSync(t.out)).toHaveLength(2)
+    expect(jobRunDirs(t.out)).toHaveLength(2)
   })
 })
 
@@ -180,7 +183,7 @@ describe('runWorker — ownership and failures', () => {
     await t.run()
     expect(controlCalls(t.mcp)).toHaveLength(2)
     expect(controlCalls(t.mcp).map((c) => c.summary)).not.toContain('gehackt')
-    const dir = join(t.out, readdirSync(t.out)[0])
+    const dir = join(t.out, jobRunDirs(t.out)[0])
     expect(readTrace(dir).find((e) => e.type === 'tool_result')).toMatchObject({ errorCode: 'UNKNOWN_TOOL' })
   })
 
@@ -735,7 +738,7 @@ describe('runWorker — the configuration of a job (M45-2d T-2065)', () => {
     tiny: { costMode: 'local', contextTokens: 1100 },
   }
   const manifestOf = (out: string, dirIndex: number) => {
-    const dir = join(out, readdirSync(out).sort()[dirIndex])
+    const dir = join(out, jobRunDirs(out).sort()[dirIndex])
     return readTrace(dir)[0] as { manifest: { model: Record<string, unknown>; limits: Record<string, unknown> } }
   }
 
@@ -866,5 +869,85 @@ describe('runWorker — the cost ceiling of a job (M45-2d T-2065)', () => {
     const t = await setup({ claims: [job(ideaChatPayload({ config: withoutCost('nope') }))] })
     await t.run()
     expect(controlCalls(t.mcp).at(-1)).toMatchObject({ error: 'UNKNOWN_CONFIGURATION: nope' })
+  })
+})
+
+// ---- the probe gate per job (M45-2d T-2066) ----
+
+describe('runWorker — the probe gate per job (M45-2d T-2066)', () => {
+  const configurations = {
+    'fast-local': { costMode: 'local', contextTokens: 32768 },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768, reasoningEffort: 'high', extraBody: { temperature: 0.7 } },
+  }
+  const probeFile = (out: string, name: string) => join(probeDir(out, name), 'probe.json')
+
+  // Each way a configuration stays unprobed; `ruin` spoils the seeded probe of `fast-local` and leaves `deep-hosted` alone.
+  const ruins: Array<[string, (t: { deps: WorkerDeps; out: string }) => void, RegExp]> = [
+    ['no probe file', (t) => rmSync(probeFile(t.out, 'fast-local')), /^CONFIGURATION_NOT_PROBED: geen probe-uitslag/],
+    ['accepted: false', (t) => seedProbe(t.deps.config, t.out, 'fast-local', { accepted: false, reasons: ['stap b_single_tool: te traag'] }), /^CONFIGURATION_NOT_PROBED: probe niet aanvaard.*te traag/],
+    ['another hash (a LiteLLM file or the configuration changed)', (t) => seedProbe(t.deps.config, t.out, 'fast-local', { hash: 'f'.repeat(64) }), /^CONFIGURATION_NOT_PROBED: hash klopt niet/],
+    ['an unreadable probe file', (t) => writeFileSync(probeFile(t.out, 'fast-local'), '{ kapot'), /^CONFIGURATION_NOT_PROBED: .*onleesbaar/],
+  ]
+
+  it.each(ruins)('fails only the job of a configuration with %s: no running, no model call, no cost figure; the next job of the other configuration runs', async (_what, ruin, error) => {
+    const t = await setup({
+      claims: [job(ideaChatPayload({ jobId: 'bad', config: harnessConfig('fast-local') })), job(ideaChatPayload({ jobId: 'good', config: harnessConfig('deep-hosted') }))],
+      script: [answer('Antwoord.')],
+      configurations,
+      once: false,
+    })
+    ruin(t)
+    stopAfterWaits(t, 2)
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'bad', outcome: 'failed' }, { jobId: 'good', outcome: 'done' }], exitCode: 0 })
+    const calls = controlCalls(t.mcp)
+    expect(calls[0]).toEqual({ job_id: 'bad', status: 'failed', error: expect.stringMatching(error), cost: COST_NONE })
+    expect(calls.slice(1).map((c) => [c.job_id, c.status])).toEqual([['good', 'running'], ['good', 'done']])
+    expect(t.model.requests).toHaveLength(1)
+    expect(t.model.requests[0].body).toMatchObject({ model: 'deep-hosted' })
+    expect(t.logs.join('\n')).not.toMatch(/RUNTIME_MISMATCH|Worker stopt/)
+  })
+
+  it('never lets a job through on a configuration without a probe, also when it is the only one', async () => {
+    const t = await setup({ claims: [job()], script: [answer('nee')] })
+    rmSync(probeFile(t.out, TEST_CONFIGURATION))
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(controlCalls(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: expect.stringMatching(/^CONFIGURATION_NOT_PROBED: /), cost: COST_NONE }])
+    expect(t.model.requests).toHaveLength(0)
+  })
+
+  it('reads the probe again at every job: a probe made while the worker runs lets the next job through', async () => {
+    const t = await setup({
+      claims: [job(ideaChatPayload({ jobId: 'first' })), job(ideaChatPayload({ jobId: 'second' }))],
+      script: [answer('Antwoord.')],
+      once: false,
+    })
+    rmSync(probeFile(t.out, TEST_CONFIGURATION))
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const res = await orig(id, u); if (id === 'first') seedProbe(t.deps.config, t.out, TEST_CONFIGURATION); return res } }
+    stopAfterWaits(t, 2)
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'first', outcome: 'failed' }, { jobId: 'second', outcome: 'done' }])
+  })
+
+  it('writes the failure to the run-log as ERROR CONFIGURATION_NOT_PROBED', async () => {
+    const t = await setup({ claims: [job()], script: [answer('nee')] })
+    rmSync(probeFile(t.out, TEST_CONFIGURATION))
+    await t.run()
+    const lines = runLogLines(t.runLogDir)
+    expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CONFIGURATION_NOT_PROBED: geen probe-uitslag/))
+    expect(lines.at(-1)).toMatch(/ exit code=1$/)
+  })
+
+  it('checks an unknown configuration and a missing ceiling before the probe', async () => {
+    const t = await setup({
+      claims: [job(ideaChatPayload({ jobId: 'a', config: harnessConfig('nope') })), job(ideaChatPayload({ jobId: 'b', config: withoutCost(TEST_CONFIGURATION) }))],
+      once: false,
+    })
+    rmSync(probeFile(t.out, TEST_CONFIGURATION))
+    stopAfterWaits(t, 2)
+    await t.run()
+    expect(controlCalls(t.mcp).map((c) => c.error)).toEqual(['UNKNOWN_CONFIGURATION: nope', 'COST_LIMIT_MISSING: ontbrekend'])
   })
 })

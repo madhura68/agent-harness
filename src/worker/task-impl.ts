@@ -10,6 +10,7 @@ import { buildScript, containerName, killLeftoverContainers, runInContainer } fr
 import { startHeartbeat } from './heartbeat.js'
 import { commitAll, diffGitAdmin, snapshotGitAdmin, type GitAdminSnapshot } from './host-git.js'
 import { failBeforeRunning, limitsFor, modelClientFor, modelSpecFor, resolveJobConfiguration } from './job-configuration.js'
+import { checkProbeForJob } from './probe-gate.js'
 import type { RunLog } from './run-log.js'
 import { createTaskTools, type VerifyRun } from './task-tools.js'
 import type { JobOutcome, WorkerDeps } from './worker.js'
@@ -199,6 +200,9 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   const resolved = resolveJobConfiguration(config, claim.payload)
   if (!resolved.ok) return failBeforeRunning(deps, jobId, runLog, resolved.failure)
   const job = resolved.job
+  // The probe gate of that configuration, after the configuration and the ceiling and before anything touches the task: no accepted probe of the hash it has now fails this job only.
+  const probed = checkProbeForJob(config, deps.out, job.name)
+  if (!probed.ok) return failBeforeRunning(deps, jobId, runLog, probed.failure)
   runLog?.worktree(p.worktree_path)
   const task = config.task
   if (!task) return closeFailed('worker heeft geen task-config', 'NO_TASK_CONFIG')

@@ -6,6 +6,7 @@ import { PassThrough } from 'node:stream'
 import { promisify } from 'node:util'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { probeDir } from '../src/probe.js'
 import { createRegistryView } from '../src/tools/registry.js'
 import type { SpawnFn } from '../src/worker/containers.js'
 import { createControlChannel } from '../src/worker/control.js'
@@ -16,9 +17,10 @@ import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep, type UpdateOutcomeOverride } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
+import { seedProbe, seedProbes } from './fakes/probe-seed.js'
 import { taskPayload } from './fakes/task-payload.js'
 import { TEST_CONFIGURATION, testModelClients, testRunLogInit, testWorkerConfig } from './fakes/worker-config.js'
-import { readTrace } from './helpers.js'
+import { jobRunDirs, readTrace } from './helpers.js'
 
 // Spies that call through: the tests assert that commitAll/snapshotGitAdmin are NOT called on some paths.
 vi.mock('../src/worker/host-git.js', async (importOriginal) => {
@@ -228,6 +230,7 @@ async function setup(s: Setup = {}) {
   }
   const docker = fakeDocker(s.docker)
   const out = tmp('out')
+  seedProbes(config, out) // every configuration has an accepted probe, unless a test takes it away (M45-2d T-2066)
   const runLogDir = tmp('runlog')
   const logs: string[] = []
   const client = mcp.client
@@ -272,7 +275,7 @@ function controlTrail(m: McpFake): string[] {
 const jobUpdates = (m: McpFake) => m.calls.filter((c) => c.name === 'update_job_status').map((c) => c.args)
 const lastJobUpdate = (m: McpFake) => jobUpdates(m).at(-1)
 const taskUpdates = (m: McpFake) => m.calls.filter((c) => c.name === 'update_task_status').map((c) => c.args.status)
-const traceOf = (out: string) => readTrace(join(out, readdirSync(out)[0]))
+const traceOf = (out: string) => readTrace(join(out, jobRunDirs(out)[0]))
 
 // ---- run-log helpers (M4 Taak 6), mirroring worker.test.ts's ----
 
@@ -364,7 +367,7 @@ describe('runTaskJob — green path', () => {
       [1, Buffer.byteLength('npm ci: up to date')],
       [2, Buffer.byteLength('PASS greet.test.ts')],
     ])
-    const runDir = join(t.out, readdirSync(t.out)[0])
+    const runDir = join(t.out, jobRunDirs(t.out)[0])
     expect(readFileSync(join(runDir, 'containers', '1.txt'), 'utf8')).toBe('npm ci: up to date')
     expect(readFileSync(join(runDir, 'containers', '2.txt'), 'utf8')).toBe('PASS greet.test.ts')
   })
@@ -995,7 +998,7 @@ describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
     tiny: { costMode: 'local', contextTokens: 1100 },
   }
   const manifestOf = (out: string, dirIndex: number) => {
-    const dir = join(out, readdirSync(out).sort()[dirIndex])
+    const dir = join(out, jobRunDirs(out).sort()[dirIndex])
     return readTrace(dir).find((e) => e.type === 'run_start') as unknown as { manifest: { model: Record<string, unknown>; limits: Record<string, unknown> } }
   }
 
@@ -1091,6 +1094,66 @@ describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
 
   it('checks the configuration before the recipe, so an unknown configuration is reported even for a repo without recipe', async () => {
     const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, repoUrl: 'https://git.example/ander.git', config: harnessConfig('nope') }) }] })
+    await t.run()
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE }])
+  })
+})
+
+describe('runTaskJob — the probe gate per job (M45-2d T-2066)', () => {
+  const configurations = {
+    'fast-local': { costMode: 'local', contextTokens: 32768 },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768 },
+  }
+
+  it('fails a job on an unprobed configuration as CONFIGURATION_NOT_PROBED: the task untouched, no container, no model call, and the worker carries on', async () => {
+    const t = await setup({
+      configurations,
+      claims: (wt) => [
+        { job: taskPayload({ worktree: wt, jobId: 'bad', config: harnessConfig('fast-local') }) },
+        { job: ideaChatPayload({ jobId: 'job2', config: harnessConfig('deep-hosted') }) },
+      ],
+      script: [answer('idee-antwoord')],
+      once: false,
+    })
+    rmSync(join(probeDir(t.out, 'fast-local'), 'probe.json'))
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'job2' && (u.status === 'done' || u.status === 'failed')) stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    expect(jobUpdates(t.mcp)[0]).toEqual({ job_id: 'bad', status: 'failed', error: expect.stringMatching(/^CONFIGURATION_NOT_PROBED: geen probe-uitslag/), cost: COST_NONE })
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+    expect(t.model.requests).toHaveLength(1) // only the idea chat of job2, on the other configuration
+    expect(t.model.requests[0].body).toMatchObject({ model: 'deep-hosted' })
+  })
+
+  it.each([
+    ['accepted: false', { accepted: false, reasons: ['stap c_two_tools: antwoord 2 heeft geen bedrag'] }, /niet aanvaard/],
+    ['another hash', { hash: '0'.repeat(64) }, /hash klopt niet/],
+  ])('fails a job on a probe with %s', async (_what, over, error) => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt }) }] })
+    seedProbe(t.deps.config, t.out, TEST_CONFIGURATION, over)
+    await t.run()
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: expect.stringMatching(error), cost: COST_NONE }])
+    expect(jobUpdates(t.mcp)[0].error).toMatch(/^CONFIGURATION_NOT_PROBED: /)
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+  })
+
+  it('writes ERROR CONFIGURATION_NOT_PROBED to the run-log', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt }) }] })
+    rmSync(join(probeDir(t.out, TEST_CONFIGURATION), 'probe.json'))
+    await t.run()
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CONFIGURATION_NOT_PROBED: geen probe-uitslag/))
+  })
+
+  it('checks an unknown configuration and a missing ceiling before the probe', async () => {
+    const t = await setup({
+      claims: (wt) => [{ job: taskPayload({ worktree: wt, config: harnessConfig('nope') }) }],
+    })
+    rmSync(join(probeDir(t.out, TEST_CONFIGURATION), 'probe.json'))
     await t.run()
     expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE }])
   })

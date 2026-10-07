@@ -6,7 +6,8 @@ import type { WorkerDeps } from '../src/worker/worker.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
-import { TEST_CONFIGURATION } from './fakes/worker-config.js'
+import { seedProbesForConfigFile } from './fakes/probe-seed.js'
+import { TEST_CONFIGURATION, testLitellmFiles } from './fakes/worker-config.js'
 import { dirContains, tmp } from './helpers.js'
 
 // `harness worker --api-key-env <VAR>`: the master key of LiteLLM comes from the environment and reaches the model clients and the
@@ -89,7 +90,7 @@ afterEach(async () => {
 function workerConfig(dir: string, baseUrl: string, over: Record<string, unknown> = {}) {
   const p = join(dir, 'worker.json')
   writeFileSync(p, JSON.stringify({
-    litellm: { baseUrl, configPath: '/etc/agent-harness/litellm/config.yaml', composePath: '/etc/agent-harness/litellm/compose.yaml' },
+    litellm: { baseUrl, ...testLitellmFiles() },
     configurations: { [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 32768 } },
     mcp: { command: 'mcp-bin', args: ['--x'], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}', SCRUM4ME_WORKER_CAPABILITIES: 'code_edit' } },
     waitSeconds: 1,
@@ -104,7 +105,9 @@ async function harnessWorker(o: { baseUrl?: string; config?: Record<string, unkn
   const baseUrl = o.baseUrl ?? 'http://127.0.0.1:1/v1'
   const dir = tmp('cli-worker-key')
   const out = join(dir, 'runs')
-  const code = await main(['worker', '--config', workerConfig(dir, baseUrl, o.config), '--out', out, '--once', ...(o.flags ?? [])])
+  const configPath = workerConfig(dir, baseUrl, o.config)
+  seedProbesForConfigFile(configPath, out) // the per-job probe gate (M45-2d T-2066): every configuration has an accepted probe
+  const code = await main(['worker', '--config', configPath, '--out', out, '--once', ...(o.flags ?? [])])
   return { code, out, logDir: join(dir, 'worker-logs'), text: output.join('') }
 }
 
@@ -123,7 +126,8 @@ describe('harness worker --api-key-env', () => {
   it('is in the usage text', async () => {
     const code = await main(['--help'])
     expect(code).toBe(0)
-    expect(output.join('')).toContain('harness worker --config <worker.json> --api-key-env <VAR> [--out <runs-dir>] [--once] [--skip-probe]')
+    expect(output.join('')).toContain('harness worker --config <worker.json> --api-key-env <VAR> [--out <runs-dir>] [--once]')
+    expect(output.join('')).not.toMatch(/harness worker[^\n]*--skip-probe/)
   })
 
   describe('with a usable variable', () => {

@@ -1,4 +1,3 @@
-import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
 import { runTaskBench, type BenchResult } from '../src/bench/task-bench.js'
@@ -11,9 +10,10 @@ import { benchCaseFor, benchTaskConfigFor } from './fakes/bench-case.js'
 import { benchTmp, cleanupBenchFixtures, createBenchRepo, disposeBenchRepo, fixtureGit, type BenchRepo } from './fakes/bench-repo.js'
 import { fakeDocker, type DockerStep, type FakeDockerOptions } from './fakes/fake-docker.js'
 import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
+import { seedProbes } from './fakes/probe-seed.js'
 import { taskPayload } from './fakes/task-payload.js'
 import { testModelClients, testWorkerConfig } from './fakes/worker-config.js'
-import { readTrace } from './helpers.js'
+import { jobRunDirs, readTrace } from './helpers.js'
 
 // src/bench/task-bench.ts holds a deliberate copy of the verify gate and the container handling of runTaskJob (src/worker/task-impl.ts):
 // the worker may change by two exports and an option only, so the bench cannot share the code. A copy drifts without anyone noticing, and
@@ -95,6 +95,7 @@ async function viaWorker(s: Scenario, task: TaskConfig, repo: BenchRepo) {
   }
   const config = testWorkerConfig({}, fake.baseUrl)
   config.task = task
+  seedProbes(config, out) // the per-job probe gate (M45-2d T-2066): the configuration of the job has an accepted probe
   const deps: WorkerDeps = {
     control,
     registryView: async () => noDocTools(),
@@ -115,7 +116,7 @@ async function viaWorker(s: Scenario, task: TaskConfig, repo: BenchRepo) {
     outcome = `uncertain (${err.outcome})`
   }
   const failed = updateStatus.mock.calls.map((c) => c[1]).filter((u) => u.status === 'failed')
-  return { outcome, failedWith: failed.at(-1)?.error, observed: observe(join(out, readdirSync(out)[0]), fake, docker) }
+  return { outcome, failedWith: failed.at(-1)?.error, observed: observe(join(out, jobRunDirs(out)[0]), fake, docker) }
 }
 
 async function viaBench(s: Scenario, task: TaskConfig, repo: BenchRepo) {

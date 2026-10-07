@@ -5,7 +5,8 @@ import type { ServerSpec } from '../src/types.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep, type HealthSetup } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
-import { TEST_CONFIGURATION } from './fakes/worker-config.js'
+import { seedProbesForConfigFile } from './fakes/probe-seed.js'
+import { TEST_CONFIGURATION, testLitellmFiles } from './fakes/worker-config.js'
 import { dirContains, tmp } from './helpers.js'
 
 const stdioCalls: ServerSpec[] = []
@@ -64,7 +65,7 @@ async function litellm(script: Parameters<typeof startFakeModelServer>[0] = [], 
 function workerConfig(dir: string, baseUrl: string, over: Record<string, unknown> = {}) {
   const p = join(dir, 'worker.json')
   writeFileSync(p, JSON.stringify({
-    litellm: { baseUrl, configPath: '/etc/agent-harness/litellm/config.yaml', composePath: '/etc/agent-harness/litellm/compose.yaml' },
+    litellm: { baseUrl, ...testLitellmFiles() },
     configurations: { [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 32768 } },
     mcp: { command: 'mcp-bin', args: ['--x'], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}', SCRUM4ME_WORKER_CAPABILITIES: 'code_edit' } },
     waitSeconds: 1,
@@ -80,11 +81,23 @@ async function runWorkerCli(baseUrl: string, o: { flags?: string[]; config?: Rec
   const flags = o.flags ?? ['--once']
   // `worker` requires --api-key-env: it is added unless the test names it itself or wants it left out.
   const withKey = o.withoutKey || flags.includes('--api-key-env') ? flags : [...flags, '--api-key-env', 'TEST_LITELLM_MASTER_KEY']
-  const code = await main(['worker', '--config', workerConfig(dir, baseUrl, o.config), '--out', out, ...withKey])
+  const configPath = workerConfig(dir, baseUrl, o.config)
+  seedProbesForConfigFile(configPath, out) // the per-job probe gate (M45-2d T-2066): every configuration has an accepted probe
+  const code = await main(['worker', '--config', configPath, '--out', out, ...withKey])
   return { code, dir, out }
 }
 
 describe('harness worker', () => {
+  it('has no --skip-probe any more: the per-job probe gate has no bypass, so the option is a usage error (78), before anything starts', async () => {
+    const m = await litellm()
+    process.env.SCRUM4ME_TOKEN = 'x'
+    const { code } = await runWorkerCli(m.baseUrl, { flags: ['--once', '--skip-probe'] })
+    expect(code).toBe(78)
+    expect(stderr.join('')).toContain('--skip-probe')
+    expect(stdioCalls).toHaveLength(0)
+    expect(m.modelsRequests).toHaveLength(0)
+  })
+
   it('rejects a config with a forbidden tool before starting the MCP', async () => {
     const m = await litellm()
     process.env.SCRUM4ME_TOKEN = 'x'

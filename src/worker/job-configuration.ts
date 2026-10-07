@@ -25,7 +25,7 @@ function cut(text: string, limit: number): string {
 }
 
 /** A payload value as it appears in an error text: as it is when plain, as JSON when it holds anything else, and cut. */
-function shown(value: unknown): string {
+export function shown(value: unknown): string {
   if (value === undefined) return 'ontbrekend'
   if (typeof value === 'string' && PRINTABLE_ASCII.test(value)) return cut(value, SHOWN_LIMIT)
   return cut(JSON.stringify(value) ?? String(value), SHOWN_LIMIT)

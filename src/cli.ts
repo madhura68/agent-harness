@@ -9,7 +9,7 @@ import { BenchCaseSchema } from './bench/case.js'
 import { DocsetError, runDocServer } from './bench/doc-server.js'
 import { assertExtraBody, loadManifest, ManifestError, ModelSpecSchema, resolveServerEnv } from './manifest.js'
 import { createModelClient, type ModelClient } from './model-client.js'
-import { probeDir, runProbe } from './probe.js'
+import { probeDir, runProbe, type ProbeResult } from './probe.js'
 import { runManifest } from './run.js'
 import { connectStdioClient, connectStdioRegistry, createRegistryView } from './tools/registry.js'
 import { openTrace } from './trace.js'
@@ -19,7 +19,8 @@ import { loadWorkerConfig, TaskConfigSchema, workerMcpEnv, type WorkerConfig } f
 import { checkHarnessRuntime, createControlChannel } from './worker/control.js'
 import { capDocArgs } from './worker/doc-tools.js'
 import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './worker/exit-codes.js'
-import { runLogConfiguration } from './worker/job-configuration.js'
+import { runLogConfiguration, shown } from './worker/job-configuration.js'
+import { configurationHash, litellmFileHashes, probeVerdict } from './worker/probe-gate.js'
 import { collectSecretEntries, collectSecretValues, workerSecretSources } from './worker/redact.js'
 import { openRunLog } from './worker/run-log.js'
 import { runWorker } from './worker/worker.js'
@@ -28,8 +29,9 @@ const USAGE = `harness — agent-harness v0
 
 Usage:
   harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>] [--extra-body-file <json>]
+  harness probe --config <harness.json> (--configuration <name> | --all) [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>]
   harness run <manifest.json> --out <dir> [--skip-probe] [--api-key-env <VAR>]
-  harness worker --config <worker.json> --api-key-env <VAR> [--out <runs-dir>] [--once] [--skip-probe]
+  harness worker --config <worker.json> --api-key-env <VAR> [--out <runs-dir>] [--once]
   harness check-run-logs --config <worker.json> --dir <run-logs-dir> [--api-key-env <VAR>]
   harness doc-server --dir <docset-dir> --product-id <id>
   harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]
@@ -50,6 +52,8 @@ export const cliArgsConfig = {
     'extra-body-file': { type: 'string' },
     'skip-probe': { type: 'boolean' },
     config: { type: 'string' },
+    configuration: { type: 'string' },
+    all: { type: 'boolean' },
     once: { type: 'boolean' },
     dir: { type: 'string' },
     'product-id': { type: 'string' },
@@ -109,26 +113,87 @@ function readExtraBodyFile(path: string): Record<string, unknown> {
   return extraBody
 }
 
+function readStepTimeoutMs(values: Values): number {
+  const stepTimeoutSec = Number(values['step-timeout'] ?? '120')
+  if (!Number.isFinite(stepTimeoutSec) || stepTimeoutSec <= 0) throw new UsageError('--step-timeout must be a positive number of seconds')
+  return stepTimeoutSec * 1000
+}
+
+function printProbeSteps(result: ProbeResult, label = ''): void {
+  for (const [name, s] of Object.entries(result.steps)) {
+    process.stdout.write(`${label}${s.pass ? 'PASS' : 'FAIL'} ${name}: ${s.reason}\n`)
+  }
+}
+
 async function cmdProbe(values: Values): Promise<number> {
+  if (values.config !== undefined) return cmdProbeConfigurations(values, values.config)
+  if (values.configuration !== undefined || values.all === true) throw new UsageError('probe: --configuration and --all need --config')
   const baseUrl = values['base-url']
   const model = values.model
   if (!baseUrl || !model) throw new UsageError('probe needs --base-url and --model')
-  const stepTimeoutSec = Number(values['step-timeout'] ?? '120')
-  if (!Number.isFinite(stepTimeoutSec) || stepTimeoutSec <= 0) throw new UsageError('--step-timeout must be a positive number of seconds')
+  const stepTimeoutMs = readStepTimeoutMs(values)
   const extraBodyFile = values['extra-body-file']
   const extraBody = extraBodyFile === undefined ? undefined : readExtraBodyFile(extraBodyFile)
   const apiKey = readApiKey(values['api-key-env'])
   const client = createModelClient({ baseUrl, name: model, apiKey, extraBody })
-  const result = await runProbe(client, { baseUrl, model, stepTimeoutMs: stepTimeoutSec * 1000 })
+  const result = await runProbe(client, { baseUrl, model, stepTimeoutMs })
   const dir = probeDir(values.out ?? 'runs', model)
   mkdirSync(dir, { recursive: true })
   const file = join(dir, 'probe.json')
   writeFileSync(file, JSON.stringify(result, null, 2) + '\n')
-  for (const [name, s] of Object.entries(result.steps)) {
-    process.stdout.write(`${s.pass ? 'PASS' : 'FAIL'} ${name}: ${s.reason}\n`)
-  }
+  printProbeSteps(result)
   process.stdout.write(`tool_calling: ${result.tool_calling} (usage_reported: ${result.usage_reported}) → ${file}\n`)
   return result.tool_calling === 'reliable' ? 0 : 1
+}
+
+/**
+ * `harness probe --config <harness.json> (--configuration <name> | --all)`: probes configurations of the worker config through LiteLLM,
+ * each under its own name with its own request fields, and writes `<out>/probe-<name>/probe.json` with the hash, the verdict and the cost
+ * of every answer (spec §4.2). It reads the config and the two LiteLLM files and nothing else: no environment is expanded and no MCP child
+ * starts, so a probe unit runs with the master key alone. Exit 0 only when every probed configuration is accepted.
+ */
+async function cmdProbeConfigurations(values: Values, configPath: string): Promise<number> {
+  const one = values.configuration
+  if ((one !== undefined) === (values.all === true)) throw new UsageError('probe --config needs exactly one of --configuration <name> and --all')
+  for (const flag of ['base-url', 'model', 'extra-body-file'] as const) {
+    if (values[flag] !== undefined) {
+      throw new UsageError(
+        flag === 'extra-body-file'
+          ? '--extra-body-file does not apply to probe --config: the extraBody of a configuration is probed as it is (configurations.<name>.extraBody)'
+          : `--${flag} does not apply to probe --config: the configuration names the model and LiteLLM is its base URL`,
+      )
+    }
+  }
+  const stepTimeoutMs = readStepTimeoutMs(values)
+  const config = loadWorkerConfig(configPath)
+  if (one !== undefined && !Object.hasOwn(config.configurations, one)) {
+    throw new UsageError(`--configuration ${shown(one)} is not a configuration of ${configPath} (it has: ${Object.keys(config.configurations).join(', ')})`)
+  }
+  const names = one !== undefined ? [one] : Object.keys(config.configurations)
+  const apiKey = readApiKey(values['api-key-env'])
+  let files: ReturnType<typeof litellmFileHashes>
+  try {
+    files = litellmFileHashes(config.litellm)
+  } catch (err) {
+    throw new ManifestError(err instanceof Error ? err.message : String(err))
+  }
+  const out = values.out ?? 'runs'
+  let allAccepted = true
+  for (const name of names) {
+    const configuration = config.configurations[name]
+    const result = await runProbe(createConfigurationClient(config, name, apiKey), { baseUrl: config.litellm.baseUrl, model: name, stepTimeoutMs })
+    const verdict = probeVerdict(result, configuration)
+    const dir = probeDir(out, name)
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'probe.json')
+    const hash = configurationHash({ name, ...configuration }, files)
+    writeFileSync(file, JSON.stringify({ ...result, configuration: name, costMode: configuration.costMode, hash, accepted: verdict.accepted, reasons: verdict.reasons }, null, 2) + '\n')
+    printProbeSteps(result, `${name}: `)
+    process.stdout.write(`${name}: tool_calling: ${result.tool_calling} (usage_reported: ${result.usage_reported}), ${verdict.accepted ? 'accepted' : 'NOT accepted'} → ${file}\n`)
+    for (const reason of verdict.reasons) process.stdout.write(`${name}: ${reason}\n`)
+    if (!verdict.accepted) allAccepted = false
+  }
+  return allAccepted ? 0 : 1
 }
 
 /** Spec §7: a tools run needs a reliable probe for the same baseUrl + model, unless --skip-probe. */
@@ -231,14 +296,15 @@ export function resolveWorkerApiKey(apiKeyEnv: string | undefined, env: Record<s
   return apiKey
 }
 
-/** One model client per configuration: LiteLLM's address, the configuration's name as the model, its own request fields, the shared key. */
+/** The model client of one configuration: LiteLLM's address, the configuration's name as the model, its own request fields, the shared key. */
+function createConfigurationClient(config: WorkerConfig, name: string, apiKey: string | undefined): ModelClient {
+  const c = config.configurations[name]
+  return createModelClient({ baseUrl: config.litellm.baseUrl, name, apiKey, reasoningEffort: c.reasoningEffort, extraBody: c.extraBody })
+}
+
+/** One model client per configuration of the worker config. */
 function createConfigurationClients(config: WorkerConfig, apiKey: string | undefined): Record<string, ModelClient> {
-  return Object.fromEntries(
-    Object.entries(config.configurations).map(([name, c]) => [
-      name,
-      createModelClient({ baseUrl: config.litellm.baseUrl, name, apiKey, reasoningEffort: c.reasoningEffort, extraBody: c.extraBody }),
-    ]),
-  )
+  return Object.fromEntries(Object.keys(config.configurations).map((name) => [name, createConfigurationClient(config, name, apiKey)]))
 }
 
 const LITELLM_MODELS_TIMEOUT_MS = 15_000
@@ -302,6 +368,8 @@ export async function checkLitellmModels(config: WorkerConfig, apiKey: string | 
  */
 async function prepareWorker(values: Values) {
   if (!values.config) throw new UsageError('worker needs --config')
+  // The per-job probe gate (src/worker/probe-gate.ts) has no bypass, so this worker has no such option; an unknown option is a usage error.
+  if (values['skip-probe'] !== undefined) throw new UsageError("Unknown option '--skip-probe' for harness worker: the probe gate per job cannot be skipped")
   rejectExtraBodyFile(values, 'worker')
   const out = values.out ?? 'runs'
   const config = loadWorkerConfig(values.config)

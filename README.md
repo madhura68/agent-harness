@@ -24,6 +24,14 @@ harness probe --base-url http://127.0.0.1:11434/v1 --model qwen3-coder:30b --out
 
 Draait vier vaste stappen met een dummy-tool `echo` en schrijft `runs/probe-<model>/probe.json` met `tool_calling: reliable | unreliable | none`. Exit 0 alleen bij `reliable`. Opties: `--api-key-env <VAR>` leest een API-key uit de omgeving, `--step-timeout <sec>` (standaard 120), `--extra-body-file <json>` leest een JSON-object met extra aanvraagvelden (dezelfde regels als `model.extraBody`, zie hieronder) en stuurt die met elke probe-aanvraag mee, zodat de probe bij dezelfde aanbieders uitkomt als de runs. Een bestand met een gereserveerde sleutel wordt geweigerd voordat er een aanvraag uitgaat. De optie geldt alleen voor `probe`: `harness run` en `harness worker` weigeren haar, omdat een stil genegeerd `provider`-blok de aanvragen zonder dat blok zou laten uitgaan; daar hoort `extraBody` in het `model`-blok.
 
+### Probe per configuratie
+
+```bash
+harness probe --config /etc/agent-harness/harness.json (--configuration <naam> | --all) --out runs --api-key-env LITELLM_MASTER_KEY
+```
+
+Probeert een of alle configuraties van de worker-config via LiteLLM, elk onder zijn eigen naam en met zijn eigen `reasoningEffort` en `extraBody`, en schrijft per configuratie `<out>/probe-<naam>/probe.json`. Behalve de velden van de losse probe staan er `configuration`, `costMode`, `hash`, `accepted` (boolean) en `reasons` (lijst) in, en per stap `costsUsd`: het gemelde bedrag van elk antwoord (`null` als het antwoord er geen meldde; `c_two_tools` heeft twee antwoorden, de andere stappen één). De `hash` is de sha256 over de LiteLLM-config en -compose en over `name`, `costMode`, `reasoningEffort` en `extraBody` van de configuratie; `contextTokens` hoort er niet bij. De uitslag is `accepted` alleen als `tool_calling` `reliable` is, bij `hosted` elk antwoord van elke stap een bedrag heeft (0 is een bedrag) en bij `local` geen enkel antwoord een bedrag groter dan 0 meldt; `reasons` noemt wat ontbreekt. Exit 0 alleen als aanvaard; bij `--all` alleen als elke configuratie aanvaard is (de andere worden wel geprobeerd en geschreven). Deze vorm leest alleen `litellm` en `configurations` uit de config en de masterkey uit `--api-key-env`: hij expandeert geen omgeving en start nooit een MCP-kindproces, dus een probe-unit draait met alleen die sleutel. `--base-url`, `--model` en `--extra-body-file` horen bij de losse vorm en worden hier geweigerd.
+
 ## Een run uitvoeren
 
 ```bash
@@ -61,7 +69,7 @@ De worker start één scrum4me-MCP-kindproces met de vaste identiteit `SCRUM4ME_
 
 `reasoningEffort` (`none` | `low` | `medium` | `high`, optioneel, per configuratie; ook als `model.reasoningEffort` in een run-manifest) gaat mee als OpenAI-`reasoning_effort`; Ollama's `/v1` zet thinking daarmee uit (`none`). Standaard staat thinking aan: zonder thinking sloegen beide geteste Qwen-modellen de doc-tools over en verzonnen ze antwoorden (zie de runbook). Denktokens tellen mee in `maxOutputTokens`.
 
-Elke claim krijgt een eigen run-dir `runs/job-<jobId>-<epoch-ms>/`. `--once` stopt na één claim of één lege wachtronde. Ctrl-C rondt een lopende job af als `failed` ("worker gestopt"); een tweede Ctrl-C breekt direct af. Dezelfde probe-gate als `harness run` geldt.
+Elke claim krijgt een eigen run-dir `runs/job-<jobId>-<epoch-ms>/`. `--once` stopt na één claim of één lege wachtronde. Ctrl-C rondt een lopende job af als `failed` ("worker gestopt"); een tweede Ctrl-C breekt direct af. Per job geldt een probe-gate per configuratie: na de configuratie en het plafond en vóór `running` leest de worker `<out>/probe-<configuratie>/probe.json` en rekent de hash opnieuw uit (twee kleine bestanden). Alleen een probe die voor die configuratie is gemaakt, `accepted: true` heeft en dezelfde hash draagt laat de job door; anders faalt alleen die job met `CONFIGURATION_NOT_PROBED: <reden>` (geen bestand, onleesbaar bestand, niet aanvaard, of een hash die niet klopt omdat een LiteLLM-bestand of de configuratie veranderde) en gelden dezelfde regels als bij `UNKNOWN_CONFIGURATION`: nooit `running`, een taak blijft onaangeraakt, `cost: { reported_cost_usd: null, cost_source: 'none' }`, en de volgende job wordt gewoon geclaimd. De gate heeft geen omzeiling: `worker` kent geen `--skip-probe` (een gebruiksfout, exit 78), en `harness run` houdt zijn eigen gate en zijn `--skip-probe`.
 
 Ontwerp en plan: [docs/specs/2026-09-26-idea-chat-local-llm-design.md](docs/specs/2026-09-26-idea-chat-local-llm-design.md), [docs/plans/M2-idea-chat-local-llm.md](docs/plans/M2-idea-chat-local-llm.md). Recept en praktijkbewijs: [docs/runbooks/idea-chat-worker.md](docs/runbooks/idea-chat-worker.md).
 

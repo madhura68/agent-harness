@@ -10,6 +10,7 @@ import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './ex
 import { startHeartbeat } from './heartbeat.js'
 import { IDEA_CHAT_SYSTEM_PROMPT, IdeaChatPayloadSchema, pendingUserMessages, renderIdeaChatUserMessage } from './idea-chat.js'
 import { failBeforeRunning, limitsFor, modelClientFor, modelSpecFor, resolveJobConfiguration } from './job-configuration.js'
+import { checkProbeForJob } from './probe-gate.js'
 import type { RunLog } from './run-log.js'
 import { ContainerUncertainError, runTaskJob, type TaskJobContext } from './task-impl.js'
 
@@ -176,6 +177,9 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   const resolved = resolveJobConfiguration(config, claim.payload)
   if (!resolved.ok) return failBeforeRunning(deps, jobId, runLog, resolved.failure)
   const job = resolved.job
+  // The probe gate of that configuration, after the configuration and the ceiling and before running: no accepted probe of the hash it has now fails this job only.
+  const probed = checkProbeForJob(config, deps.out, job.name)
+  if (!probed.ok) return failBeforeRunning(deps, jobId, runLog, probed.failure)
 
   const running = await control.updateStatus(jobId, { status: 'running' })
   if (!running.ok) {

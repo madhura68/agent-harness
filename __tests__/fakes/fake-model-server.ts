@@ -70,7 +70,7 @@ export function completion(opts: {
   content?: string | null
   toolCalls?: Array<{ id?: string; name: string; arguments?: unknown }>
   finishReason?: string
-  usage?: { prompt_tokens: number; completion_tokens: number } | null
+  usage?: { prompt_tokens: number; completion_tokens: number; cost?: number } | null
   model?: string
 }) {
   const message: Record<string, unknown> = { role: 'assistant', content: opts.content ?? null }

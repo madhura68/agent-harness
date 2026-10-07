@@ -14,7 +14,7 @@ Recept voor `harness worker` met een `task`-blok ([spec](../specs/2026-09-27-tas
 2. **scrum4me-mcp met de M3-wijziging** (§5): het claimfilter kent `kind = 'TASK_IMPLEMENTATION' AND source = 'COPILOT' AND sprint_run_id IS NULL`, en de MCP doet geen statusdoorwerking (auto-PR, story/PBI/sprint, PBI-cascade) voor `local_llm`-jobs.
 3. **Docker op max2**, `janpeter` in de docker-groep, het image (`node:24-bookworm`, volledige variant — de `slim`-variant heeft geen git) eenmalig gepulld.
 4. **Forgejo-gebruiker `agent-harness`** met schrijfrecht op de recept-repo's; token als `FORGEJO_PUSH_TOKEN` in het worker-secretsbestand, nooit in de config of dit runbook.
-5. **Probe** voor het model uit de config, zoals bij idea-chat.
+5. **Probe** van elke configuratie uit de config (`harness probe --config … --all`), zoals bij idea-chat: de gate per job eist een aanvaarde probe van de huidige hash.
 
 ## Dispatchen en uitlezen
 
