@@ -31,7 +31,7 @@ const LOCKED = ACTIONS.filter((a) => !LOCK_FREE.includes(a))
 /** Every invocation that takes the lock: the locked actions and provider-key with a valid name. */
 const LOCKED_CASES: string[][] = [...LOCKED.map((a) => [a]), ['provider-key', 'OPENROUTER_API_KEY']]
 /** Actions that are built in an earlier part (own describe blocks); the rest still answers 70. */
-const BUILT = ['install']
+const BUILT = ['install', 'stop', 'start', 'probe', 'release-update', 'release-rollback', 'mcp-update', 'mcp-rollback']
 const NOT_BUILT = ACTIONS.filter((a) => !BUILT.includes(a))
 const NOT_BUILT_LOCKED_CASES = LOCKED_CASES.filter((c) => !BUILT.includes(c[0]))
 const COMMAND_STUBS = ['systemctl', 'runuser', 'git', 'npm', 'docker', 'curl', 'flock']
@@ -137,7 +137,8 @@ describe('ops wrapper: de actielijst', () => {
     expect(calls()).toEqual([])
   })
 
-  it('kent alle elf acties: elke actie die nog niet is gebouwd geeft 70 met een duidelijke regel, de rest van de wrapper blijft ongemoeid', () => {
+  it('kent alle elf acties: elke actie die nog niet is gebouwd (status, litellm-up, litellm-upgrade) geeft 70 met een duidelijke regel, de rest van de wrapper blijft ongemoeid', () => {
+    expect(NOT_BUILT).toEqual(['status', 'litellm-up', 'litellm-upgrade'])
     for (const actie of NOT_BUILT) {
       const res = run([actie])
       expect(res.code, actie).toBe(70)
@@ -157,7 +158,8 @@ describe('ops wrapper: de actielijst', () => {
     for (const actie of LOCK_FREE) {
       writeFileSync(log, '')
       run([actie])
-      expect(stubCalls(), actie).toEqual([])
+      // status is not built yet; stop only asks systemd to stop the service
+      expect(stubCalls(), actie).toEqual(actie === 'stop' ? ['systemctl stop agent-harness.service'] : [])
     }
   })
 
@@ -200,7 +202,8 @@ describe('ops wrapper: één actie tegelijk', () => {
       writeFileSync(log, '')
       const res = run([actie], { env: { STUB_FLOCK_BUSY: '1' } })
       expect(res.code, actie).not.toBe(75)
-      expect(stubCalls(), actie).toEqual([])
+      // status is not built yet (no calls); stop only asks systemd to stop the service
+      expect(stubCalls(), actie).toEqual(actie === 'stop' ? ['systemctl stop agent-harness.service'] : [])
     }
   })
 })
@@ -909,6 +912,676 @@ describe('ops wrapper: install en releases (deel c)', () => {
       expect(readdirSync(doel)).toEqual(['sentinel'])
       expect(lstatSync(srv('releases', SHA)).isSymbolicLink()).toBe(false)
       expect(existsSync(srv('releases', SHA, '.built'))).toBe(true)
+    })
+  })
+})
+
+// --- stop, start, probe, release-update/-rollback en mcp-update/-rollback (deel d) ---------------------------------------------
+
+const RA = 'a1'.repeat(20)
+const RB = 'b2'.repeat(20)
+const RC = 'c3'.repeat(20)
+
+describe('ops wrapper: stop, start, probe, release-* en mcp-* (deel d)', () => {
+  const me = userInfo().username
+  const OWNER = `runuser -u ${me} -- env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 `
+  const VAR = (): string => join(dir, 'var')
+  const MCP = (): string => join(dir, 'mcp')
+  const MCPSTATE = (): string => join(dir, 'mcpstate')
+  const prevFile = (): string => join(VAR(), 'release.prev')
+  const builtFile = (): string => join(VAR(), 'mcp.built')
+  const mcpPrevFile = (): string => join(VAR(), 'mcp.prev')
+  const read = (p: string): string => readFileSync(p, 'utf8')
+  /** The calls that matter for order: the owner commands (without the runuser prefix), flock and systemctl. */
+  const view = (): string[] =>
+    stubCalls()
+      .filter((c) => c.startsWith('runuser') || c.startsWith('flock') || c.startsWith('systemctl'))
+      .map((c) => c.replace(OWNER, ''))
+  const dEnv = (extra: Record<string, string> = {}): Record<string, string> =>
+    installEnv({ AH_STATE_DIR: VAR(), AH_MCP_DIR: MCP(), STUB_MCP: MCPSTATE(), STUB_REAL_NODE: process.execPath, ...extra })
+  const act = (action: string, extra: Record<string, string> = {}) => run([action], { env: dEnv(extra) })
+  const current = (): string => readlinkSync(srv('current'))
+  const point = (commit: string): void => {
+    rmSync(srv('current'), { force: true })
+    symlinkSync(`releases/${commit}`, srv('current'))
+  }
+  /** `current` -> B and, optionally, release.prev -> A: the starting point of most release tests. */
+  const releases = (cur: string, prev?: string): void => {
+    mkdirSync(srv('releases'), { recursive: true })
+    fakeRelease(cur)
+    point(cur)
+    if (prev) {
+      fakeRelease(prev)
+      writeFileSync(prevFile(), `${prev}\n`)
+    }
+  }
+  const failNodeOnce = (): void => writeFileSync(join(dir, 'state', 'node-fail-once'), '')
+  const failReloadOnce = (): void => writeFileSync(join(dir, 'state', 'fail-reload-once'), '')
+
+  beforeEach(() => {
+    installStubs()
+    mkdirSync(units(), { recursive: true })
+    mkdirSync(VAR())
+    stateOf('agent-harness.service', 'inactive')
+    stateOf('agent-harness-worker.service', 'inactive')
+    // node: the real one, except that a flag file makes the next call fail once (an interruption inside the switch)
+    rmSync(join(dir, 'bin', 'node'))
+    writeStub('node', `if [ -f "$STUB_STATE/node-fail-once" ]; then rm -f "$STUB_STATE/node-fail-once"; exit 1; fi\nexec "$STUB_REAL_NODE" "$@"`)
+    // systemctl: is-active from the state files; daemon-reload fails once on a flag; start can be given an exit code
+    writeStub(
+      'systemctl',
+      `${LOG_LINE}
+if [ "$1" = is-active ]; then
+  if [ -f "$STUB_STATE/$2" ]; then s=$(cat "$STUB_STATE/$2"); echo "$s"; [ "$s" = active ] && exit 0; exit 3; fi
+  echo unknown; exit 4
+fi
+if [ "$1" = daemon-reload ] && [ -f "$STUB_STATE/fail-reload-once" ]; then rm -f "$STUB_STATE/fail-reload-once"; exit 1; fi
+if [ "$1" = start ] && [ -n "$STUB_START_RC" ]; then exit "$STUB_START_RC"; fi
+exit 0`,
+    )
+  })
+
+  describe('stop, start en probe', () => {
+    it('stop vraagt systemd de dienst te stoppen, zonder lock en zonder andere aanroep', () => {
+      const res = act('stop', { STUB_FLOCK_BUSY: '1' })
+      expect(res.code, res.stderr).toBe(0)
+      expect(stubCalls()).toEqual(['systemctl stop agent-harness.service'])
+    })
+
+    it('stop geeft de fout van systemctl door', () => {
+      writeStub('systemctl', `${LOG_LINE}\nexit 5`)
+      expect(act('stop').code).toBe(5)
+    })
+
+    describe('start', () => {
+      const ready = (): void => {
+        writeFileSync(units('agent-harness.service'), '[Service]\n')
+        writeFileSync(etc('harness.json'), '{}')
+        releases(RB)
+      }
+
+      it('start de dienst als unit, harness.json en current er zijn, na de lock', () => {
+        ready()
+        const res = act('start')
+        expect(res.code, res.stderr).toBe(0)
+        expect(stubCalls()).toEqual(['flock -n 9', 'systemctl start agent-harness.service'])
+      })
+
+      it.each([
+        ['de unit', () => rmSync(units('agent-harness.service'))],
+        ['harness.json', () => rmSync(etc('harness.json'))],
+        ['current', () => rmSync(srv('current'))],
+        ['current als dode link', () => point(RC)],
+      ])('weigert (66) als %s ontbreekt, zonder systemctl start', (_naam, breek) => {
+        ready()
+        breek()
+        const res = act('start')
+        expect(res.code, res.stderr).toBe(66)
+        expect(stubCalls().filter((c) => c.startsWith('systemctl start'))).toEqual([])
+      })
+
+      it('geeft 75 bij een bezette lock, zonder systemctl-aanroep', () => {
+        ready()
+        const res = act('start', { STUB_FLOCK_BUSY: '1' })
+        expect(res.code).toBe(75)
+        expect(stubCalls()).toEqual(['flock -n 9'])
+      })
+    })
+
+    describe('probe', () => {
+      it('start de probe-unit (blokkerend) en slaagt alleen als systemctl slaagt', () => {
+        const res = act('probe')
+        expect(res.code, res.stderr).toBe(0)
+        expect(stubCalls()).toEqual(['flock -n 9', 'systemctl start agent-harness-probe.service'])
+      })
+
+      it('geeft de exitcode van systemctl door als de probe-unit faalt', () => {
+        const res = act('probe', { STUB_START_RC: '5' })
+        expect(res.code).toBe(5)
+        expect(stubCalls()).toEqual(['flock -n 9', 'systemctl start agent-harness-probe.service'])
+      })
+
+      it('geeft 75 bij een bezette lock, zonder systemctl-aanroep', () => {
+        const res = act('probe', { STUB_FLOCK_BUSY: '1' })
+        expect(res.code).toBe(75)
+        expect(stubCalls()).toEqual(['flock -n 9'])
+      })
+    })
+  })
+
+  describe('stilstand en lock van release-* en mcp-*', () => {
+    const ACTIES = ['release-update', 'release-rollback', 'mcp-update', 'mcp-rollback']
+
+    it.each(ACTIES)('%s weigert (75) bij active, activating en een andere uitkomst dan inactive/failed, zonder git, npm, docker of daemon-reload', (actie) => {
+      for (const toestand of ['active', 'activating', 'deactivating', '']) {
+        writeFileSync(log, '')
+        stateOf('agent-harness.service', toestand)
+        const res = act(actie)
+        expect(res.code, `${actie} ${JSON.stringify(toestand)}`).toBe(75)
+        expect(stubCalls()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service'])
+      }
+    })
+
+    it.each(['mcp-update', 'mcp-rollback'])('%s weigert (75) ook bij een actieve of activerende oude dienst, zonder git of npm', (actie) => {
+      for (const toestand of ['active', 'activating']) {
+        writeFileSync(log, '')
+        stateOf('agent-harness-worker.service', toestand)
+        const res = act(actie)
+        expect(res.code, `${actie} ${toestand}`).toBe(75)
+        expect(res.stderr).toContain('agent-harness-worker.service')
+        expect(stubCalls()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-worker.service'])
+      }
+    })
+
+    it.each(['release-update', 'release-rollback'])('%s eist niets van de oude dienst: die mag draaien', (actie) => {
+      stateOf('agent-harness-worker.service', 'active')
+      writeFileSync(log, '')
+      act(actie)
+      expect(stubCalls().filter((c) => c.includes('agent-harness-worker.service'))).toEqual([])
+    })
+
+    it.each(['failed', 'inactive'])('gaat bij %s door: geen weigering om de stilstand (een andere uitkomst kan er nog wel zijn)', (toestand) => {
+      stateOf('agent-harness.service', toestand)
+      stateOf('agent-harness-worker.service', toestand)
+      for (const actie of ACTIES) {
+        const res = act(actie)
+        expect(res.stderr, actie).not.toContain('is niet gestopt')
+        expect(stubCalls().filter((c) => c.startsWith('systemctl is-active')).length, actie).toBeGreaterThan(0)
+      }
+    })
+
+    it.each(['start', 'probe', ...ACTIES])('%s geeft 75 bij een bezette lock en doet geen enkele andere aanroep', (actie) => {
+      const res = act(actie, { STUB_FLOCK_BUSY: '1' })
+      expect(res.code).toBe(75)
+      expect(stubCalls()).toEqual(['flock -n 9'])
+    })
+  })
+
+  describe('release-update', () => {
+    it('bouwt in releases/<commit>, schrijft release.prev, wisselt current pas daarna, installeert de units en drukt oud → nieuw af', () => {
+      releases(RB, RA)
+      const res = act('release-update', { STUB_HEAD: RC })
+      expect(res.code, res.stderr).toBe(0)
+      const url = 'https://git.example.invalid/janpeter/agent-harness.git'
+      const rel = srv('releases', RC)
+      expect(view()).toEqual([
+        'flock -n 9',
+        'systemctl is-active agent-harness.service',
+        `git ls-remote ${url} refs/heads/main`,
+        `git clone ${url} ${rel}`,
+        `git -C ${rel} checkout --detach ${RC}`,
+        'npm ci',
+        'npm run build',
+        `touch ${rel}/.built`,
+        'systemctl daemon-reload',
+      ])
+      expect(existsSync(join(rel, '.built'))).toBe(true)
+      expect(current()).toBe(`releases/${RC}`)
+      expect(read(prevFile())).toBe(`${RB}\n`)
+      expect(res.stdout).toContain(`${RB} → ${RC}`)
+      expect(readdirSync(VAR()).sort()).toEqual(['release.prev'])
+      expect(existsSync(units('agent-harness.service'))).toBe(true)
+      expect(existsSync(units('agent-harness-probe.service'))).toBe(true)
+      expect(stubCalls().filter((c) => /^systemctl (enable|start)/.test(c))).toEqual([])
+    })
+
+    it('maakt release.prev als hij er nog niet is (de eerste update na install)', () => {
+      releases(RB)
+      expect(existsSync(prevFile())).toBe(false)
+      expect(act('release-update', { STUB_HEAD: RC }).code).toBe(0)
+      expect(read(prevFile())).toBe(`${RB}\n`)
+    })
+
+    it('laat bij een falende build, twee keer na elkaar, current en release.prev gelijk', () => {
+      releases(RB, RA)
+      for (const poging of [1, 2]) {
+        const res = act('release-update', { STUB_HEAD: RC, STUB_NPM_FAIL: 'run' })
+        expect(res.code, `poging ${poging}`).toBe(74)
+        expect(current(), `poging ${poging}`).toBe(`releases/${RB}`)
+        expect(read(prevFile()), `poging ${poging}`).toBe(`${RA}\n`)
+        expect(existsSync(srv('releases', RC, '.built'))).toBe(false)
+      }
+      expect(readdirSync(VAR()).sort()).toEqual(['release.prev'])
+      expect(stubCalls().filter((c) => c === 'systemctl daemon-reload')).toEqual([])
+    })
+
+    it('laat bij een falende build zonder release.prev er ook geen achter', () => {
+      releases(RB)
+      expect(act('release-update', { STUB_HEAD: RC, STUB_CLONE_RC: '128' }).code).toBe(74)
+      expect(existsSync(prevFile())).toBe(false)
+      expect(current()).toBe(`releases/${RB}`)
+    })
+
+    it('verwijdert een onvolledige releases/<commit> vóór het bouwen', () => {
+      releases(RB, RA)
+      fakeRelease(RC, false)
+      writeFileSync(srv('releases', RC, 'half-gebouwd'), 'x')
+      const res = act('release-update', { STUB_HEAD: RC })
+      expect(res.code, res.stderr).toBe(0)
+      expect(existsSync(srv('releases', RC, 'half-gebouwd'))).toBe(false)
+      expect(existsSync(srv('releases', RC, '.built'))).toBe(true)
+      const stappen = view().map((c) => c.split(' ').slice(0, 2).join(' '))
+      expect(stappen.indexOf('rm -rf')).toBeLessThan(stappen.indexOf('git clone'))
+    })
+
+    it('maakt na een onderbreking tussen het schrijven van release.prev en de wissel dezelfde update af: current → C en release.prev → B', () => {
+      releases(RB, RA)
+      failNodeOnce()
+      const res1 = act('release-update', { STUB_HEAD: RC })
+      expect(res1.code).toBe(74)
+      expect(current()).toBe(`releases/${RB}`)
+      expect(read(prevFile())).toBe(`${RB}\n`) // al geschreven, de wissel nog niet
+      writeFileSync(log, '')
+      const res2 = act('release-update', { STUB_HEAD: RC })
+      expect(res2.code, res2.stderr).toBe(0)
+      expect(current()).toBe(`releases/${RC}`)
+      expect(read(prevFile())).toBe(`${RB}\n`)
+      expect(stubCalls().filter((c) => / (clone|npm) /.test(c) || / git clone /.test(c))).toEqual([]) // de release was al gebouwd
+      expect(existsSync(units('agent-harness.service'))).toBe(true)
+    })
+
+    it('maakt na een onderbreking tussen de wissel en de units alleen de units af, en laat release.prev staan', () => {
+      releases(RB, RA)
+      failReloadOnce()
+      expect(act('release-update', { STUB_HEAD: RC }).code).not.toBe(0)
+      expect(current()).toBe(`releases/${RC}`)
+      expect(read(prevFile())).toBe(`${RB}\n`)
+      writeFileSync(log, '')
+      const res = act('release-update', { STUB_HEAD: RC })
+      expect(res.code, res.stderr).toBe(0)
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', `git ls-remote https://git.example.invalid/janpeter/agent-harness.git refs/heads/main`, 'systemctl daemon-reload'])
+      expect(current()).toBe(`releases/${RC}`)
+      expect(read(prevFile())).toBe(`${RB}\n`)
+    })
+
+    it('doet bij een herhaling na succes alleen units installeren: geen build, geen wissel, release.prev blijft B', () => {
+      releases(RB, RA)
+      expect(act('release-update', { STUB_HEAD: RC }).code).toBe(0)
+      writeFileSync(log, '')
+      const res = act('release-update', { STUB_HEAD: RC })
+      expect(res.code, res.stderr).toBe(0)
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', `git ls-remote https://git.example.invalid/janpeter/agent-harness.git refs/heads/main`, 'systemctl daemon-reload'])
+      expect(read(prevFile())).toBe(`${RB}\n`)
+      expect(res.stdout).not.toContain('→')
+    })
+
+    it('laat een achtergebleven current.new → releases/B de oude release niet vervuilen: current → C en releases/B ongewijzigd', () => {
+      releases(RB, RA)
+      symlinkSync(`releases/${RB}`, srv('current.new'))
+      const voor = readdirSync(srv('releases', RB)).sort()
+      const res = act('release-update', { STUB_HEAD: RC })
+      expect(res.code, res.stderr).toBe(0)
+      expect(current()).toBe(`releases/${RC}`)
+      expect(readdirSync(srv('releases', RB)).sort()).toEqual(voor)
+      expect(existsSync(srv('current.new'))).toBe(false)
+    })
+
+    it('geeft 74 als ls-remote faalt of geen geldige commit levert, en verandert niets', () => {
+      releases(RB, RA)
+      for (const extra of [{ STUB_LSREMOTE_OUT: 'geen-sha\trefs/heads/main' }, { STUB_LSREMOTE_OUT: '' }, { STUB_LSREMOTE_RC: '128' }]) {
+        const res = act('release-update', { ...extra, STUB_HEAD: '' })
+        expect(res.code, JSON.stringify(extra)).toBe(74)
+      }
+      expect(current()).toBe(`releases/${RB}`)
+      expect(read(prevFile())).toBe(`${RA}\n`)
+      expect(stubCalls().some((c) => / git clone /.test(c))).toBe(false)
+    })
+
+    it('geeft 66 zonder current (eerst install) en zonder de map voor de toestandsbestanden, vóór elke git-aanroep', () => {
+      mkdirSync(srv('releases'), { recursive: true })
+      expect(act('release-update', { STUB_HEAD: RC }).code).toBe(66)
+      releases(RB)
+      rmSync(VAR(), { recursive: true })
+      expect(act('release-update', { STUB_HEAD: RC }).code).toBe(66)
+      expect(stubCalls().some((c) => / git /.test(c))).toBe(false)
+    })
+
+    it('geeft 74 als current niet naar releases/<commit> wijst, en verandert niets', () => {
+      mkdirSync(srv('releases'), { recursive: true })
+      symlinkSync('/elders', srv('current'))
+      expect(act('release-update', { STUB_HEAD: RC }).code).toBe(74)
+      expect(readlinkSync(srv('current'))).toBe('/elders')
+    })
+  })
+
+  describe('release-rollback', () => {
+    it('wisselt current naar release.prev zonder build, laat release.prev staan, installeert de units en drukt oud → nieuw af', () => {
+      releases(RB, RA)
+      const res = act('release-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(current()).toBe(`releases/${RA}`)
+      expect(read(prevFile())).toBe(`${RA}\n`)
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl daemon-reload'])
+      expect(stubCalls().filter((c) => /^(git|npm|docker|curl) /.test(c))).toEqual([])
+      expect(res.stdout).toContain(`${RB} → ${RA}`)
+      expect(readdirSync(VAR()).sort()).toEqual(['release.prev'])
+    })
+
+    it('doet bij een tweede aanroep alleen units installeren, en verandert release.prev niet', () => {
+      releases(RB, RA)
+      expect(act('release-rollback').code).toBe(0)
+      writeFileSync(log, '')
+      const res = act('release-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl daemon-reload'])
+      expect(current()).toBe(`releases/${RA}`)
+      expect(read(prevFile())).toBe(`${RA}\n`)
+    })
+
+    it('maakt een terugzetting af die vóór de wissel is onderbroken (de node-stub faalt één keer): daarna current → A', () => {
+      releases(RB, RA)
+      failNodeOnce()
+      expect(act('release-rollback').code).toBe(74)
+      expect(current()).toBe(`releases/${RB}`)
+      expect(read(prevFile())).toBe(`${RA}\n`)
+      const res = act('release-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(current()).toBe(`releases/${RA}`)
+      expect(read(prevFile())).toBe(`${RA}\n`)
+    })
+
+    it('maakt een terugzetting af die na de wissel is onderbroken (de systemctl-stub faalt één keer): daarna current → A en de units geïnstalleerd', () => {
+      releases(RB, RA)
+      failReloadOnce()
+      expect(act('release-rollback').code).not.toBe(0)
+      expect(current()).toBe(`releases/${RA}`)
+      writeFileSync(log, '')
+      const res = act('release-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(view()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl daemon-reload'])
+      expect(current()).toBe(`releases/${RA}`)
+      expect(read(prevFile())).toBe(`${RA}\n`)
+    })
+
+    it('laat een achtergebleven current.new → releases/B de release B niet vervuilen: current → A en releases/B ongewijzigd', () => {
+      releases(RB, RA)
+      symlinkSync(`releases/${RB}`, srv('current.new'))
+      const voor = readdirSync(srv('releases', RB)).sort()
+      const res = act('release-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(current()).toBe(`releases/${RA}`)
+      expect(readdirSync(srv('releases', RB)).sort()).toEqual(voor)
+      expect(existsSync(srv('current.new'))).toBe(false)
+    })
+
+    it('geeft 75 zonder release.prev (zoals na de eerste installatie), zonder die release, of zonder zijn .built, en laat current ongemoeid', () => {
+      releases(RB)
+      expect(act('release-rollback').code).toBe(75)
+      writeFileSync(prevFile(), `${RA}\n`) // release A bestaat niet
+      expect(act('release-rollback').code).toBe(75)
+      fakeRelease(RA, false) // niet gebouwd
+      expect(act('release-rollback').code).toBe(75)
+      writeFileSync(prevFile(), 'geen-commit\n')
+      expect(act('release-rollback').code).toBe(75)
+      expect(current()).toBe(`releases/${RB}`)
+      expect(stubCalls().filter((c) => c === 'systemctl daemon-reload')).toEqual([])
+    })
+
+    it('laat release-update daarna weer vooruit gaan, met de teruggezette release als release.prev', () => {
+      releases(RB, RA)
+      expect(act('release-rollback').code).toBe(0)
+      const res = act('release-update', { STUB_HEAD: RB })
+      expect(res.code, res.stderr).toBe(0)
+      expect(current()).toBe(`releases/${RB}`)
+      expect(read(prevFile())).toBe(`${RA}\n`)
+    })
+  })
+
+  describe('mcp-update en mcp-rollback', () => {
+    /** git, npm and the checkout as one fake mcp-stable: HEAD and origin/main are files; flags in STUB_MCP make steps fail. */
+    function mcpStubs(): void {
+      mkdirSync(MCP())
+      mkdirSync(MCPSTATE())
+      writeFileSync(join(MCPSTATE(), 'head'), `${RA}\n`)
+      writeFileSync(join(MCPSTATE(), 'remote'), `${RB}\n`)
+      writeStub(
+        'git',
+        `${LOG_LINE}
+M="$STUB_MCP"
+[ "$1" = -C ] && shift 2
+case "$1" in
+  status) [ -f "$M/dirty" ] && echo ' M prisma/schema.prisma'; [ -f "$M/generated" ] && [ -f "$M/dirty-after-generate" ] && echo ' M prisma/schema.prisma'; exit 0 ;;
+  fetch) [ -f "$M/fail-fetch" ] && exit 1; exit 0 ;;
+  rev-parse) case "$2" in origin/main) cat "$M/remote" ;; HEAD) cat "$M/head" ;; *) exit 1 ;; esac; exit 0 ;;
+  merge) [ "$2" = --ff-only ] || exit 2; [ -f "$M/fail-merge" ] && exit 1; printf '%s\\n' "$3" > "$M/head"; exit 0 ;;
+  reset) [ "$2" = --hard ] || exit 2; [ -f "$M/fail-reset" ] && exit 1; printf '%s\\n' "$3" > "$M/head"; rm -f "$M/dirty" "$M/generated"; exit 0 ;;
+  submodule) [ -f "$M/fail-submodule" ] && exit 1; exit 0 ;;
+esac
+exit 0`,
+      )
+      writeStub(
+        'npm',
+        `${LOG_LINE}
+printf 'npmcwd %s\\n' "$(pwd)" >> "$STUB_LOG"
+if [ "$STUB_NPM_FAIL" = "$1" ] || [ "$STUB_NPM_FAIL" = "$1 $2" ]; then exit 1; fi
+if [ "$1 $2" = "run prisma:generate" ]; then : > "$STUB_MCP/generated"; fi
+exit 0`,
+      )
+    }
+    const flag = (name: string): void => writeFileSync(join(MCPSTATE(), name), '')
+    const unflag = (name: string): void => rmSync(join(MCPSTATE(), name), { force: true })
+    const head = (): string => read(join(MCPSTATE(), 'head')).trim()
+    const gitCalls = (): string[] => view().filter((c) => c.startsWith('git '))
+    const writes = (): string[] => gitCalls().filter((c) => / (fetch|merge|pull)( |$)/.test(c))
+    const setBuilt = (c: string): void => writeFileSync(builtFile(), `${c}\n`)
+    const setRemote = (c: string): void => writeFileSync(join(MCPSTATE(), 'remote'), `${c}\n`)
+
+    beforeEach(() => {
+      mcpStubs()
+      setBuilt(RA)
+    })
+
+    it('mcp-update: git fetch, ff-only merge naar origin/main, submodule, npm ci, prisma:generate en een schone status, in die volgorde; daarna mcp.prev → A en mcp.built → B', () => {
+      const res = act('mcp-update')
+      expect(res.code, res.stderr).toBe(0)
+      const d = MCP()
+      expect(view()).toEqual([
+        'flock -n 9',
+        'systemctl is-active agent-harness.service',
+        'systemctl is-active agent-harness-worker.service',
+        `git -C ${d} status --porcelain`,
+        `git -C ${d} fetch origin`,
+        `git -C ${d} rev-parse origin/main`,
+        `git -C ${d} merge --ff-only ${RB}`,
+        `git -C ${d} submodule update --init`,
+        'npm ci',
+        'npm run prisma:generate',
+        `git -C ${d} status --porcelain`,
+      ])
+      for (const c of calls().filter((x) => x.startsWith('npmcwd '))) expect(c).toBe(`npmcwd ${d}`)
+      expect(read(builtFile())).toBe(`${RB}\n`)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+      expect(res.stdout).toContain(`${RA} → ${RB}`)
+      expect(readdirSync(VAR()).sort()).toEqual(['mcp.built', 'mcp.prev'])
+      expect(head()).toBe(RB)
+    })
+
+    it('begint bij het eerste gebruik mcp.built bij de huidige HEAD (waarop de oude dienst draait), vóór de merge', () => {
+      rmSync(builtFile())
+      const res = act('mcp-update')
+      expect(res.code, res.stderr).toBe(0)
+      expect(gitCalls()).toContain(`git -C ${MCP()} rev-parse HEAD`)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+      expect(read(builtFile())).toBe(`${RB}\n`)
+    })
+
+    it('laat bij het eerste gebruik en een mislukte update mcp.built op de HEAD van de oude dienst en mcp.prev daar ook', () => {
+      rmSync(builtFile())
+      expect(act('mcp-update', { STUB_NPM_FAIL: 'ci' }).code).toBe(74)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+    })
+
+    it('mcp-update naar B faalt, een tweede mcp-update faalt ook, en mcp-rollback kiest A zonder één git fetch, merge of pull', () => {
+      for (const poging of [1, 2]) {
+        const res = act('mcp-update', { STUB_NPM_FAIL: 'ci' })
+        expect(res.code, `poging ${poging}`).toBe(74)
+        expect(read(builtFile()), `poging ${poging}`).toBe(`${RA}\n`)
+        expect(read(mcpPrevFile()), `poging ${poging}`).toBe(`${RA}\n`)
+      }
+      expect(head()).toBe(RB) // de merge is gedaan, de installatie niet
+      writeFileSync(log, '')
+      const res = act('mcp-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(writes()).toEqual([])
+      expect(gitCalls()).toEqual([`git -C ${MCP()} reset --hard ${RA}`, `git -C ${MCP()} submodule update --init`, `git -C ${MCP()} status --porcelain`])
+      expect(head()).toBe(RA)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+      expect(stubCalls().filter((c) => /^(curl|docker) /.test(c))).toEqual([])
+    })
+
+    it.each([
+      ['de submodule-stap', { STUB_NPM_FAIL: '' }, 'fail-submodule'],
+      ['git merge', { STUB_NPM_FAIL: '' }, 'fail-merge'],
+      ['git fetch', { STUB_NPM_FAIL: '' }, 'fail-fetch'],
+    ])('mcp-update die faalt bij %s geeft 74 en laat mcp.built op A', (_naam, extra, vlag) => {
+      flag(vlag)
+      const res = act('mcp-update', extra)
+      expect(res.code, res.stderr).toBe(74)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+    })
+
+    it.each(['ci', 'run prisma:generate'])('mcp-update met npm %s die faalt: 74 en mcp.built op A', (stap) => {
+      expect(act('mcp-update', { STUB_NPM_FAIL: stap }).code).toBe(74)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+    })
+
+    it('een geslaagde update naar B, dan dezelfde update nog eens: mcp.prev blijft A, en mcp-rollback kiest A', () => {
+      expect(act('mcp-update').code).toBe(0)
+      writeFileSync(log, '')
+      const res = act('mcp-update')
+      expect(res.code, res.stderr).toBe(0)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+      expect(read(builtFile())).toBe(`${RB}\n`)
+      expect(res.stdout).not.toContain(`${RA} → ${RB}`)
+      writeFileSync(log, '')
+      const terug = act('mcp-rollback')
+      expect(terug.code, terug.stderr).toBe(0)
+      expect(gitCalls()).toContain(`git -C ${MCP()} reset --hard ${RA}`)
+      expect(head()).toBe(RA)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+    })
+
+    it('een herhaald mcp-rollback kiest dezelfde commit en houdt mcp.prev', () => {
+      writeFileSync(mcpPrevFile(), `${RA}\n`)
+      setBuilt(RB)
+      for (const keer of [1, 2]) {
+        expect(act('mcp-rollback').code, `keer ${keer}`).toBe(0)
+        expect(head()).toBe(RA)
+        expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+        expect(read(builtFile())).toBe(`${RA}\n`)
+      }
+    })
+
+    it('een update waarvan het doel al mcp.built is, laat mcp.prev ongemoeid (ook als hij er niet is)', () => {
+      setRemote(RA)
+      const res = act('mcp-update')
+      expect(res.code, res.stderr).toBe(0)
+      expect(existsSync(mcpPrevFile())).toBe(false)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      expect(res.stdout).not.toContain('→')
+    })
+
+    it('een mcp-update maakt na een onderbreking tussen mcp.prev en de installatie dezelfde update af', () => {
+      flag('fail-merge')
+      expect(act('mcp-update').code).toBe(74)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      unflag('fail-merge')
+      expect(act('mcp-update').code).toBe(0)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+      expect(read(builtFile())).toBe(`${RB}\n`)
+    })
+
+    it('geeft exit 1 als git status --porcelain na prisma:generate niet leeg is, en laat mcp.built ongewijzigd', () => {
+      flag('dirty-after-generate')
+      const res = act('mcp-update')
+      expect(res.code).toBe(1)
+      expect(res.stderr).toContain('prisma/schema.prisma')
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      writeFileSync(mcpPrevFile(), `${RA}\n`)
+      writeFileSync(log, '')
+      expect(act('mcp-rollback').code).toBe(1)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+    })
+
+    it('mcp-update weigert (75) een checkout met wijzigingen, vóór elke fetch, merge, npm of schrijfactie', () => {
+      flag('dirty')
+      const res = act('mcp-update')
+      expect(res.code).toBe(75)
+      expect(gitCalls()).toEqual([`git -C ${MCP()} status --porcelain`])
+      expect(stubCalls().filter((c) => c.startsWith('npm '))).toEqual([])
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      expect(existsSync(mcpPrevFile())).toBe(false)
+    })
+
+    it('mcp-rollback weigert (75) zonder mcp.prev, vóór elke git- of npm-aanroep', () => {
+      const res = act('mcp-rollback')
+      expect(res.code).toBe(75)
+      expect(gitCalls()).toEqual([])
+      expect(stubCalls().filter((c) => c.startsWith('npm '))).toEqual([])
+      expect(read(builtFile())).toBe(`${RA}\n`)
+    })
+
+    it('mcp-rollback weigert een vuile checkout niet: de reset herstelt hem', () => {
+      writeFileSync(mcpPrevFile(), `${RA}\n`)
+      setBuilt(RB)
+      flag('dirty')
+      const res = act('mcp-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(existsSync(join(MCPSTATE(), 'dirty'))).toBe(false)
+      expect(res.stdout).toContain(`${RB} → ${RA}`)
+    })
+
+    it('mcp-rollback laat een kapotte mcp.built de terugzetting niet blokkeren: hij wordt overschreven', () => {
+      writeFileSync(mcpPrevFile(), `${RA}\n`)
+      writeFileSync(builtFile(), 'kapot\n')
+      const res = act('mcp-rollback')
+      expect(res.code, res.stderr).toBe(0)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      expect(res.stdout).toContain(`onbekend → ${RA}`)
+    })
+
+    it('mcp-rollback geeft 74 als de reset faalt, en laat mcp.built en mcp.prev staan', () => {
+      writeFileSync(mcpPrevFile(), `${RA}\n`)
+      setBuilt(RB)
+      flag('fail-reset')
+      expect(act('mcp-rollback').code).toBe(74)
+      expect(read(builtFile())).toBe(`${RB}\n`)
+      expect(read(mcpPrevFile())).toBe(`${RA}\n`)
+    })
+
+    it('schrijft mcp.prev en mcp.built nooit half: een mislukte rename laat het oude bestand en geen tijdelijk bestand achter', () => {
+      const res = act('mcp-update', { STUB_MV_FAIL: '1' })
+      expect(res.code).not.toBe(0)
+      expect(read(builtFile())).toBe(`${RA}\n`)
+      expect(existsSync(mcpPrevFile())).toBe(false)
+      expect(readdirSync(VAR())).toEqual(['mcp.built'])
+      expect(head()).toBe(RA) // geen merge vóór mcp.prev
+      expect(gitCalls().some((c) => / merge /.test(c))).toBe(false)
+    })
+
+    it('weigert (75) een mcp.built, mcp.prev of origin/main die geen volledige commit is, en (66) zonder checkout', () => {
+      writeFileSync(builtFile(), 'abc\n')
+      expect(act('mcp-update').code).toBe(75)
+      setBuilt(RA)
+      writeFileSync(mcpPrevFile(), 'abc\n')
+      expect(act('mcp-rollback').code).toBe(75)
+      writeFileSync(join(MCPSTATE(), 'remote'), 'abc\n')
+      expect(act('mcp-update').code).toBe(74)
+      rmSync(MCP(), { recursive: true })
+      expect(act('mcp-update').code).toBe(66)
+      expect(act('mcp-rollback').code).toBe(66)
+    })
+
+    it('zet root-git nergens in: elke git- en npm-aanroep staat achter runuser, als janpeter', () => {
+      expect(act('mcp-update').code).toBe(0)
+      const direct = stubCalls().filter((c) => /^(git|npm) /.test(c))
+      const via = stubCalls().filter((c) => c.startsWith('runuser') && / (git|npm) /.test(c))
+      expect(direct.length).toBe(via.length)
+      for (const c of via) expect(c).toContain('env HOME=/home/janpeter GIT_TERMINAL_PROMPT=0 ')
     })
   })
 })

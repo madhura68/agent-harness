@@ -9,17 +9,19 @@
 #   status | install | stop | start | probe | release-update | release-rollback | mcp-update | mcp-rollback
 #   | litellm-up | litellm-upgrade | provider-key <NAME>
 #
-# Exit codes: 0 ok; 64 unknown action, extra argument, unknown NAME or unusable value; 66 a needed directory or source file is missing, a source file is a symlink, or a release is not built;
-#   70 the action is not built yet; 73 a file could not be created; 74 a release could not be built, switched or looked up;
-#   75 busy (another action holds the lock) or the worker
-#   is not at a standstill.
+# Exit codes: 0 ok; 1 the mcp-stable checkout is not clean after the MCP install (git status --porcelain); 64 unknown action, extra argument,
+#   unknown NAME or unusable value; 66 a needed directory or source file is missing, a source file is a symlink, or a release is not built;
+#   70 the action is not built yet; 73 a file could not be created; 74 a release could not be built, switched or looked up, or a git/npm step of
+#   the MCP checkout failed; 75 busy (another action holds the lock), the worker is not at a standstill, or a precondition of the action does not
+#   hold (no release.prev or mcp.prev, a dirty mcp-stable checkout before an update, a state file that is not a full commit). `probe` returns the
+#   exit code of `systemctl start agent-harness-probe.service`.
 #
 # Rules this file keeps:
 # - git and npm only through `runuser` as the checkout owner (owner_git, owner_npm); never git as root in a checkout. runuser
 #   keeps root's environment, HOME=/root included, so every owner command runs through `env HOME=<owner's home>` (owner_run):
 #   git and npm never read or write root's config or cache. owner_run also sets GIT_TERMINAL_PROMPT=0.
-# - All paths are variables with fixed defaults (AH_ETC, AH_LITELLM_ENV, AH_LOCK, AH_OWNER, AH_OWNER_HOME, AH_SRV, AH_UNIT_DIR,
-#   AH_REPO_URL, ...), and so is PATH: the script sets
+# - All paths are variables with fixed defaults (AH_ETC, AH_LITELLM_ENV, AH_LOCK, AH_OWNER, AH_OWNER_HOME, AH_SRV, AH_STATE_DIR, AH_MCP_DIR,
+#   AH_UNIT_DIR, AH_REPO_URL, ...), and so is PATH: the script sets
 #   a fixed PATH itself instead of relying on sudo's secure_path (AH_PATH replaces it). sudo's env_reset wipes the caller's
 #   environment, so a caller cannot override any of these in production; the tests set them (and put stubs on AH_PATH).
 # - Standstill (require_standstill) means `systemctl is-active <unit>` says `inactive` or `failed`. Every other answer
@@ -33,7 +35,14 @@
 # `.built` only after a complete build); /srv/agent-harness/current is a symlink (root) to the rolled-out release, so it always
 # names a built release. build_release builds one as the owner, swap_current switches the link with node (rename(2) replaces the
 # link without following it; `ln -s` and `mv` would follow an existing link to a directory, and `mv -T` is GNU only), and
-# install_units installs both worker units from current (never enable or start). Part d (release-update, rollback) reuses them.
+# install_units installs both worker units from current (never enable or start). release-update and release-rollback reuse them.
+#
+# State files in AH_STATE_DIR (/var/lib/agent-harness), each one commit plus a newline, always written through a temp file and rename:
+#   release.prev  the release `current` pointed at before the last release-update (release-rollback never changes it)
+#   mcp.built     the commit of the last successful MCP install in the mcp-stable checkout (first use: its HEAD)
+#   mcp.prev      the commit mcp.built had before the last update to another commit (mcp-rollback never changes it)
+# Every release/mcp action is written so that a repetition after success, and a rerun after an interruption between any two
+# writes, ends in the outcome the plan states (see each action).
 #
 # Adding an action: write `action_<name with _>()` (it replaces the not_implemented line), use the helpers below
 # (require_standstill, owner_git, owner_npm, make_temp_beside, publish_temp), and add its name to the case lists in `main` only if its
@@ -58,12 +67,17 @@ AH_LITELLM_DIR="${AH_LITELLM_DIR:-$AH_ETC/litellm}"
 AH_HARNESS_JSON="${AH_HARNESS_JSON:-$AH_ETC/harness.json}"
 AH_HARNESS_ENV="${AH_HARNESS_ENV:-$AH_ETC/harness-litellm.env}"
 AH_REPO_URL="${AH_REPO_URL:-https://git.jp-visser.nl/janpeter/agent-harness.git}"
+AH_STATE_DIR="${AH_STATE_DIR:-/var/lib/agent-harness}"
+AH_RELEASE_PREV="$AH_STATE_DIR/release.prev"
+AH_MCP_BUILT="$AH_STATE_DIR/mcp.built"
+AH_MCP_PREV="$AH_STATE_DIR/mcp.prev"
+# The mcp-stable checkout of the old service (owner janpeter); only git fetch/merge/reset and the MCP install touch it (as the owner).
+AH_MCP_DIR="${AH_MCP_DIR:-/home/janpeter/Development/scrum4me-mcp-stable}"
 
 UNIT_HARNESS="agent-harness.service"
 UNIT_PROBE="agent-harness-probe.service"
 UNIT_BRIDGE="litellm-ollama-bridge.service"
-# Used by the release, mcp and litellm actions (parts d-e).
-# shellcheck disable=SC2034
+# The old service: the mcp-* actions need it at a standstill too (its MCP checkout is the one they change).
 UNIT_WORKER="agent-harness-worker.service"
 
 PROVIDER_KEY_NAMES="OPENROUTER_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY"
@@ -239,6 +253,86 @@ install_bridge_unit() {
   printf '%s vervangen door die uit current\n' "$dst"
 }
 
+# --- origin/main, state files and the MCP checkout (release-* and mcp-*) ------------------------------------------------------
+
+# Sets ORIGIN_COMMIT to the commit of origin/main, looked up as the owner. A failed lookup, or an answer that is no full commit, is 74.
+ORIGIN_COMMIT=""
+resolve_origin_main() {
+  local out
+  ORIGIN_COMMIT=""
+  out=$(owner_git ls-remote "$AH_REPO_URL" refs/heads/main) || die 74 "git ls-remote van origin/main mislukt"
+  read -r ORIGIN_COMMIT _ <<<"$out" || true
+  [[ $ORIGIN_COMMIT =~ ^[0-9a-f]{40}$ ]] || die 74 "git ls-remote gaf geen geldige commit voor origin/main"
+}
+
+# Sets CURRENT_COMMIT to the release `current` points at ("" when there is no `current`). Anything but a link to releases/<commit> is 74.
+CURRENT_COMMIT=""
+read_current_release() {
+  local target re='^releases/([0-9a-f]{40})$'
+  CURRENT_COMMIT=""
+  if [[ ! -e $AH_CURRENT && ! -L $AH_CURRENT ]]; then return 0; fi
+  [[ -L $AH_CURRENT ]] || die 74 "$AH_CURRENT is geen symlink"
+  target=$(readlink -- "$AH_CURRENT") || die 74 "$AH_CURRENT kon niet worden gelezen"
+  [[ $target =~ $re ]] || die 74 "$AH_CURRENT wijst niet naar releases/<commit>"
+  CURRENT_COMMIT=${BASH_REMATCH[1]}
+}
+
+require_state_dir() {
+  [[ -d $AH_STATE_DIR ]] || die 66 "map $AH_STATE_DIR ontbreekt"
+}
+
+# Sets STATE_COMMIT to the commit in a state file ("" when the file is missing). A symlink or a first line that is no full commit
+# is 75, except with a second argument (lenient: the caller overwrites the file anyway), which reads it as missing.
+STATE_COMMIT=""
+read_state_commit() { # $1 = file, $2 = "lenient" (optional)
+  local line=""
+  STATE_COMMIT=""
+  [[ -e $1 || -L $1 ]] || return 0
+  if [[ -L $1 || ! -f $1 ]]; then
+    [[ ${2:-} == lenient ]] && return 0
+    die 75 "$1 is geen gewoon bestand"
+  fi
+  IFS= read -r line <"$1" || true
+  if [[ ! $line =~ ^[0-9a-f]{40}$ ]]; then
+    [[ ${2:-} == lenient ]] && return 0
+    die 75 "$1 bevat geen volledige commit"
+  fi
+  STATE_COMMIT=$line
+}
+
+# A state file is always written through a temp file and rename, so a crash leaves the old file or the new one, never half of one.
+write_state_commit() { # $1 = file, $2 = commit
+  require_commit "$2"
+  make_temp_beside "$1"
+  printf '%s\n' "$2" >"$TEMP_FILE"
+  publish_temp "$1" 644
+}
+
+require_mcp_checkout() {
+  [[ -d $AH_MCP_DIR ]] || die 66 "checkout $AH_MCP_DIR ontbreekt"
+}
+
+# Sets MCP_REV to the full commit `git rev-parse <rev>` gives in the MCP checkout (74 when git fails or answers anything else).
+MCP_REV=""
+mcp_rev_parse() { # $1 = rev
+  MCP_REV=$(owner_git -C "$AH_MCP_DIR" rev-parse "$1") || die 74 "git rev-parse $1 in $AH_MCP_DIR mislukt"
+  [[ $MCP_REV =~ ^[0-9a-f]{40}$ ]] || die 74 "git rev-parse $1 gaf geen volledige commit"
+}
+
+# The shared install step of mcp-update and mcp-rollback: submodule, npm ci, prisma:generate (it rewrites prisma/schema.prisma from the
+# submodule and generates the client; postinstall does the same but swallows a failure), then the checkout must be clean: a stale
+# schema (it is in git) shows up as a change. Everything as the owner, npm in the checkout.
+mcp_install() {
+  local out
+  owner_git -C "$AH_MCP_DIR" submodule update --init || die 74 "git submodule update --init in $AH_MCP_DIR mislukt"
+  (cd "$AH_MCP_DIR" && owner_npm ci && owner_npm run prisma:generate) || die 74 "npm ci of npm run prisma:generate in $AH_MCP_DIR mislukt"
+  out=$(owner_git -C "$AH_MCP_DIR" status --porcelain) || die 74 "git status in $AH_MCP_DIR mislukt"
+  if [[ -n $out ]]; then
+    printf '%s\n' "$out" >&2
+    die 1 "git status --porcelain is niet leeg na de MCP-installatie in $AH_MCP_DIR"
+  fi
+}
+
 # --- the LiteLLM files and the master key -------------------------------------------------------------------------------
 
 # Sets ENV_VALUE to the value of the first non-empty NAME=value line of an env file (empty when there is none). A secret never
@@ -307,7 +401,6 @@ action_status() { not_implemented status e; }
 # unit, the master key. A second run changes nothing that exists: no git or npm call, and no file, key or release replaced
 # (except a bridge unit that differs from the one in current).
 action_install() {
-  local out commit=""
   require_standstill "$UNIT_HARNESS"
   umask 022
 
@@ -317,11 +410,9 @@ action_install() {
   if [[ -e $AH_CURRENT || -L $AH_CURRENT ]]; then
     printf 'release bestaat; bijwerken via release-update\n'
   else
-    out=$(owner_git ls-remote "$AH_REPO_URL" refs/heads/main) || die 74 "git ls-remote van origin/main mislukt"
-    read -r commit _ <<<"$out" || true
-    [[ $commit =~ ^[0-9a-f]{40}$ ]] || die 74 "git ls-remote gaf geen geldige commit voor origin/main"
-    build_release "$commit"
-    swap_current "$commit"
+    resolve_origin_main
+    build_release "$ORIGIN_COMMIT"
+    swap_current "$ORIGIN_COMMIT"
   fi
   install_units
 
@@ -335,13 +426,129 @@ action_install() {
   ensure_master_key
 }
 
-action_stop() { not_implemented stop d; }
-action_start() { not_implemented start d; }
-action_probe() { not_implemented probe d; }
-action_release_update() { not_implemented release-update d; }
-action_release_rollback() { not_implemented release-rollback d; }
-action_mcp_update() { not_implemented mcp-update d; }
-action_mcp_rollback() { not_implemented mcp-rollback d; }
+# stop: free of the lock (see main); it changes no file.
+action_stop() {
+  systemctl stop "$UNIT_HARNESS"
+}
+
+# start: refuses (66) when the unit, harness.json or current is missing; otherwise systemctl start. In 2d nobody calls it.
+action_start() {
+  [[ -f $AH_UNIT_DIR/$UNIT_HARNESS ]] || die 66 "unit $AH_UNIT_DIR/$UNIT_HARNESS ontbreekt (eerst install)"
+  [[ -f $AH_HARNESS_JSON ]] || die 66 "$AH_HARNESS_JSON ontbreekt (eerst install)"
+  [[ -e $AH_CURRENT ]] || die 66 "$AH_CURRENT ontbreekt of wijst naar niets (eerst install)"
+  systemctl start "$UNIT_HARNESS"
+}
+
+# probe: starts the probe unit and blocks until it ends; exit 0 only when it succeeded, otherwise systemctl's exit code. The result
+# per configuration is in probe.json and in the journal.
+action_probe() {
+  local rc=0
+  systemctl start "$UNIT_PROBE" || rc=$?
+  ((rc == 0)) || die "$rc" "$UNIT_PROBE faalde (systemctl start gaf rc=$rc); zie probe.json en de journal"
+  printf 'probe geslaagd\n'
+}
+
+# release-update: the commit of origin/main. When `current` already is that release, only the units are installed (the repair after
+# an update interrupted before the units). Otherwise: build, write release.prev (the release `current` has now), switch, install
+# the units. A failed build changes neither `current` nor release.prev. An interruption leaves `current` on the old release (and
+# release.prev on it too) or on the new one; the same action then finishes the job: release.prev is written again with the same
+# value, the switch is made, the units follow.
+action_release_update() {
+  local old new
+  require_standstill "$UNIT_HARNESS"
+  require_state_dir
+  read_current_release
+  old=$CURRENT_COMMIT
+  [[ -n $old ]] || die 66 "geen release in $AH_CURRENT (eerst install)"
+  resolve_origin_main
+  new=$ORIGIN_COMMIT
+  if [[ $new == "$old" ]]; then
+    printf 'current is al release %s; alleen de units installeren\n' "$new"
+    install_units
+    return 0
+  fi
+  build_release "$new"
+  write_state_commit "$AH_RELEASE_PREV" "$old"
+  swap_current "$new"
+  install_units
+  printf '%s → %s\n' "$old" "$new"
+}
+
+# release-rollback: switch to the release in release.prev, without a build; release.prev does not change. A missing release.prev,
+# release or .built is 75. When `current` already is that release (a second call, or a rerun after an interruption), only the
+# units are installed. Going forward again is release-update.
+action_release_rollback() {
+  local old prev
+  require_standstill "$UNIT_HARNESS"
+  read_state_commit "$AH_RELEASE_PREV"
+  prev=$STATE_COMMIT
+  [[ -n $prev ]] || die 75 "release.prev ontbreekt (zoals na de eerste installatie); er is geen release om naar terug te gaan"
+  [[ -f $AH_RELEASES/$prev/.built ]] || die 75 "release $prev (release.prev) ontbreekt of is niet gebouwd"
+  read_current_release
+  old=$CURRENT_COMMIT
+  if [[ $old == "$prev" ]]; then
+    printf 'current is al release %s; alleen de units installeren\n' "$prev"
+    install_units
+    return 0
+  fi
+  swap_current "$prev"
+  install_units
+  printf '%s → %s\n' "${old:-onbekend}" "$prev"
+}
+
+# mcp-update: mcp.built holds the commit of the last successful install (first use: HEAD, on which the old service runs; written
+# before anything changes). A dirty checkout is 75. fetch, then the target is origin/main. Only when the target differs from
+# mcp.built does mcp.built go to mcp.prev first, so a failed update (also a second attempt) leaves mcp.prev on the last good commit
+# and a repetition of a successful one leaves it on the commit before. merge --ff-only, install; only on success mcp.built becomes the target.
+action_mcp_update() {
+  local dirty built target
+  require_standstill "$UNIT_HARNESS" "$UNIT_WORKER"
+  require_state_dir
+  require_mcp_checkout
+  dirty=$(owner_git -C "$AH_MCP_DIR" status --porcelain) || die 74 "git status in $AH_MCP_DIR mislukt"
+  [[ -z $dirty ]] || die 75 "$AH_MCP_DIR heeft wijzigingen; herstel eerst met mcp-rollback of ruim ze op"
+  read_state_commit "$AH_MCP_BUILT"
+  built=$STATE_COMMIT
+  if [[ -z $built ]]; then
+    mcp_rev_parse HEAD
+    built=$MCP_REV
+    write_state_commit "$AH_MCP_BUILT" "$built"
+  fi
+  owner_git -C "$AH_MCP_DIR" fetch origin || die 74 "git fetch origin in $AH_MCP_DIR mislukt"
+  mcp_rev_parse origin/main
+  target=$MCP_REV
+  if [[ $target != "$built" ]]; then
+    write_state_commit "$AH_MCP_PREV" "$built"
+  fi
+  owner_git -C "$AH_MCP_DIR" merge --ff-only "$target" || die 74 "git merge --ff-only $target in $AH_MCP_DIR mislukt"
+  mcp_install
+  write_state_commit "$AH_MCP_BUILT" "$target"
+  if [[ $target == "$built" ]]; then
+    printf 'mcp-stable staat al op %s; opnieuw geïnstalleerd\n' "$target"
+  else
+    printf '%s → %s\n' "$built" "$target"
+  fi
+}
+
+# mcp-rollback: without mcp.prev 75. Otherwise reset --hard to it and install; expressly no fetch, merge or pull (they would go back to
+# origin/main). A dirty checkout is no reason to refuse: the reset repairs it. On success mcp.built is that commit; mcp.prev stays, so a
+# repetition picks the same commit.
+action_mcp_rollback() {
+  local old prev
+  require_standstill "$UNIT_HARNESS" "$UNIT_WORKER"
+  require_state_dir
+  require_mcp_checkout
+  read_state_commit "$AH_MCP_PREV"
+  prev=$STATE_COMMIT
+  [[ -n $prev ]] || die 75 "mcp.prev ontbreekt; er is geen commit om naar terug te gaan"
+  read_state_commit "$AH_MCP_BUILT" lenient
+  old=$STATE_COMMIT
+  owner_git -C "$AH_MCP_DIR" reset --hard "$prev" || die 74 "git reset --hard $prev in $AH_MCP_DIR mislukt"
+  mcp_install
+  write_state_commit "$AH_MCP_BUILT" "$prev"
+  printf '%s → %s\n' "${old:-onbekend}" "$prev"
+}
+
 action_litellm_up() { not_implemented litellm-up e; }
 action_litellm_upgrade() { not_implemented litellm-upgrade e; }
 
