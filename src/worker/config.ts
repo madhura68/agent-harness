@@ -120,13 +120,14 @@ export function loadWorkerConfig(path: string): WorkerConfig {
 }
 
 /**
- * The MCP child's env: the config env with ${VAR} expanded, then the fixed worker identity.
- * The fixed keys come last so no config can make this worker claim ordinary jobs.
+ * The MCP child's env: the config env with ${VAR} expanded, then the fixed worker identity: runtime HARNESS, no capability.
+ * The fixed keys come last so no config can make this worker claim jobs of another runtime. An empty capability list is the
+ * identity; an unset variable would give the MCP its default `code_edit,planning,review`.
  */
 export function workerMcpEnv(cfg: WorkerConfig, env: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const out: Record<string, string> = {}
   for (const [k, v] of Object.entries(cfg.mcp.env ?? {})) out[k] = expandEnv(v, env, 'mcp.env')
-  out.SCRUM4ME_WORKER_CAPABILITIES = 'local_llm'
-  out.SCRUM4ME_WORKER_RUNTIME = 'CLAUDE'
+  out.SCRUM4ME_WORKER_CAPABILITIES = ''
+  out.SCRUM4ME_WORKER_RUNTIME = 'HARNESS'
   return out
 }

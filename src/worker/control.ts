@@ -1,10 +1,12 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js'
 import { flattenContent } from '../tools/registry.js'
 
 export type ClaimResult =
   | { type: 'timeout' }
   | { type: 'job'; jobId: string; kind: string; payload: unknown }
   | { type: 'error'; message: string } // server gave a tool error; the connection is healthy
+  | { type: 'runtime_mismatch' } // the MCP handed the claim back: this worker's runtime is not the job's (M45-2b); nothing to do for this job
   | { type: 'broken'; message: string } // SDK/transport failed; the connection is gone or a handler may still run
   | { type: 'stopped' } // the given signal (Ctrl-C) fired
 
@@ -58,6 +60,9 @@ export interface ControlChannel {
   log(kind: 'implementation' | 'commit' | 'test', args: LogArgs): Promise<{ ok: boolean; message?: string }>
 }
 
+/** The tool error text of `wait_for_job` for a claim whose job runtime differs from this worker's. */
+export const RUNTIME_MISMATCH = 'RUNTIME_MISMATCH'
+
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err))
 const text = (res: unknown) => {
   const content = (res as { content?: unknown }).content
@@ -96,6 +101,8 @@ export function createControlChannel(client: Client, opts: { requestTimeoutMs?: 
         return { type: 'broken', message: message(err) }
       }
       const body = text(res)
+      // The MCP sets exactly this text, unchanged, in `content` (toolError); any other error text that merely contains it is an ordinary tool error.
+      if (res.isError && body === RUNTIME_MISMATCH) return { type: 'runtime_mismatch' }
       if (res.isError) return { type: 'error', message: body }
       let parsed: unknown
       try {
@@ -196,4 +203,36 @@ export function createControlChannel(client: Client, opts: { requestTimeoutMs?: 
       }
     },
   }
+}
+
+export type StartCheck = { ok: true } | { ok: false; line: string }
+
+/**
+ * The start check (M45-2d): the MCP's `health` must list HARNESS in `runtimes`. An MCP release without M45-2b has no such
+ * entry, or no field, or no `health` tool at all; it would register this worker under a runtime it does not know. A refusal
+ * comes with the log line to print; the caller stops before any claim. A tool error, a missing tool and a reply that is not
+ * JSON count as a refusal too. A call that throws (the connection is gone) is left to the caller, which knows whether it was lost.
+ */
+export async function checkHarnessRuntime(client: Client): Promise<StartCheck> {
+  const refuse = (shown: string, why = ''): StartCheck => ({ ok: false, line: `STARTCHECK_FAILED: de MCP kent HARNESS niet (health.runtimes=${shown})${why}` })
+  let res
+  try {
+    res = await client.callTool({ name: 'health', arguments: {} })
+  } catch (err) {
+    // The SDK throws for a tool the server does not have (older SDKs) and for a lost connection; only the first is a refusal here.
+    if (err instanceof McpError && err.code === ErrorCode.MethodNotFound) return refuse('ontbrekend', `: geen health-tool (${message(err)})`)
+    throw err
+  }
+  const body = text(res)
+  if (res.isError) return refuse('ontbrekend', `: health gaf een toolfout (${body.slice(0, 200)})`)
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return refuse('ontbrekend', `: health gaf geen JSON (${body.slice(0, 200)})`)
+  }
+  const runtimes = (parsed as { runtimes?: unknown } | null)?.runtimes
+  if (runtimes === undefined) return refuse('ontbrekend')
+  if (!Array.isArray(runtimes) || !runtimes.includes('HARNESS')) return refuse(JSON.stringify(runtimes).slice(0, 200))
+  return { ok: true }
 }

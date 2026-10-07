@@ -15,8 +15,9 @@ import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
 import { checkRunLogs } from './worker/check-run-logs.js'
 import { loadWorkerConfig, TaskConfigSchema, workerMcpEnv, type WorkerConfig } from './worker/config.js'
-import { createControlChannel } from './worker/control.js'
+import { checkHarnessRuntime, createControlChannel } from './worker/control.js'
 import { capDocArgs } from './worker/doc-tools.js'
+import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED } from './worker/exit-codes.js'
 import { collectSecretEntries, collectSecretValues, workerSecretSources } from './worker/redact.js'
 import { openRunLog } from './worker/run-log.js'
 import { runWorker } from './worker/worker.js'
@@ -256,9 +257,35 @@ async function cmdWorker(values: Values): Promise<number> {
   process.on('SIGINT', onSignal)
   process.on('SIGTERM', onSignal)
   let conn: Awaited<ReturnType<typeof connectStdioClient>> | undefined
+  // The MCP child is lost when its connection closes and the harness did not close it itself. Nothing can be reported to it any more,
+  // so the loop stops (a running job is left) and the worker exits 1: a restart brings a new child, and a new start check.
+  let closing = false
+  let mcpLost = false
+  const onMcpClosed = () => {
+    if (closing || mcpLost) return
+    mcpLost = true
+    process.stderr.write('MCP-verbinding verloren: het MCP-kindproces is weg; een lopende job wordt verlaten. Worker stopt.\n')
+    stop.abort()
+  }
   try {
+    // Every step that can fail without an MCP child comes before this line (config, the key, probe gate). Then no child exists and
+    // nothing is registered in claude_workers. The LiteLLM /models check of T-2065 goes here too, ahead of connectStdioClient.
     conn = await connectStdioClient({ ...config.mcp, env }, stop.signal)
     const client = conn.client
+    client.onclose = onMcpClosed
+    // Start check before the first claim: an MCP release that does not know HARNESS would register this worker under a runtime it lacks.
+    let startCheck: Awaited<ReturnType<typeof checkHarnessRuntime>>
+    try {
+      startCheck = await checkHarnessRuntime(client)
+    } catch (err) {
+      // A lost child is a case for a restart (1). Any other failure of the call itself is a refusal like a tool error: the same start fails the same way.
+      if (mcpLost) return EXIT_RESTART
+      startCheck = { ok: false, line: `STARTCHECK_FAILED: de MCP kent HARNESS niet (health.runtimes=ontbrekend): health-aanroep mislukt (${err instanceof Error ? err.message : String(err)})` }
+    }
+    if (!startCheck.ok) {
+      process.stderr.write(`${startCheck.line}\n`)
+      return EXIT_NO_RESTART
+    }
     const { exitCode, jobs } = await runWorker({
       control: createControlChannel(client),
       registryView: async (signal) => capDocArgs(await createRegistryView(client, config.allow, signal)),
@@ -270,8 +297,10 @@ async function cmdWorker(values: Values): Promise<number> {
       runLogFor: (claim) => openRunLog(config.workerLog, { jobId: claim.jobId, kind: claim.kind, model: config.model, version, secrets }),
     })
     process.stdout.write(`worker klaar — ${jobs.length} job(s): ${jobs.map((j) => `${j.jobId}=${j.outcome}`).join(', ') || 'geen'}\n`)
-    return exitCode
+    // Lost child beats the loop's own result: the loop was stopped by the loss, which reads as a clean stop (0) to it.
+    return mcpLost && exitCode === EXIT_STOPPED ? EXIT_RESTART : exitCode
   } finally {
+    closing = true // the harness's own close below is no loss
     process.off('SIGINT', onSignal)
     process.off('SIGTERM', onSignal)
     await conn?.close().catch(() => undefined)

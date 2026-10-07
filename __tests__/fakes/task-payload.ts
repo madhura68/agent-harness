@@ -10,12 +10,14 @@ export function taskPayload(opts: {
   plan?: string | null
   storyDescription?: string | null
   acceptance?: string | null
+  runtime?: string
 } = {}) {
   return {
     job_id: opts.jobId ?? 'job1',
     kind: 'TASK_IMPLEMENTATION',
     source: 'COPILOT',
     status: 'claimed',
+    config: { runtime: opts.runtime ?? 'HARNESS' },
     task: {
       id: 'task-1',
       code: 'T-1',

@@ -6,6 +6,7 @@ import type { ToolRegistry } from '../types.js'
 import type { WorkerConfig } from './config.js'
 import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
+import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './exit-codes.js'
 import { startHeartbeat } from './heartbeat.js'
 import { IDEA_CHAT_SYSTEM_PROMPT, IdeaChatPayloadSchema, pendingUserMessages, renderIdeaChatUserMessage } from './idea-chat.js'
 import type { RunLog } from './run-log.js'
@@ -237,7 +238,12 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   return outcome
 }
 
-export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId: string; outcome: JobOutcome }>; exitCode: 0 | 1 }> {
+/** The runtime a claimed payload says it was made for (`config.runtime`); anything but a string is no runtime at all. */
+function payloadRuntime(payload: unknown): unknown {
+  return (payload as { config?: { runtime?: unknown } } | null | undefined)?.config?.runtime
+}
+
+export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId: string; outcome: JobOutcome }>; exitCode: ExitCode }> {
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const jobs: Array<{ jobId: string; outcome: JobOutcome }> = []
   // Leftover harness containers from a crash: clean them up before the first task. Idea-chat never waits on
@@ -254,24 +260,36 @@ export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId
     },
   }
   for (;;) {
-    if (deps.signal.aborted) return { jobs, exitCode: 0 }
+    if (deps.signal.aborted) return { jobs, exitCode: EXIT_STOPPED }
     const claim = await deps.control.waitForJob(deps.config.waitSeconds, deps.signal)
     switch (claim.type) {
       case 'stopped':
-        return { jobs, exitCode: 0 }
+        return { jobs, exitCode: EXIT_STOPPED }
       case 'timeout':
-        if (deps.once) return { jobs, exitCode: 0 }
+        if (deps.once) return { jobs, exitCode: EXIT_STOPPED }
         continue
       case 'error':
         log(`wait_for_job: ${claim.message}`)
-        if (deps.once) return { jobs, exitCode: 1 }
+        if (deps.once) return { jobs, exitCode: EXIT_RESTART }
         await sleep(deps.errorBackoffMs ?? 5000, deps.signal)
         continue
+      case 'runtime_mismatch':
+        // The MCP gave the claim back itself (the job stays QUEUED), so there is nothing to close. A restart would meet the same job and the same refusal.
+        log('RUNTIME_MISMATCH: de MCP gaf de claim terug omdat de runtime van de job niet bij deze worker hoort. Worker stopt zonder herstart.')
+        return { jobs, exitCode: EXIT_NO_RESTART }
       case 'broken':
         // A claim may have landed server-side; its job returns to QUEUED through the lease reset.
         log(`MCP-verbinding onbruikbaar (${claim.message}); uitkomst van een eventueel lopende claim onbekend. Worker stopt.`)
-        return { jobs, exitCode: 1 }
+        return { jobs, exitCode: EXIT_RESTART }
       case 'job': {
+        // Own check, for an MCP without the claim check of M45-2b: a job that is not ours is left alone (no update_job_status, no run-log);
+        // against such an MCP its lease runs out and the job returns to the queue. A payload without config.runtime is no HARNESS payload.
+        const runtime = payloadRuntime(claim.payload)
+        if (runtime !== 'HARNESS') {
+          jobs.push({ jobId: claim.jobId, outcome: 'abandoned' })
+          log(`RUNTIME_MISMATCH (eigen controle): job ${claim.jobId} heeft config.runtime=${JSON.stringify(runtime)?.slice(0, 60) ?? 'ontbrekend'}; niet aangeraakt. Worker stopt zonder herstart.`)
+          return { jobs, exitCode: EXIT_NO_RESTART }
+        }
         let outcome: JobOutcome
         try {
           outcome = await runOneJob(deps, claim, taskCtx)
@@ -279,16 +297,16 @@ export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId
           if (err instanceof ContainerUncertainError) {
             jobs.push({ jobId: claim.jobId, outcome: err.outcome })
             log(`job ${claim.jobId}: ${err.message}. Worker stopt.`)
-            return { jobs, exitCode: 1 }
+            return { jobs, exitCode: EXIT_RESTART }
           }
           if (!(err instanceof ClaimFilterError)) throw err
           jobs.push({ jobId: claim.jobId, outcome: 'failed' })
-          log(`job ${claim.jobId}: ${err.message} — dit hoort het claimfilter (local_llm-isolatie in scrum4me-mcp) te voorkomen. Worker stopt.`)
-          return { jobs, exitCode: 1 }
+          log(`job ${claim.jobId}: ${err.message} — dit hoort het claimfilter (runtime-isolatie in scrum4me-mcp) te voorkomen. Worker stopt zonder herstart.`)
+          return { jobs, exitCode: EXIT_NO_RESTART }
         }
         jobs.push({ jobId: claim.jobId, outcome })
-        if (deps.signal.aborted) return { jobs, exitCode: 0 } // stopped on request: the job is closed, the stop was clean
-        if (deps.once) return { jobs, exitCode: outcome === 'done' ? 0 : 1 }
+        if (deps.signal.aborted) return { jobs, exitCode: EXIT_STOPPED } // stopped on request: the job is closed, the stop was clean
+        if (deps.once) return { jobs, exitCode: outcome === 'done' ? EXIT_STOPPED : EXIT_RESTART }
         continue
       }
     }

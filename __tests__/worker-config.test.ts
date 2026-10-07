@@ -61,13 +61,13 @@ describe('loadWorkerConfig', () => {
 })
 
 describe('workerMcpEnv', () => {
-  it('forces local_llm and CLAUDE over whatever the config says', () => {
+  it('forces HARNESS without a capability over whatever the config says', () => {
     const cfg = WorkerConfigSchema.parse({
       ...base,
       mcp: { ...base.mcp, env: { ...base.mcp.env, SCRUM4ME_WORKER_CAPABILITIES: 'code_edit', SCRUM4ME_WORKER_RUNTIME: 'CODEX' } },
     })
     const env = workerMcpEnv(cfg, { SCRUM4ME_TOKEN: 'tok' })
-    expect(env).toEqual({ SCRUM4ME_TOKEN: 'tok', SCRUM4ME_WORKER_CAPABILITIES: 'local_llm', SCRUM4ME_WORKER_RUNTIME: 'CLAUDE' })
+    expect(env).toEqual({ SCRUM4ME_TOKEN: 'tok', SCRUM4ME_WORKER_CAPABILITIES: '', SCRUM4ME_WORKER_RUNTIME: 'HARNESS' })
   })
 
   it('names an unset variable', () => {
@@ -77,7 +77,7 @@ describe('workerMcpEnv', () => {
 
   it('works without mcp.env', () => {
     const cfg = WorkerConfigSchema.parse({ ...base, mcp: { command: 'node', args: [] } })
-    expect(workerMcpEnv(cfg, {})).toEqual({ SCRUM4ME_WORKER_CAPABILITIES: 'local_llm', SCRUM4ME_WORKER_RUNTIME: 'CLAUDE' })
+    expect(workerMcpEnv(cfg, {})).toEqual({ SCRUM4ME_WORKER_CAPABILITIES: '', SCRUM4ME_WORKER_RUNTIME: 'HARNESS' })
   })
 })
 

@@ -327,6 +327,65 @@ describe('runWorker — the claim loop', () => {
   })
 })
 
+/**
+ * Stops the worker after `n` wait_for_job attempts, so a worker that wrongly keeps looping fails its test instead of hanging it
+ * (an in-memory MCP answers without ever yielding to a timer, so a time-based stop would never fire).
+ */
+function stopAfterWaits(t: { deps: WorkerDeps }, n: number): void {
+  const stop = new AbortController()
+  let waits = 0
+  const wait = t.deps.control.waitForJob.bind(t.deps.control)
+  t.deps.signal = stop.signal
+  t.deps.control = { ...t.deps.control, waitForJob: async (seconds, signal) => { if (++waits > n) stop.abort(); return wait(seconds, signal) } }
+}
+
+describe('runWorker — runtime mismatch (M45-2d)', () => {
+  it('exits 78 on a RUNTIME_MISMATCH tool error of wait_for_job, touches no job and does not wait again', async () => {
+    const t = await setup({ claims: [{ runtimeMismatch: true }, job()], script: [answer('nee')], once: false })
+    stopAfterWaits(t, 3)
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [], exitCode: 78 })
+    expect(controlCalls(t.mcp)).toEqual([])
+    expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
+    expect(t.model.requests).toHaveLength(0)
+    expect(t.logs.join('\n')).toContain('RUNTIME_MISMATCH')
+  })
+
+  it('treats another tool error that merely contains the text as an ordinary tool error', async () => {
+    const t = await setup({ claims: [{ error: 'Worktree creation failed: RUNTIME_MISMATCH in de naam' }], once: true })
+    const r = await t.run()
+    expect(r.exitCode).toBe(1)
+  })
+
+  it('exits 78 on a claimed payload with config.runtime CLAUDE, without update_job_status or a model call', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ runtime: 'CLAUDE' })), job()], script: [answer('nee')], once: false })
+    stopAfterWaits(t, 3)
+    const r = await t.run()
+    expect(r.exitCode).toBe(78)
+    expect(controlCalls(t.mcp)).toEqual([])
+    expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
+    expect(t.model.requests).toHaveLength(0)
+    expect(t.logs.join('\n')).toContain('RUNTIME_MISMATCH (eigen controle)')
+  })
+
+  it('reads a payload without config.runtime as a mismatch too, never as HARNESS', async () => {
+    const payload = ideaChatPayload() as unknown as { config: Record<string, unknown> }
+    delete payload.config.runtime
+    const t = await setup({ claims: [job(payload)], script: [answer('nee')], once: false })
+    stopAfterWaits(t, 3)
+    const r = await t.run()
+    expect(r.exitCode).toBe(78)
+    expect(controlCalls(t.mcp)).toEqual([])
+  })
+
+  it('does not write a run-log for the refused claim', async () => {
+    const t = await setup({ claims: [job(ideaChatPayload({ runtime: 'CLAUDE' }))], once: false })
+    stopAfterWaits(t, 3)
+    await t.run()
+    expect(existsSync(runLogRunsDir(t.runLogDir))).toBe(false)
+  })
+})
+
 describe('createControlChannel', () => {
   it('passes a request timeout of at least waitSeconds + 30 s and the signal', async () => {
     mcp = await startFakeScrum4meMcp({ claims: [{ timeout: true }] })
@@ -488,7 +547,7 @@ describe('runWorker — review fixes', () => {
   it('stops after an unsupported kind: a wrong claim filter must not drain the queue', async () => {
     const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'PR_REVIEW' }), job()], script: [answer('nee')], once: false })
     const r = await t.run()
-    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 78 })
     expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
     expect(t.logs.join('\n')).toMatch(/claimfilter/i)
   })
@@ -498,7 +557,7 @@ describe('runWorker — review fixes', () => {
     delete payload.chat.pending_user_message_ids
     const t = await setup({ claims: [job(payload), job()], script: [answer('nee')], once: false })
     const r = await t.run()
-    expect(r.exitCode).toBe(1)
+    expect(r.exitCode).toBe(78)
     expect(t.mcp.calls.filter((c) => c.name === 'wait_for_job')).toHaveLength(1)
   })
 
@@ -589,7 +648,7 @@ describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
   it('an unsupported kind writes exactly one block with ERROR CLAIM_FILTER, and ClaimFilterError still reaches the worker loop', async () => {
     const t = await setup({ claims: [job({ ...ideaChatPayload(), kind: 'PR_REVIEW' }), job()], script: [answer('nee')], once: false })
     const r = await t.run()
-    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 1 })
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 78 })
     const lines = runLogLines(t.runLogDir)
     expect(lines.filter((l) => l.includes('"type":"harness.run_end"'))).toHaveLength(1)
     expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CLAIM_FILTER: /))
@@ -600,7 +659,7 @@ describe('runWorker — run-log (M4 Taak 5, spec §5.6/§6.4)', () => {
     delete payload.chat.pending_user_message_ids
     const t = await setup({ claims: [job(payload), job()], script: [answer('nee')], once: false })
     const r = await t.run()
-    expect(r.exitCode).toBe(1)
+    expect(r.exitCode).toBe(78)
     const lines = runLogLines(t.runLogDir)
     expect(lines.filter((l) => l.includes('"type":"harness.run_end"'))).toHaveLength(1)
     expect(lines).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CLAIM_FILTER: /))

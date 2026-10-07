@@ -450,7 +450,7 @@ describe('runTaskJob — failures', () => {
   })
 
   it('an invalid payload ⇒ failed, the task untouched, and the worker does not stop', async () => {
-    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION' } }, { job: ideaChatPayload({ jobId: 'job2' }) }], script: [answer('ok')], once: false })
+    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION', config: { runtime: 'HARNESS' } } }, { job: ideaChatPayload({ jobId: 'job2' }) }], script: [answer('ok')], once: false })
     const stop = new AbortController()
     t.deps.signal = stop.signal
     const orig = t.deps.control.updateStatus.bind(t.deps.control)
@@ -963,7 +963,7 @@ describe('runTaskJob — run-log (M4 Taak 6, spec §5.6)', () => {
   })
 
   it('an invalid payload ⇒ ERROR PAYLOAD_INVALID', async () => {
-    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION' } }] })
+    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION', config: { runtime: 'HARNESS' } } }] })
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
     expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PAYLOAD_INVALID: payload ongeldig: /))

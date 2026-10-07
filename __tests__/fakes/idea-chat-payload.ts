@@ -1,7 +1,7 @@
 type Msg = { id: string; role: string; kind?: string; content: string; created_at: string }
 
 /** An IDEA_CHAT payload in the shape of the scrum4me-mcp wait_for_job IDEA_CHAT branch. */
-export function ideaChatPayload(opts: { jobId?: string; kind?: string; messages?: Msg[]; pending?: string[] } = {}) {
+export function ideaChatPayload(opts: { jobId?: string; kind?: string; runtime?: string; messages?: Msg[]; pending?: string[] } = {}) {
   const messages: Msg[] = opts.messages ?? [
     { id: 'm1', role: 'USER', kind: 'TEXT', content: 'Eerste vraag', created_at: '2026-09-26T09:00:00.000Z' },
     { id: 'm2', role: 'ASSISTANT', kind: 'TEXT', content: 'Eerste antwoord', created_at: '2026-09-26T09:00:20.000Z' },
@@ -12,7 +12,7 @@ export function ideaChatPayload(opts: { jobId?: string; kind?: string; messages?
     kind: opts.kind ?? 'IDEA_CHAT',
     source: 'SYSTEM',
     status: 'claimed',
-    config: { model: 'claude-sonnet-5' },
+    config: { runtime: opts.runtime ?? 'HARNESS', model: 'claude-sonnet-5' },
     doc_index: [],
     idea: {
       id: 'idea1',

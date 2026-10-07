@@ -3,12 +3,13 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ServerSpec } from '../src/types.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
-import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
+import { startFakeScrum4meMcp, type ClaimStep, type HealthSetup } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
 import { dirContains, tmp } from './helpers.js'
 
 const stdioCalls: ServerSpec[] = []
 let claims: ClaimStep[] = []
+let health: HealthSetup = {}
 let fakeMcp: Awaited<ReturnType<typeof startFakeScrum4meMcp>> | undefined
 // Set fresh on every connectStdioClient call: lets a test assert the harness itself closed the MCP
 // child (Fix 2 / cmdWorker's `finally`), independent of this test file's own afterEach cleanup below.
@@ -20,7 +21,7 @@ vi.mock('../src/tools/registry.js', async (importActual) => {
     ...actual,
     connectStdioClient: vi.fn(async (server: ServerSpec) => {
       stdioCalls.push(server)
-      fakeMcp = await startFakeScrum4meMcp({ claims })
+      fakeMcp = await startFakeScrum4meMcp({ claims, health })
       const closeSpy = vi.fn(fakeMcp.close)
       lastCloseSpy = closeSpy
       return { client: fakeMcp.client, close: closeSpy }
@@ -37,6 +38,7 @@ let stderr: string[] = []
 beforeEach(() => {
   stdioCalls.length = 0
   claims = []
+  health = {}
   stderr = []
   vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true })
   vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => { stderr.push(String(chunk)); return true })
@@ -98,7 +100,7 @@ describe('harness worker', () => {
     expect(stdioCalls).toHaveLength(0)
   })
 
-  it('forces local_llm into the MCP env and exits 0 on a timeout with --once', async () => {
+  it('forces HARNESS without a capability into the MCP env and exits 0 on a timeout with --once', async () => {
     const dir = tmp('cli-worker')
     const out = join(dir, 'runs')
     writeProbe(out, 'http://127.0.0.1:1/v1')
@@ -109,7 +111,7 @@ describe('harness worker', () => {
     expect(stdioCalls).toHaveLength(1)
     expect(stdioCalls[0]).toEqual({
       command: 'mcp-bin', args: ['--x'],
-      env: { SCRUM4ME_TOKEN: 'x', SCRUM4ME_WORKER_CAPABILITIES: 'local_llm', SCRUM4ME_WORKER_RUNTIME: 'CLAUDE' },
+      env: { SCRUM4ME_TOKEN: 'x', SCRUM4ME_WORKER_CAPABILITIES: '', SCRUM4ME_WORKER_RUNTIME: 'HARNESS' },
     })
   })
 
@@ -238,3 +240,85 @@ describe('harness worker', () => {
     expect(fakeMcp?.calls.filter((c) => c.name === 'get_product_doc').map((c) => c.args)).toEqual([{ doc_id: 'doc1', max_chars: 12_000 }])
   })
 })
+
+const waitCalls = () => fakeMcp?.calls.filter((c) => c.name === 'wait_for_job').length ?? 0
+
+describe('harness worker — start check and exit codes (M45-2d)', () => {
+  async function start(extra: string[] = ['--once'], over: Record<string, unknown> = {}, baseUrl = 'http://127.0.0.1:1/v1') {
+    const dir = tmp('cli-worker')
+    const out = join(dir, 'runs')
+    writeProbe(out, baseUrl)
+    process.env.SCRUM4ME_TOKEN = 'x'
+    return main(['worker', '--config', workerConfig(dir, baseUrl, over), '--out', out, ...extra])
+  }
+
+  it.each([
+    ['without HARNESS in health.runtimes', { runtimes: ['CLAUDE', 'CODEX'] }, '["CLAUDE","CODEX"]'],
+    ['with a health reply without a runtimes field', { runtimes: null }, 'ontbrekend'],
+    ['without a health tool', { noTool: true }, 'ontbrekend'],
+    ['with a health tool error', { error: 'database down' }, 'ontbrekend'],
+  ])('exits 78 before any claim %s', async (_what, setup, shown) => {
+    health = setup
+    claims = [{ job: ideaChatPayload() }]
+    const code = await start()
+    expect(code).toBe(78)
+    expect(waitCalls()).toBe(0)
+    expect(fakeMcp?.calls.map((c) => c.name).filter((n) => n !== 'health')).toEqual([])
+    expect(stderr.join('')).toContain(`STARTCHECK_FAILED: de MCP kent HARNESS niet (health.runtimes=${shown})`)
+    expect(lastCloseSpy).toHaveBeenCalledTimes(1) // the MCP child does not outlive the refusal
+  })
+
+  it('calls health once before the first wait_for_job when runtimes contains HARNESS, and the loop starts', async () => {
+    claims = [{ timeout: true }]
+    const code = await start()
+    expect(code).toBe(0)
+    expect(fakeMcp?.calls.map((c) => c.name)).toEqual(['health', 'wait_for_job'])
+    expect(stderr.join('')).not.toContain('STARTCHECK_FAILED')
+  })
+
+  it('exits 1 when the MCP closes while the worker waits for a job', async () => {
+    claims = [{ hangMs: 5000 }]
+    const exited = start([])
+    await vi.waitFor(() => expect(waitCalls()).toBe(1))
+    await fakeMcp?.close()
+    expect(await exited).toBe(1)
+    expect(waitCalls()).toBe(1)
+  })
+
+  it('exits 1 at once when the MCP closes during a job, leaves the job and claims nothing new', async () => {
+    model = await startFakeModelServer([{ delayMs: 4000, body: completion({ content: 'te laat', model: 'qwen3-coder:30b' }) }])
+    claims = [{ job: ideaChatPayload() }, { job: ideaChatPayload({ jobId: 'job2' }) }]
+    const started = Date.now()
+    const exited = start([], {}, model.baseUrl)
+    await vi.waitFor(() => expect(model?.requests).toHaveLength(1))
+    await fakeMcp?.close()
+    expect(await exited).toBe(1)
+    expect(Date.now() - started).toBeLessThan(3000) // the pending model call did not run to its end
+    expect(waitCalls()).toBe(1)
+    expect(stderr.join('')).toMatch(/MCP-verbinding verloren/)
+  })
+
+  it('does not count its own close as a lost connection', async () => {
+    claims = [{ timeout: true }]
+    const code = await start()
+    expect(code).toBe(0)
+    expect(stderr.join('')).not.toMatch(/MCP-verbinding verloren/)
+  })
+
+  // Spec acceptance 7: a valid start, the child gone (1), a new start against an MCP without the runtimes field (78, no claim).
+  it('restarts after a lost child with exit 1 but not against an MCP that does not know HARNESS: 78, no claim, nothing prepared', async () => {
+    claims = [{ hangMs: 5000 }]
+    const first = start([])
+    await vi.waitFor(() => expect(waitCalls()).toBe(1))
+    await fakeMcp?.close()
+    expect(await first).toBe(1)
+
+    health = { runtimes: null }
+    claims = [{ job: ideaChatPayload() }]
+    const second = await start()
+    expect(second).toBe(78)
+    expect(stdioCalls).toHaveLength(2)
+    expect(fakeMcp?.calls.map((c) => c.name)).toEqual(['health']) // no wait_for_job, so no claim and no worktree
+  })
+})
+
