@@ -1,7 +1,7 @@
 ---
 title: "agent-harness.service op max2 (HARNESS-runtime): indeling, installeren, bijwerken en terugzetten"
 status: active
-last_updated: 2026-10-07
+last_updated: 2026-10-08
 ---
 
 # agent-harness.service op max2
@@ -138,9 +138,33 @@ Voor mcp-stable gaat het in deze volgorde, nadat `stop-check.sh` is geslaagd (en
 - Providersleutels (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) plaatst alleen JP, met `provider-key <NAAM>` aan een terminal. Zet ze nooit via een flow of een argument.
 - De sudoers-regels geven ops-agent precies de elf acties, elk met een vast argument en zonder jokerteken. Het bestand kent geen `SETENV` en geen `env_keep`, dus de overschrijfbare paden van de wrapper (`AH_*`, voor tests) blijven door sudo's omgevingsreset buiten bereik van een aanroeper.
 
-## Wat in 2e gebeurt
+## Stand na 2e
 
-- **Stap 8.1:** de oude dienst stoppen en uitschakelen (het eigen `local_llm`-recept), dan mcp-stable bijwerken zoals hierboven (doelcommit lezen, voorcontrole 2, `harness_mcp_update`, `mcp.built` vergelijken).
-- **Stap 8.2:** de eerste `HARNESS`-rij; vooraf de consumentenlijst van alle MCP-clients afwerken en controleren voor welke producten het token van de dienst jobs kan claimen.
-- **Stap 8.5:** `stop-check.sh` is niet nodig (de dienst draait nog niet): `harness_start`, dan `systemctl enable agent-harness.service` als root. De startcontrole bewijst mcp-stable.
-- Daarna geldt "Bijwerken en terugzetten" hierboven.
+De cutover (Scrum4Me-plan `docs/plans/M45-2e-harness-cutover.md`, "Status 2e") is uitgevoerd op 2026-10-08, 22:27–22:53 CEST.
+
+- **Diensten:**
+  - `agent-harness.service` is `active` en `enabled`, op `current` = `b0152a4`.
+  - De oude `agent-harness-worker.service` is `inactive` en `disabled`, maar nog aanwezig: verwijderen hoort bij increment 3 (spec §7.3).
+- **mcp-stable** staat op `eaac101` (`mcp.built`), met `mcp.prev` = `285c98a`.
+  - Nooit `harness_mcp_rollback` naar `285c98a` of een andere commit zonder `HARNESS`: er bestaan nu `HARNESS`-rijen.
+  - Terugzetten kan alleen naar een vastgelegde commit mét `HARNESS`.
+- **Configuraties en keuzes:**
+  - In de registry (workers `/settings/models`) staan `gsq-lokaal` en `qwen3.8-or` actief, gelijk aan `harness.json`.
+  - Productkeuzes (workers `/context`) alleen op Agent-harness: idee-chat `gsq-lokaal` met plafond $0,05, taken `qwen3.8-or` met $0,50.
+  - Een keuze op een ander product hoort pas bij een recept en een repo-root op max2.
+- **Bewezen in de praktijk:**
+  - De omgezette `local_llm`-job is door deze dienst beantwoord.
+  - Een idee-chat via Ollama, en een taak via OpenRouter met push en groene verify.
+  - Een plafond dat stopt (`COST_LIMIT_EXCEEDED`).
+  - Een onbekende configuratie (`UNKNOWN_CONFIGURATION`).
+  - `stop-check.sh` tijdens een lopende taak (exit 1), en daarna `stop-check.sh` (exit 0) plus de flow `update_agent_harness` (exit 0).
+- **Bijwerken en terugzetten:** zoals hierboven, altijd eerst `stop-check.sh`.
+- **Bekende punten:**
+
+  | Issue | Onderwerp |
+  |---|---|
+  | Agent-harness ISS-2 | geen worktree-opruiming na een taak |
+  | Agent-harness ISS-3 | `bench-workspace.test.ts` faalt in de verify-container |
+  | Agent-harness ISS-4 | een mislukte taakjob laat de taak op IN_PROGRESS |
+  | scrum4me-mcp ISS-13 | tokenscope niet afgedwongen bij de claim |
+  | scrum4me-mcp ISS-14 | verify-gate ALIGNED bij een wijziging buiten het plan |
