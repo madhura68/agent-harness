@@ -1,0 +1,21 @@
+# /etc/sudoers.d/agent-harness-ops (owner root:root, mode 0440). Install a changed copy only after `visudo -cf <bestand>` accepts it.
+#
+# One line per allowed action of the ops wrapper, with the exact argument and no wildcard. The interactive key action is not here: only
+# JP runs it, at a terminal. ops-agent calls the others through the flows; janpeter may run `stop`, for stop-check.sh on the admin machine
+# (whether janpeter may run more with sudo -n on max2 was not measured, so this line makes that independent).
+#
+# Environment: sudo's default reset of the environment stays in force, so the AH_ variables of the wrapper (paths and PATH, meant for
+# tests) never reach it from a caller. This file sets no environment option and adds no tag that would let the caller pass any variable:
+# with one of those a caller could point the wrapper at its own scripts and run them as root.
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh status
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh install
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh stop
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh start
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh probe
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh release-update
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh release-rollback
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh mcp-update
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh mcp-rollback
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh litellm-up
+ops-agent ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh litellm-upgrade
+janpeter ALL=(root) NOPASSWD: /usr/local/lib/agent-harness/ops/agent-harness-ops.sh stop

@@ -8,7 +8,7 @@ const MessageSchema = z.object({
   created_at: z.string(),
 })
 
-/** The IDEA_CHAT payload from scrum4me-mcp wait_for_job (source SYSTEM); prompt_text and config are ignored. */
+/** The IDEA_CHAT payload from scrum4me-mcp wait_for_job (source SYSTEM); prompt_text is ignored, and `config` (the configuration and the cost ceiling of the job) is read by job-configuration.ts. */
 export const IdeaChatPayloadSchema = z
   .object({
     job_id: z.string(),

@@ -1,5 +1,6 @@
 // Measurement script for the M45 trial window on max2 (increment 1). Node built-ins only: it runs from the clone on max2
-// without an npm install.
+// without an npm install. Trial tool only: the production config (config.yaml) no longer has the negative-control model
+// `qwen3.8-or-neg`, so the `meet` negative control only works against the increment-1 config of the trial.
 //
 //   node meet.mjs meet --base-url http://127.0.0.1:4000 --out <dir> [--timeout-sec 660]
 //   node meet.mjs proxy --listen 127.0.0.1:4001 --upstream http://127.0.0.1:4000 --log <file> [--timeout-sec 660]
@@ -39,6 +40,7 @@ import { parseArgs } from 'node:util'
 export const REDACTED = '<redacted>'
 export const MODEL_LOKAAL = 'gsq-lokaal'
 export const MODEL_GEHOST = 'qwen3.8-or'
+// Increment 1 only: the negative control exists in the trial config, not in the production config of 2d.
 export const MODEL_NEGATIEF = 'qwen3.8-or-neg'
 export const PROMPT = 'Antwoord alleen met: pong'
 // Just above the 600 s that LiteLLM gives an upstream request, so a time-out of LiteLLM itself arrives as an HTTP answer.

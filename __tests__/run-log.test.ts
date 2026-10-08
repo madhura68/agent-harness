@@ -22,6 +22,8 @@ function baseInit(overrides: Partial<RunLogInit> = {}): RunLogInit {
     jobId: 'job-1',
     kind: 'TASK_IMPLEMENTATION',
     model: { name: 'test-model', baseUrl: 'http://127.0.0.1:11434/v1' },
+    costMode: 'local',
+    maxCostUsd: '0.05',
     version: 'agent-harness@0.1.0',
     secrets: [],
     ...overrides,
@@ -125,6 +127,8 @@ describe('openRunLog: file creation (spec §5.1)', () => {
         jobId: 'job-abc',
         kind: 'TASK_IMPLEMENTATION',
         model: { name: 'qwen3-coder:30b', baseUrl: 'http://127.0.0.1:11434/v1' },
+        costMode: 'hosted',
+        maxCostUsd: '0.50',
         now: () => new Date('2026-09-28T10:00:00.000Z'),
       }),
     )
@@ -132,7 +136,7 @@ describe('openRunLog: file creation (spec §5.1)', () => {
     const lines = readLogLines()
     expect(lines[0]).toBe('2026-09-28T10:00:00.000Z [harness] claimed job_id=job-abc')
     expect(lines[1]).toBe(
-      '2026-09-28T10:00:00.000Z [harness] config job_id=job-abc runtime=HARNESS kind=TASK_IMPLEMENTATION model=qwen3-coder:30b base_url=http://127.0.0.1:11434/v1',
+      '2026-09-28T10:00:00.000Z [harness] config job_id=job-abc runtime=HARNESS kind=TASK_IMPLEMENTATION model=qwen3-coder:30b configuration=qwen3-coder:30b cost_mode=hosted max_cost_usd=0.50 base_url=http://127.0.0.1:11434/v1',
     )
   })
 

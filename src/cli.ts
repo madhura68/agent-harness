@@ -3,20 +3,24 @@ import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
+import { fetch } from 'undici'
 import type { ZodType } from 'zod'
 import { BenchCaseSchema } from './bench/case.js'
 import { DocsetError, runDocServer } from './bench/doc-server.js'
 import { assertExtraBody, loadManifest, ManifestError, ModelSpecSchema, resolveServerEnv } from './manifest.js'
-import { createModelClient } from './model-client.js'
-import { probeDir, runProbe } from './probe.js'
+import { createModelClient, type ModelClient } from './model-client.js'
+import { probeDir, runProbe, type ProbeResult } from './probe.js'
 import { runManifest } from './run.js'
 import { connectStdioClient, connectStdioRegistry, createRegistryView } from './tools/registry.js'
 import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
 import { checkRunLogs } from './worker/check-run-logs.js'
 import { loadWorkerConfig, TaskConfigSchema, workerMcpEnv, type WorkerConfig } from './worker/config.js'
-import { createControlChannel } from './worker/control.js'
+import { checkHarnessRuntime, createControlChannel } from './worker/control.js'
 import { capDocArgs } from './worker/doc-tools.js'
+import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './worker/exit-codes.js'
+import { runLogConfiguration, shown } from './worker/job-configuration.js'
+import { configurationHash, litellmFileHashes, probeVerdict } from './worker/probe-gate.js'
 import { collectSecretEntries, collectSecretValues, workerSecretSources } from './worker/redact.js'
 import { openRunLog } from './worker/run-log.js'
 import { runWorker } from './worker/worker.js'
@@ -25,9 +29,10 @@ const USAGE = `harness — agent-harness v0
 
 Usage:
   harness probe --base-url <url> --model <name> [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>] [--extra-body-file <json>]
+  harness probe --config <harness.json> (--configuration <name> | --all) [--out <runs-dir>] [--api-key-env <VAR>] [--step-timeout <sec>]
   harness run <manifest.json> --out <dir> [--skip-probe] [--api-key-env <VAR>]
-  harness worker --config <worker.json> [--out <runs-dir>] [--once] [--skip-probe] [--api-key-env <VAR>]
-  harness check-run-logs --config <worker.json> --dir <run-logs-dir>
+  harness worker --config <worker.json> --api-key-env <VAR> [--out <runs-dir>] [--once]
+  harness check-run-logs --config <worker.json> --dir <run-logs-dir> [--api-key-env <VAR>]
   harness doc-server --dir <docset-dir> --product-id <id>
   harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]
   harness task-bench --check-case --case <json> --task-config <json> --out <dir>
@@ -47,6 +52,8 @@ export const cliArgsConfig = {
     'extra-body-file': { type: 'string' },
     'skip-probe': { type: 'boolean' },
     config: { type: 'string' },
+    configuration: { type: 'string' },
+    all: { type: 'boolean' },
     once: { type: 'boolean' },
     dir: { type: 'string' },
     'product-id': { type: 'string' },
@@ -79,7 +86,7 @@ function rejectExtraBodyFile(values: Values, command: 'run' | 'worker' | 'task-b
   if (values['extra-body-file'] === undefined) return
   const where = {
     run: 'the model block of the manifest (model.extraBody)',
-    worker: 'the model block of the worker config (model.extraBody)',
+    worker: 'a configuration of the worker config (configurations.<name>.extraBody)',
     'task-bench': 'the --model-config file (extraBody)',
   }[command]
   throw new UsageError(`--extra-body-file only applies to harness probe; for harness ${command} put extraBody in ${where}`)
@@ -106,26 +113,87 @@ function readExtraBodyFile(path: string): Record<string, unknown> {
   return extraBody
 }
 
+function readStepTimeoutMs(values: Values): number {
+  const stepTimeoutSec = Number(values['step-timeout'] ?? '120')
+  if (!Number.isFinite(stepTimeoutSec) || stepTimeoutSec <= 0) throw new UsageError('--step-timeout must be a positive number of seconds')
+  return stepTimeoutSec * 1000
+}
+
+function printProbeSteps(result: ProbeResult, label = ''): void {
+  for (const [name, s] of Object.entries(result.steps)) {
+    process.stdout.write(`${label}${s.pass ? 'PASS' : 'FAIL'} ${name}: ${s.reason}\n`)
+  }
+}
+
 async function cmdProbe(values: Values): Promise<number> {
+  if (values.config !== undefined) return cmdProbeConfigurations(values, values.config)
+  if (values.configuration !== undefined || values.all === true) throw new UsageError('probe: --configuration and --all need --config')
   const baseUrl = values['base-url']
   const model = values.model
   if (!baseUrl || !model) throw new UsageError('probe needs --base-url and --model')
-  const stepTimeoutSec = Number(values['step-timeout'] ?? '120')
-  if (!Number.isFinite(stepTimeoutSec) || stepTimeoutSec <= 0) throw new UsageError('--step-timeout must be a positive number of seconds')
+  const stepTimeoutMs = readStepTimeoutMs(values)
   const extraBodyFile = values['extra-body-file']
   const extraBody = extraBodyFile === undefined ? undefined : readExtraBodyFile(extraBodyFile)
   const apiKey = readApiKey(values['api-key-env'])
   const client = createModelClient({ baseUrl, name: model, apiKey, extraBody })
-  const result = await runProbe(client, { baseUrl, model, stepTimeoutMs: stepTimeoutSec * 1000 })
+  const result = await runProbe(client, { baseUrl, model, stepTimeoutMs })
   const dir = probeDir(values.out ?? 'runs', model)
   mkdirSync(dir, { recursive: true })
   const file = join(dir, 'probe.json')
   writeFileSync(file, JSON.stringify(result, null, 2) + '\n')
-  for (const [name, s] of Object.entries(result.steps)) {
-    process.stdout.write(`${s.pass ? 'PASS' : 'FAIL'} ${name}: ${s.reason}\n`)
-  }
+  printProbeSteps(result)
   process.stdout.write(`tool_calling: ${result.tool_calling} (usage_reported: ${result.usage_reported}) → ${file}\n`)
   return result.tool_calling === 'reliable' ? 0 : 1
+}
+
+/**
+ * `harness probe --config <harness.json> (--configuration <name> | --all)`: probes configurations of the worker config through LiteLLM,
+ * each under its own name with its own request fields, and writes `<out>/probe-<name>/probe.json` with the hash, the verdict and the cost
+ * of every answer (spec §4.2). It reads the config and the two LiteLLM files and nothing else: no environment is expanded and no MCP child
+ * starts, so a probe unit runs with the master key alone. Exit 0 only when every probed configuration is accepted.
+ */
+async function cmdProbeConfigurations(values: Values, configPath: string): Promise<number> {
+  const one = values.configuration
+  if ((one !== undefined) === (values.all === true)) throw new UsageError('probe --config needs exactly one of --configuration <name> and --all')
+  for (const flag of ['base-url', 'model', 'extra-body-file'] as const) {
+    if (values[flag] !== undefined) {
+      throw new UsageError(
+        flag === 'extra-body-file'
+          ? '--extra-body-file does not apply to probe --config: the extraBody of a configuration is probed as it is (configurations.<name>.extraBody)'
+          : `--${flag} does not apply to probe --config: the configuration names the model and LiteLLM is its base URL`,
+      )
+    }
+  }
+  const stepTimeoutMs = readStepTimeoutMs(values)
+  const config = loadWorkerConfig(configPath)
+  if (one !== undefined && !Object.hasOwn(config.configurations, one)) {
+    throw new UsageError(`--configuration ${shown(one)} is not a configuration of ${configPath} (it has: ${Object.keys(config.configurations).join(', ')})`)
+  }
+  const names = one !== undefined ? [one] : Object.keys(config.configurations)
+  const apiKey = readApiKey(values['api-key-env'])
+  let files: ReturnType<typeof litellmFileHashes>
+  try {
+    files = litellmFileHashes(config.litellm)
+  } catch (err) {
+    throw new ManifestError(err instanceof Error ? err.message : String(err))
+  }
+  const out = values.out ?? 'runs'
+  let allAccepted = true
+  for (const name of names) {
+    const configuration = config.configurations[name]
+    const result = await runProbe(createConfigurationClient(config, name, apiKey), { baseUrl: config.litellm.baseUrl, model: name, stepTimeoutMs })
+    const verdict = probeVerdict(result, configuration)
+    const dir = probeDir(out, name)
+    mkdirSync(dir, { recursive: true })
+    const file = join(dir, 'probe.json')
+    const hash = configurationHash({ name, ...configuration }, files)
+    writeFileSync(file, JSON.stringify({ ...result, configuration: name, costMode: configuration.costMode, hash, accepted: verdict.accepted, reasons: verdict.reasons }, null, 2) + '\n')
+    printProbeSteps(result, `${name}: `)
+    process.stdout.write(`${name}: tool_calling: ${result.tool_calling} (usage_reported: ${result.usage_reported}), ${verdict.accepted ? 'accepted' : 'NOT accepted'} → ${file}\n`)
+    for (const reason of verdict.reasons) process.stdout.write(`${name}: ${reason}\n`)
+    if (!verdict.accepted) allAccepted = false
+  }
+  return allAccepted ? 0 : 1
 }
 
 /** Spec §7: a tools run needs a reliable probe for the same baseUrl + model, unless --skip-probe. */
@@ -201,9 +269,8 @@ function harnessVersion(): string {
 }
 
 /**
- * The model block that `harness worker` gives its model client. Without --api-key-env that is the block as loaded. With it, the
- * key is the value of that variable and beats a model.apiKey in the config, as in `harness run`. The block passed in stays as it
- * is, so the key reaches the client and nothing else.
+ * The master key of LiteLLM for `harness worker`: the value of the variable that --api-key-env names, or no key without the option.
+ * It goes to the model clients and to the check of the LiteLLM models, and nowhere else: the worker config has no place for a key.
  *
  * The worker masks secrets in a run-log by what process.env holds (workerSecretSources): the value of a variable with a
  * secret-like name, from 8 characters up. `harness check-run-logs` picks its secrets the same way and counts a shorter one as a
@@ -211,8 +278,8 @@ function harnessVersion(): string {
  * unmasked, so both are refused. The checks call the redaction's own functions, because a copy of its name pattern or its
  * minimum length could drift away from it.
  */
-export function resolveWorkerModel(model: WorkerConfig['model'], apiKeyEnv: string | undefined, env: Record<string, string | undefined>): WorkerConfig['model'] {
-  if (apiKeyEnv === undefined) return model
+export function resolveWorkerApiKey(apiKeyEnv: string | undefined, env: Record<string, string | undefined>): string | undefined {
+  if (apiKeyEnv === undefined) return undefined
   // An empty name (a shell variable that expanded to nothing) is no reason to run without a key.
   if (apiKeyEnv === '') throw new UsageError('--api-key-env needs the name of an environment variable')
   const apiKey = env[apiKeyEnv]
@@ -226,24 +293,128 @@ export function resolveWorkerModel(model: WorkerConfig['model'], apiKeyEnv: stri
   if (!collectSecretValues({ [apiKeyEnv]: apiKey }).includes(apiKey)) {
     throw new UsageError(`--api-key-env: the value of ${apiKeyEnv} is shorter than 8 characters, which the worker's redaction does not mask`)
   }
-  return { ...model, apiKey }
+  return apiKey
 }
 
-async function cmdWorker(values: Values): Promise<number> {
+/** The model client of one configuration: LiteLLM's address, the configuration's name as the model, its own request fields, the shared key. */
+function createConfigurationClient(config: WorkerConfig, name: string, apiKey: string | undefined): ModelClient {
+  const c = config.configurations[name]
+  return createModelClient({ baseUrl: config.litellm.baseUrl, name, apiKey, reasoningEffort: c.reasoningEffort, extraBody: c.extraBody })
+}
+
+/** One model client per configuration of the worker config. */
+function createConfigurationClients(config: WorkerConfig, apiKey: string | undefined): Record<string, ModelClient> {
+  return Object.fromEntries(Object.keys(config.configurations).map((name) => [name, createConfigurationClient(config, name, apiKey)]))
+}
+
+const LITELLM_MODELS_TIMEOUT_MS = 15_000
+
+/** A URL for a log line: without any credentials it carries. */
+function plainUrl(url: string): string {
+  try {
+    const u = new URL(url)
+    u.username = ''
+    u.password = ''
+    return u.toString()
+  } catch {
+    return '<ongeldige url>'
+  }
+}
+
+type ModelsCheck = { ok: true } | { ok: false; exitCode: ExitCode; line: string }
+
+/**
+ * The start check against LiteLLM (spec §4.1): `GET <litellm.baseUrl>/models` with the master key, and the model names it serves must be
+ * exactly the configurations of the worker. Not reachable, or no usable answer (a network error, a 5xx): 1, because a restart may
+ * find LiteLLM up. A refused key (401, 403), a configuration LiteLLM does not know, or a LiteLLM model without a configuration: 78,
+ * because the same files give the same refusal at every restart. The line to print comes with the refusal; it holds both lists and never the key.
+ */
+export async function checkLitellmModels(config: WorkerConfig, apiKey: string | undefined): Promise<ModelsCheck> {
+  const url = `${config.litellm.baseUrl.replace(/\/+$/, '')}/models`
+  // The reason is a status or an error name and code, never an error message: undici's messages can quote the URL, credentials included.
+  const unreachable = (why: string): ModelsCheck => ({ ok: false, exitCode: EXIT_RESTART, line: `LITELLM_UNREACHABLE: GET ${plainUrl(url)} mislukt (${why})` })
+  let served: string[]
+  try {
+    const res = await fetch(url, { headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {}, signal: AbortSignal.timeout(LITELLM_MODELS_TIMEOUT_MS) })
+    // A refused key is refused again at every restart, so 78; the body is not shown, because it may echo the key.
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, exitCode: EXIT_NO_RESTART, line: `LITELLM_AUTH_FAILED: GET ${plainUrl(url)} gaf HTTP ${res.status}; controleer de masterkey van --api-key-env` }
+    }
+    if (!res.ok) return unreachable(`HTTP ${res.status}`)
+    const body: unknown = await res.json().catch(() => undefined)
+    const data = (body as { data?: unknown } | null | undefined)?.data
+    if (!Array.isArray(data) || data.some((m) => typeof (m as { id?: unknown } | null)?.id !== 'string')) return unreachable('antwoord is geen modellijst')
+    served = data.map((m: { id: string }) => m.id)
+  } catch (err) {
+    const code = (err as { cause?: { code?: unknown } } | null)?.cause?.code
+    return unreachable(`${err instanceof Error ? err.name : 'fout'}${typeof code === 'string' ? ` ${code}` : ''}`)
+  }
+  const configured = Object.keys(config.configurations)
+  const notInLitellm = configured.filter((name) => !served.includes(name))
+  const withoutConfiguration = served.filter((id) => !configured.includes(id))
+  if (notInLitellm.length === 0 && withoutConfiguration.length === 0) return { ok: true }
+  return {
+    ok: false,
+    exitCode: EXIT_NO_RESTART,
+    line:
+      `LITELLM_MODELS_MISMATCH: configuraties=${JSON.stringify(configured)}; litellm=${JSON.stringify(served)}; ` +
+      `niet in litellm: ${JSON.stringify(notInLitellm)}; zonder configuratie: ${JSON.stringify(withoutConfiguration)}`,
+  }
+}
+
+/**
+ * Everything a worker start needs before the MCP child exists: the config, the key, the env of the child, the LiteLLM check. Nothing here
+ * starts a process or registers a worker, so a refusal leaves nothing behind. Returns an exit code instead of a start when LiteLLM refuses.
+ */
+async function prepareWorker(values: Values) {
   if (!values.config) throw new UsageError('worker needs --config')
+  // The per-job probe gate (src/worker/probe-gate.ts) has no bypass, so this worker has no such option; an unknown option is a usage error.
+  if (values['skip-probe'] !== undefined) throw new UsageError("Unknown option '--skip-probe' for harness worker: the probe gate per job cannot be skipped")
   rejectExtraBodyFile(values, 'worker')
   const out = values.out ?? 'runs'
   const config = loadWorkerConfig(values.config)
-  // Read before the probe gate and before anything starts, like harness run, so a bad --api-key-env fails with no MCP process.
-  // Only the model client gets the key: `config` keeps the model block as loaded, so the run-log, the manifest and the trace never carry it.
-  const clientModel = resolveWorkerModel(config.model, values['api-key-env'], process.env)
-  if (values['skip-probe'] !== true && !passesProbeGate(config.model, out)) return 1
+  // Read before anything starts, like harness run, so a bad --api-key-env fails with no MCP process.
+  // Only the model clients and the LiteLLM check get the key: `config` never holds it, so the run-log, the manifest and the trace never carry it.
+  // The master key is required: without it LiteLLM answers 401 at every start.
+  if (values['api-key-env'] === undefined) throw new UsageError('worker needs --api-key-env (the variable that holds the master key of LiteLLM)')
+  const apiKey = resolveWorkerApiKey(values['api-key-env'], process.env)
   // Expand ${VAR} before anything starts; the values only travel to the MCP child process.
   const env = workerMcpEnv(config)
+  const refusal = await checkLitellmModels(config, apiKey)
+  if (!refusal.ok) {
+    process.stderr.write(`${refusal.line}\n`)
+    return refusal.exitCode
+  }
+  return { out, config, apiKey, env }
+}
+
+/** The exit code of a start error that comes before the MCP child: a bad config, flag or variable is the same at every restart, so 78 (not 1). */
+function startErrorExit(err: unknown): ExitCode {
+  if (err instanceof UsageError) {
+    process.stderr.write(`${err.message}\n${USAGE}`)
+    return EXIT_NO_RESTART
+  }
+  if (err instanceof ManifestError) {
+    process.stderr.write(`${err.message}\n`)
+    return EXIT_NO_RESTART
+  }
+  throw err
+}
+
+async function cmdWorker(values: Values): Promise<number> {
+  let prepared: Awaited<ReturnType<typeof prepareWorker>>
+  try {
+    prepared = await prepareWorker(values)
+  } catch (err) {
+    return startErrorExit(err)
+  }
+  if (typeof prepared === 'number') return prepared
+  const { out, config, apiKey, env } = prepared
+  const modelClients = createConfigurationClients(config, apiKey)
   // Computed once per worker run, not per job: the version never changes mid-run, and re-scanning every
   // secret source on every claim would be wasted work.
   const version = harnessVersion()
-  const secrets = collectSecretValues(...workerSecretSources(config, process.env))
+  const secrets = collectSecretValues(...workerSecretSources(config, process.env, values['api-key-env']))
 
   const stop = new AbortController()
   let interrupts = 0
@@ -256,22 +427,51 @@ async function cmdWorker(values: Values): Promise<number> {
   process.on('SIGINT', onSignal)
   process.on('SIGTERM', onSignal)
   let conn: Awaited<ReturnType<typeof connectStdioClient>> | undefined
+  // The MCP child is lost when its connection closes and the harness did not close it itself. Nothing can be reported to it any more,
+  // so the loop stops (a running job is left) and the worker exits 1: a restart brings a new child, and a new start check.
+  let closing = false
+  let mcpLost = false
+  const onMcpClosed = () => {
+    if (closing || mcpLost) return
+    mcpLost = true
+    process.stderr.write('MCP-verbinding verloren: het MCP-kindproces is weg; een lopende job wordt verlaten. Worker stopt.\n')
+    stop.abort()
+  }
   try {
+    // Every step that can fail without an MCP child comes before this line (config, the key, the LiteLLM check: prepareWorker). Then no
+    // child exists and nothing is registered in claude_workers.
     conn = await connectStdioClient({ ...config.mcp, env }, stop.signal)
     const client = conn.client
+    client.onclose = onMcpClosed
+    // Start check before the first claim: an MCP release that does not know HARNESS would register this worker under a runtime it lacks.
+    let startCheck: Awaited<ReturnType<typeof checkHarnessRuntime>>
+    try {
+      startCheck = await checkHarnessRuntime(client)
+    } catch (err) {
+      // The call itself failed (a lost child, an SDK request timeout, any other transport error): that says nothing about the MCP's runtimes, and
+      // a new start can succeed, so it is a restart (1). Only an answer that lacks HARNESS (checkHarnessRuntime returns it) is a refusal (78).
+      process.stderr.write(`health-aanroep van de startcontrole mislukt (${err instanceof Error ? err.message : String(err)}); herstart\n`)
+      return EXIT_RESTART
+    }
+    if (!startCheck.ok) {
+      process.stderr.write(`${startCheck.line}\n`)
+      return EXIT_NO_RESTART
+    }
     const { exitCode, jobs } = await runWorker({
       control: createControlChannel(client),
       registryView: async (signal) => capDocArgs(await createRegistryView(client, config.allow, signal)),
-      modelClient: createModelClient(clientModel),
+      modelClients,
       config,
       out,
       once: values.once === true,
       signal: stop.signal,
-      runLogFor: (claim) => openRunLog(config.workerLog, { jobId: claim.jobId, kind: claim.kind, model: config.model, version, secrets }),
+      runLogFor: (claim) => openRunLog(config.workerLog, { jobId: claim.jobId, kind: claim.kind, ...runLogConfiguration(config, claim.payload), version, secrets }),
     })
     process.stdout.write(`worker klaar — ${jobs.length} job(s): ${jobs.map((j) => `${j.jobId}=${j.outcome}`).join(', ') || 'geen'}\n`)
-    return exitCode
+    // Lost child beats the loop's own result: the loop was stopped by the loss, which reads as a clean stop (0) to it.
+    return mcpLost && exitCode === EXIT_STOPPED ? EXIT_RESTART : exitCode
   } finally {
+    closing = true // the harness's own close below is no loss
     process.off('SIGINT', onSignal)
     process.off('SIGTERM', onSignal)
     await conn?.close().catch(() => undefined)
@@ -287,7 +487,10 @@ async function cmdCheckRunLogs(values: Values): Promise<number> {
   if (!values.config) throw new UsageError('check-run-logs needs --config')
   if (!values.dir) throw new UsageError('check-run-logs needs --dir')
   const config = loadWorkerConfig(values.config)
-  const { checked, results } = checkRunLogs(config, process.env, values.dir)
+  // The master key of the worker counts as a secret too. A variable that is not set is an error and not "nothing to check", so it cannot pass in silence.
+  const apiKeyEnv = values['api-key-env']
+  if (apiKeyEnv !== undefined && !process.env[apiKeyEnv]) throw new UsageError(`--api-key-env: environment variable ${apiKeyEnv} is not set or empty`)
+  const { checked, results } = checkRunLogs(config, process.env, values.dir, apiKeyEnv)
   process.stdout.write(`${checked} geheim(en) gecontroleerd in ${values.dir}\n`)
   for (const r of results) process.stdout.write(`  ${r.name}: treffers=${r.hits} kort=${r.short}\n`)
   // Exit 1 on any hit, and also when nothing was checked at all: that usually means this ran without

@@ -6,7 +6,7 @@ last_updated: 2026-10-05
 
 # LiteLLM op max2 (M45)
 
-LiteLLM zet de harness voor één aanroepvorm (`POST /v1/chat/completions`) voor een lokale en een gehoste configuratie. In M45 increment 1 is het een **praktijkproef**: LiteLLM draait alleen tijdens een venster op max2, en Scrum4Me verandert niet. De spec en het plan staan in Scrum4Me:
+LiteLLM zet de harness voor één aanroepvorm (`POST /v1/chat/completions`) voor een lokale en een gehoste configuratie. In M45 increment 1 was het een **praktijkproef**: LiteLLM draaide alleen tijdens een venster op max2, en Scrum4Me veranderde niet. Dit runbook beschrijft die proef en haar uitslagen. **Sinds 2d** staan de bestanden in `deploy/max2/litellm/` in productievorm (altijd aan, `restart: unless-stopped`, zonder `qwen3.8-or-neg`, de brug een ingeschakelde unit) en worden ze geïnstalleerd en beheerd door de ops-wrapper: zie [harness-service-max2.md](harness-service-max2.md). De tabellen hieronder beschrijven de bestanden zoals ze in de proef waren; waar de productie afwijkt, staat dat erbij. De spec en het plan staan in Scrum4Me:
 - `docs/superpowers/specs/2026-10-05-harness-runtime-design.md` (de spec);
 - `docs/plans/M45-harness-runtime-litellm.md` (het plan). De volledige vensterprocedure staat in Taak 3 van dat plan.
 
@@ -14,16 +14,16 @@ LiteLLM zet de harness voor één aanroepvorm (`POST /v1/chat/completions`) voor
 
 | Bestand | Rol |
 |---|---|
-| `deploy/max2/litellm/compose.yml` | Project en container `litellm`, image vastgepind op digest (v1.83.3-stable, dezelfde als Scrum4Us), poort alleen `127.0.0.1:4000`, netwerk `litellm` (bridge `br-litellm`, `172.30.82.0/24`, gateway `172.30.82.1`, niet internal want OpenRouter vraagt egress), `restart: "no"`, `mem_limit 2g`, `pids_limit 512`, `no-new-privileges`, healthcheck op `/health/liveliness` |
-| `deploy/max2/litellm/config.yaml` | De drie configuraties hieronder; `turn_off_message_logging: true`; `router_settings.disable_cooldowns: true` (zie de droge proef); master key uit de omgeving; geen database, geen callbacks |
-| `deploy/max2/litellm/litellm-ollama-bridge.service` | socat op `172.30.82.1:11434` naar de Ollama van de host (`127.0.0.1:11434`), een kopie van `dsh-ollama-bridge.service`. In increment 1 alleen **gestart**, nooit `enable`d |
+| `deploy/max2/litellm/compose.yml` | Project en container `litellm`, image vastgepind op digest (v1.83.3-stable, dezelfde als Scrum4Us), poort alleen `127.0.0.1:4000`, netwerk `litellm` (bridge `br-litellm`, `172.30.82.0/24`, gateway `172.30.82.1`, niet internal want OpenRouter vraagt egress), `restart: "no"` in de proef (productie: `unless-stopped`), `mem_limit 2g`, `pids_limit 512`, `no-new-privileges`, healthcheck op `/health/liveliness` |
+| `deploy/max2/litellm/config.yaml` | De drie configuraties hieronder (productie: de eerste twee); `turn_off_message_logging: true`; `router_settings.disable_cooldowns: true` (zie de droge proef); master key uit de omgeving; geen database, geen callbacks |
+| `deploy/max2/litellm/litellm-ollama-bridge.service` | socat op `172.30.82.1:11434` naar de Ollama van de host (`127.0.0.1:11434`), een kopie van `dsh-ollama-bridge.service`. In increment 1 alleen **gestart**, nooit `enable`d; sinds 2d een ingeschakelde unit die `litellm-up` start |
 | `deploy/max2/litellm/meet.mjs` | Het meetscript van de proef (modi `meet`, `proxy`, `manifesten`, `opzoeken`) |
 
 | Configuratie | Route | Bijzonderheden |
 |---|---|---|
 | `gsq-lokaal` | `openai/qwen3.8-gsq-rco:27b-iq3_s-text` via de brug | `api_key: "none"`, `timeout: 600` |
 | `qwen3.8-or` | `openrouter/qwen/qwen3.8-27b` | `extra_body.provider`: `quantizations: ["bf16"]`, `data_collection: "deny"`, `require_parameters: true`, `allow_fallbacks: false` |
-| `qwen3.8-or-neg` | als `qwen3.8-or` | alleen increment 1: `provider: {only: ["bestaat-niet"], allow_fallbacks: false}`. Komt het provider-blok aan, dan faalt elke aanvraag bij OpenRouter (de negatieve controle) |
+| `qwen3.8-or-neg` | als `qwen3.8-or` | alleen increment 1, niet in de productieconfig: `provider: {only: ["bestaat-niet"], allow_fallbacks: false}`. Komt het provider-blok aan, dan faalt elke aanvraag bij OpenRouter (de negatieve controle) |
 
 De container heet `litellm` en nooit iets met het naamvoorvoegsel van de harness-containers: een worker met task-config ruimt zulke containers op bij zijn start.
 

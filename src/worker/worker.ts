@@ -1,3 +1,4 @@
+import { createCostGuard, parseCeilingNanos, type CostGuard } from '../cost.js'
 import type { Manifest } from '../manifest.js'
 import type { ModelClient } from '../model-client.js'
 import { runManifest } from '../run.js'
@@ -6,8 +7,12 @@ import type { ToolRegistry } from '../types.js'
 import type { WorkerConfig } from './config.js'
 import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
+import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './exit-codes.js'
+import { costFailureText, costLogLine, sendFinalStatus, withMeasured } from './final-status.js'
 import { startHeartbeat } from './heartbeat.js'
 import { IDEA_CHAT_SYSTEM_PROMPT, IdeaChatPayloadSchema, pendingUserMessages, renderIdeaChatUserMessage } from './idea-chat.js'
+import { failBeforeRunning, limitsFor, modelClientFor, modelSpecFor, resolveJobConfiguration } from './job-configuration.js'
+import { checkProbeForJob } from './probe-gate.js'
 import type { RunLog } from './run-log.js'
 import { ContainerUncertainError, runTaskJob, type TaskJobContext } from './task-impl.js'
 
@@ -15,7 +20,8 @@ export type WorkerDeps = {
   control: ControlChannel
   /** Allowlist view on the shared MCP connection; closing it leaves the connection open. */
   registryView: (signal?: AbortSignal) => Promise<ToolRegistry>
-  modelClient: ModelClient
+  /** One model client per configuration of `config`, by name; each job runs through the client of the configuration its payload names. */
+  modelClients: Record<string, ModelClient>
   config: WorkerConfig
   out: string
   once: boolean
@@ -74,6 +80,8 @@ function runIdFor(jobId: string): string {
 }
 
 function failureText(result: RunResult, config: WorkerConfig): string {
+  const costText = costFailureText(result)
+  if (costText) return costText
   if (result.error) return `${result.status}: ${result.error.code} ${result.error.message}`
   if (result.status === 'timed_out') return `timed_out: geen antwoord binnen maxWallSeconds=${config.limits.maxWallSeconds}`
   if (result.status === 'budget_exceeded') {
@@ -82,19 +90,16 @@ function failureText(result: RunResult, config: WorkerConfig): string {
   return `${result.status}: onbekende fout`
 }
 
-/** What to send when the run ended; null = send nothing (ownership lost). */
-function closingUpdate(result: RunResult, config: WorkerConfig): StatusUpdate {
+/** What to send when the run ended, without the tokens and the cost (`close` adds those). `configuration` is the name the provider's own model name falls back to. */
+function closingUpdate(result: RunResult, config: WorkerConfig, configuration: string): StatusUpdate {
   if (result.status === 'completed') {
     const answer = result.answer ?? ''
-    const modelId = result.model.reported ?? config.model.name
+    const modelId = result.model.reported ?? configuration
     if (answer.trim() === '') return { status: 'failed', error: `leeg antwoord van ${modelId}` }
     return {
       status: 'done',
       summary: cut(answer, SUMMARY_LIMIT, TRUNCATED_MARK),
       model_id: modelId,
-      ...(result.usage.source === 'provider_reported'
-        ? { input_tokens: result.usage.inputTokens, output_tokens: result.usage.outputTokens }
-        : {}),
     }
   }
   return { status: 'failed', error: cut(failureText(result, config), ERROR_LIMIT) }
@@ -144,8 +149,15 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const { jobId } = claim
 
-  const close = async (update: StatusUpdate): Promise<JobOutcome> => {
-    const res = await control.updateStatus(jobId, update)
+  // What the final status carries besides its own fields (M45-2d): the tokens of the run and the cost the guard of the job counted. Both
+  // stay empty for a job that never got as far as a run, which reports no cost figure.
+  let guard: CostGuard | undefined = undefined
+  let runUsage: RunResult['usage'] | undefined
+  let ceiling = 'ontbrekend'
+  const close = async (update: StatusUpdate, measured = true): Promise<JobOutcome> => {
+    const final = measured ? withMeasured(update, runUsage, guard) : update
+    if (final.cost) runLog?.meta(costLogLine(final.cost, ceiling))
+    const res = await sendFinalStatus(control, jobId, final)
     if (!res.ok) log(`job ${jobId}: update_job_status(${update.status}) mislukt: ${res.message ?? 'onbekend'}`)
     runLog?.step(`job_status ${update.status === 'done' ? 'done' : 'failed'}`)
     return update.status === 'done' ? 'done' : 'failed'
@@ -154,7 +166,7 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   // Second lock behind the claim filter: this worker runs IDEA_CHAT and TASK_IMPLEMENTATION only.
   if (claim.kind !== 'IDEA_CHAT') {
     runLog?.fail('CLAIM_FILTER', `kind ${claim.kind} niet ondersteund door agent-harness`)
-    await close({ status: 'failed', error: `kind ${claim.kind} niet ondersteund door agent-harness` })
+    await close({ status: 'failed', error: `kind ${claim.kind} niet ondersteund door agent-harness` }, false) // not a job of this worker: no cost report
     throw new ClaimFilterError(`kind ${claim.kind}`)
   }
   const parsed = IdeaChatPayloadSchema.safeParse(claim.payload)
@@ -169,6 +181,15 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
     runLog?.fail('JOB_FAILED', 'geen onbeantwoord USER-bericht')
     return close({ status: 'failed', error: 'geen onbeantwoord USER-bericht' })
   }
+  // The job's own configuration and cost ceiling, from its payload: one that this worker does not have fails this job only, before it runs.
+  const resolved = resolveJobConfiguration(config, claim.payload)
+  if (!resolved.ok) return failBeforeRunning(deps, jobId, runLog, resolved.failure)
+  const job = resolved.job
+  // The probe gate of that configuration, after the configuration and the ceiling and before running: no accepted probe of the hash it has now fails this job only.
+  const probed = checkProbeForJob(config, deps.out, job.name)
+  if (!probed.ok) return failBeforeRunning(deps, jobId, runLog, probed.failure, job.maxCostUsd)
+  ceiling = job.maxCostUsd
+  guard = createCostGuard({ mode: job.configuration.costMode, ceilingNanos: parseCeilingNanos(job.maxCostUsd), configuration: job.name })
 
   const running = await control.updateStatus(jobId, { status: 'running' })
   if (!running.ok) {
@@ -197,18 +218,21 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
       profile: 'tools',
       system: IDEA_CHAT_SYSTEM_PROMPT,
       prompt: renderIdeaChatUserMessage(payload),
-      model: config.model,
+      model: modelSpecFor(config, job),
       tools: { server: { command: 'shared', args: [] }, allow: config.allow },
-      limits: config.limits,
+      limits: limitsFor(config.limits, job),
     }
     const result = await runManifest(manifest, {
-      client: deps.modelClient,
+      client: modelClientFor(deps.modelClients, job.name),
       trace: runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId),
       connectRegistry: (signal) => deps.registryView(signal),
       signal: inner.signal,
       runStartExtra: { jobId, ideaId: payload.idea.id },
+      costGuard: guard,
+      retryOnce: job.configuration.costMode === 'hosted',
     })
-    update = closingUpdate(result, config)
+    runUsage = result.usage
+    update = closingUpdate(result, config, job.name)
     if (update.status === 'failed') failInfo = { code: ideaChatFailCode(result), message: update.error ?? '' }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -237,7 +261,12 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
   return outcome
 }
 
-export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId: string; outcome: JobOutcome }>; exitCode: 0 | 1 }> {
+/** The runtime a claimed payload says it was made for (`config.runtime`); anything but a string is no runtime at all. */
+function payloadRuntime(payload: unknown): unknown {
+  return (payload as { config?: { runtime?: unknown } } | null | undefined)?.config?.runtime
+}
+
+export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId: string; outcome: JobOutcome }>; exitCode: ExitCode }> {
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const jobs: Array<{ jobId: string; outcome: JobOutcome }> = []
   // Leftover harness containers from a crash: clean them up before the first task. Idea-chat never waits on
@@ -254,24 +283,36 @@ export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId
     },
   }
   for (;;) {
-    if (deps.signal.aborted) return { jobs, exitCode: 0 }
+    if (deps.signal.aborted) return { jobs, exitCode: EXIT_STOPPED }
     const claim = await deps.control.waitForJob(deps.config.waitSeconds, deps.signal)
     switch (claim.type) {
       case 'stopped':
-        return { jobs, exitCode: 0 }
+        return { jobs, exitCode: EXIT_STOPPED }
       case 'timeout':
-        if (deps.once) return { jobs, exitCode: 0 }
+        if (deps.once) return { jobs, exitCode: EXIT_STOPPED }
         continue
       case 'error':
         log(`wait_for_job: ${claim.message}`)
-        if (deps.once) return { jobs, exitCode: 1 }
+        if (deps.once) return { jobs, exitCode: EXIT_RESTART }
         await sleep(deps.errorBackoffMs ?? 5000, deps.signal)
         continue
+      case 'runtime_mismatch':
+        // The MCP gave the claim back itself (the job stays QUEUED), so there is nothing to close. A restart would meet the same job and the same refusal.
+        log('RUNTIME_MISMATCH: de MCP gaf de claim terug omdat de runtime van de job niet bij deze worker hoort. Worker stopt zonder herstart.')
+        return { jobs, exitCode: EXIT_NO_RESTART }
       case 'broken':
         // A claim may have landed server-side; its job returns to QUEUED through the lease reset.
         log(`MCP-verbinding onbruikbaar (${claim.message}); uitkomst van een eventueel lopende claim onbekend. Worker stopt.`)
-        return { jobs, exitCode: 1 }
+        return { jobs, exitCode: EXIT_RESTART }
       case 'job': {
+        // Own check, for an MCP without the claim check of M45-2b: a job that is not ours is left alone (no update_job_status, no run-log);
+        // against such an MCP its lease runs out and the job returns to the queue. A payload without config.runtime is no HARNESS payload.
+        const runtime = payloadRuntime(claim.payload)
+        if (runtime !== 'HARNESS') {
+          jobs.push({ jobId: claim.jobId, outcome: 'abandoned' })
+          log(`RUNTIME_MISMATCH (eigen controle): job ${claim.jobId} heeft config.runtime=${JSON.stringify(runtime)?.slice(0, 60) ?? 'ontbrekend'}; niet aangeraakt. Worker stopt zonder herstart.`)
+          return { jobs, exitCode: EXIT_NO_RESTART }
+        }
         let outcome: JobOutcome
         try {
           outcome = await runOneJob(deps, claim, taskCtx)
@@ -279,16 +320,16 @@ export async function runWorker(deps: WorkerDeps): Promise<{ jobs: Array<{ jobId
           if (err instanceof ContainerUncertainError) {
             jobs.push({ jobId: claim.jobId, outcome: err.outcome })
             log(`job ${claim.jobId}: ${err.message}. Worker stopt.`)
-            return { jobs, exitCode: 1 }
+            return { jobs, exitCode: EXIT_RESTART }
           }
           if (!(err instanceof ClaimFilterError)) throw err
           jobs.push({ jobId: claim.jobId, outcome: 'failed' })
-          log(`job ${claim.jobId}: ${err.message} — dit hoort het claimfilter (local_llm-isolatie in scrum4me-mcp) te voorkomen. Worker stopt.`)
-          return { jobs, exitCode: 1 }
+          log(`job ${claim.jobId}: ${err.message} — dit hoort het claimfilter (runtime-isolatie in scrum4me-mcp) te voorkomen. Worker stopt zonder herstart.`)
+          return { jobs, exitCode: EXIT_NO_RESTART }
         }
         jobs.push({ jobId: claim.jobId, outcome })
-        if (deps.signal.aborted) return { jobs, exitCode: 0 } // stopped on request: the job is closed, the stop was clean
-        if (deps.once) return { jobs, exitCode: outcome === 'done' ? 0 : 1 }
+        if (deps.signal.aborted) return { jobs, exitCode: EXIT_STOPPED } // stopped on request: the job is closed, the stop was clean
+        if (deps.once) return { jobs, exitCode: outcome === 'done' ? EXIT_STOPPED : EXIT_RESTART }
         continue
       }
     }

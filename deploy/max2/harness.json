@@ -2,20 +2,25 @@
   "litellm": {
     "baseUrl": "http://127.0.0.1:4000/v1",
     "configPath": "/etc/agent-harness/litellm/config.yaml",
-    "composePath": "/etc/agent-harness/litellm/docker-compose.yaml"
+    "composePath": "/etc/agent-harness/litellm/compose.yml"
   },
   "configurations": {
-    "qwen3.8-gsq-rco": {
+    "gsq-lokaal": {
       "costMode": "local",
       "contextTokens": 65536
+    },
+    "qwen3.8-or": {
+      "costMode": "hosted",
+      "contextTokens": 65536,
+      "reasoningEffort": "medium"
     }
   },
   "mcp": {
-    "command": "/Users/janpetervisser/Development/scrum4me-mcp-stable/node_modules/.bin/tsx",
+    "command": "/home/janpeter/Development/scrum4me-mcp-stable/node_modules/.bin/tsx",
     "args": [
       "--tsconfig",
-      "/Users/janpetervisser/Development/scrum4me-mcp-stable/tsconfig.json",
-      "/Users/janpetervisser/Development/scrum4me-mcp-stable/src/index.ts"
+      "/home/janpeter/Development/scrum4me-mcp-stable/tsconfig.json",
+      "/home/janpeter/Development/scrum4me-mcp-stable/src/index.ts"
     ],
     "env": {
       "SCRUM4ME_TOKEN": "${SCRUM4ME_TOKEN}",
@@ -23,12 +28,13 @@
       "DIRECT_URL": "${DIRECT_URL}",
       "GIT_ASKPASS": "/usr/local/lib/agent-harness/forgejo-askpass.sh",
       "GIT_TERMINAL_PROMPT": "0",
-      "FORGEJO_PUSH_TOKEN": "${FORGEJO_PUSH_TOKEN}",
+      "GIT_CONFIG_GLOBAL": "/dev/null",
+      "GIT_CONFIG_NOSYSTEM": "1",
       "SCRUM4ME_AGENT_WORKTREE_DIR": "/var/lib/agent-harness/worktrees",
       "SCRUM4ME_REPO_ROOT_cmuhjw9e80003mt7rq4w3sauu": "/var/lib/agent-harness/repos/agent-harness",
+      "SCRUM4ME_REPO_ROOT_REPO_agent-harness": "/var/lib/agent-harness/repos/agent-harness",
       "SCRUM4ME_REPO_ROOT_REPO_scrum4me-mcp": "/var/lib/agent-harness/repos/scrum4me-mcp",
-      "GIT_CONFIG_GLOBAL": "/dev/null",
-      "GIT_CONFIG_NOSYSTEM": "1"
+      "FORGEJO_PUSH_TOKEN": "${FORGEJO_PUSH_TOKEN}"
     }
   },
   "allow": [
@@ -44,11 +50,6 @@
     "maxToolErrors": 2
   },
   "waitSeconds": 300,
-  "workerLog": {
-    "dir": "/srv/scrum4me/worker-logs",
-    "pool": "harness",
-    "instance": "max2"
-  },
   "task": {
     "limits": {
       "maxTurns": 40,
@@ -63,14 +64,24 @@
     "recipes": [
       {
         "repoUrl": "https://git.jp-visser.nl/janpeter/agent-harness.git",
-        "prepare": ["npm ci"],
+        "prepare": [
+          "npm ci"
+        ],
         "verify": "npm run verify"
       },
       {
         "repoUrl": "https://git.jp-visser.nl/janpeter/scrum4me-mcp.git",
-        "prepare": ["npm ci", "npm run prisma:generate"],
+        "prepare": [
+          "npm ci",
+          "npm run prisma:generate"
+        ],
         "verify": "npm run typecheck && npm run typecheck:tests && npx vitest run --exclude __tests__/ppe-bundle1-parity.test.ts --exclude __tests__/branch-safety.test.ts --exclude __tests__/default-branch.test.ts --exclude __tests__/worktree-branch-safety.test.ts --exclude __tests__/update-job-status-local-llm-chain.test.ts --exclude __tests__/update-job-status-local-llm-done-gitlink.test.ts --exclude __tests__/git/local-llm.test.ts"
       }
     ]
+  },
+  "workerLog": {
+    "dir": "/srv/scrum4me/worker-logs",
+    "pool": "harness",
+    "instance": "max2"
   }
 }

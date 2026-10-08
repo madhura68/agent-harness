@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { main } from '../src/cli.js'
 import { checkRunLogs } from '../src/worker/check-run-logs.js'
-import { WorkerConfigSchema } from '../src/worker/config.js'
+import { testWorkerConfig, workerConfigInput } from './fakes/worker-config.js'
 
 // Obvious test values -- never a real secret.
 const TOKEN = 'test-token-fake-0123456789abcdef'
@@ -13,10 +13,7 @@ function tmp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), `harness-${prefix}-`))
 }
 
-const baseConfig = WorkerConfigSchema.parse({
-  model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'test-model' },
-  mcp: { command: 'node', args: [] },
-})
+const baseConfig = testWorkerConfig({ mcp: { command: 'node', args: [] } })
 
 describe('checkRunLogs', () => {
   it('finds one occurrence of a configured secret in a run-log file', () => {
@@ -88,10 +85,7 @@ describe('checkRunLogs', () => {
     writeFileSync(join(dir, 'a.log'), `leak once: ${TOKEN}\n`)
     // examples/worker.json's real shape: mcp.env re-exposes SCRUM4ME_TOKEN via ${VAR} expansion, so the
     // same name+value legitimately arrives from two distinct sources (process.env and workerMcpEnv).
-    const config = WorkerConfigSchema.parse({
-      model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'test-model' },
-      mcp: { command: 'node', args: [], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}' } },
-    })
+    const config = testWorkerConfig({ mcp: { command: 'node', args: [], env: { SCRUM4ME_TOKEN: '${SCRUM4ME_TOKEN}' } } })
     const { results } = checkRunLogs(config, { SCRUM4ME_TOKEN: TOKEN }, dir)
     const rows = results.filter((r) => r.name === 'SCRUM4ME_TOKEN')
     expect(rows).toEqual([{ name: 'SCRUM4ME_TOKEN', hits: 1, short: false }])
@@ -105,16 +99,13 @@ describe('checkRunLogs', () => {
     expect(rows).toEqual([{ name: 'DATABASE_URL (url-wachtwoord)', hits: 1, short: false }])
   })
 
-  it('also checks a secret sourced from config.model.apiKey (not only process env)', () => {
+  it('also checks the key of --api-key-env, as MODEL_API_KEY, even under a variable name the redaction does not know', () => {
     const dir = tmp('crl')
-    const apiKey = 'model-api-key-fake-777777'
+    const apiKey = 'litellm-master-key-fake-777777'
     writeFileSync(join(dir, 'a.log'), `key used: ${apiKey}\n`)
-    const config = WorkerConfigSchema.parse({
-      model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'test-model', apiKey },
-      mcp: { command: 'node', args: [] },
-    })
-    const { results } = checkRunLogs(config, {}, dir)
+    const { results } = checkRunLogs(baseConfig, { LITELLM: apiKey }, dir, 'LITELLM')
     expect(results).toContainEqual({ name: 'MODEL_API_KEY', hits: 1, short: false })
+    expect(checkRunLogs(baseConfig, { LITELLM: apiKey }, dir).results).toEqual([]) // without the option nothing names that variable
   })
 })
 
@@ -142,7 +133,7 @@ describe('harness check-run-logs (CLI)', () => {
 
   function writeConfig(dir: string): string {
     const p = join(dir, 'worker.json')
-    writeFileSync(p, JSON.stringify({ model: { baseUrl: 'http://127.0.0.1:11434/v1', name: 'test-model' }, mcp: { command: 'node', args: [] } }))
+    writeFileSync(p, JSON.stringify(workerConfigInput({ mcp: { command: 'node', args: [] } })))
     return p
   }
 
@@ -201,5 +192,31 @@ describe('harness check-run-logs (CLI)', () => {
     const everything = [...stdout, ...stderr].join('')
     expect(everything).toContain('CHECK_RUN_LOGS_TEST_TOKEN') // proves the run really happened and found the hit
     expect(everything).not.toContain(canary)
+  })
+
+  it('takes --api-key-env and counts that key as a secret to check', async () => {
+    const dir = tmp('crl-cli')
+    const logsDir = join(dir, 'logs')
+    mkdirSync(logsDir, { recursive: true })
+    const key = 'litellm-master-key-fake-8492716'
+    writeFileSync(join(logsDir, 'a.log'), `leaked: ${key}\n`)
+    process.env.CHECK_RUN_LOGS_TEST_MASTER_KEY = key
+    try {
+      const code = await main(['check-run-logs', '--config', writeConfig(dir), '--dir', logsDir, '--api-key-env', 'CHECK_RUN_LOGS_TEST_MASTER_KEY'])
+      expect(code).toBe(1)
+      expect(stdout.join('')).toMatch(/MODEL_API_KEY[^\n]*\b1\b/)
+      expect([...stdout, ...stderr].join('')).not.toContain(key)
+    } finally {
+      delete process.env.CHECK_RUN_LOGS_TEST_MASTER_KEY
+    }
+  })
+
+  it('refuses an --api-key-env variable that is not set, as a usage error', async () => {
+    const dir = tmp('crl-cli')
+    const logsDir = join(dir, 'logs')
+    mkdirSync(logsDir, { recursive: true })
+    const code = await main(['check-run-logs', '--config', writeConfig(dir), '--dir', logsDir, '--api-key-env', 'CHECK_RUN_LOGS_TEST_UNSET_KEY'])
+    expect(code).toBe(1)
+    expect(stderr.join('')).toContain('CHECK_RUN_LOGS_TEST_UNSET_KEY')
   })
 })

@@ -4,7 +4,11 @@ import type { ChatMessage, CompleteResult, ToolCall, ToolDef } from './types.js'
 
 export type ProbeStep = 'a_plain' | 'b_single_tool' | 'c_two_tools' | 'd_nonexistent_tool'
 export type ProbeVerdict = 'reliable' | 'unreliable' | 'none'
-export type ProbeStepResult = { pass: boolean; reason: string; raw: unknown }
+/**
+ * `costsUsd` holds one entry per answer the step received (c_two_tools has two): the amount the response reported, or null when it
+ * reported none. A missing amount is null, never 0; 0 is a free answer. A step that got no answer at all has an empty list.
+ */
+export type ProbeStepResult = { pass: boolean; reason: string; raw: unknown; costsUsd: Array<number | null> }
 export type ProbeResult = {
   baseUrl: string
   model: string
@@ -54,40 +58,44 @@ export async function runProbe(
   opts: { baseUrl: string; model: string; stepTimeoutMs: number },
 ): Promise<ProbeResult> {
   const responses: CompleteResult[] = []
-  const call = async (messages: ChatMessage[], tools?: ToolDef[]) => {
+  const call = async (costs: Array<number | null>, messages: ChatMessage[], tools?: ToolDef[]) => {
     const r = await client.complete(messages, { signal: AbortSignal.timeout(opts.stepTimeoutMs), maxTokens: PROBE_MAX_TOKENS, tools })
     responses.push(r)
+    costs.push(r.usage.costUsd ?? null)
     return r
   }
-  const step = async (fn: () => Promise<ProbeStepResult>): Promise<ProbeStepResult> => {
+  const step = async (fn: (costs: Array<number | null>) => Promise<Omit<ProbeStepResult, 'costsUsd'>>): Promise<ProbeStepResult> => {
+    const costs: Array<number | null> = []
     try {
-      return await fn()
+      return { ...(await fn(costs)), costsUsd: costs }
     } catch (err) {
-      if (err instanceof ModelError) return { pass: false, reason: err.message, raw: null }
+      // The answers that came in before the error keep their amount.
+      if (err instanceof ModelError) return { pass: false, reason: err.message, raw: null, costsUsd: costs }
       throw err
     }
   }
 
-  const a_plain = await step(async () => {
-    const r = await call([{ role: 'user', content: PROMPT_A }])
+  const a_plain = await step(async (costs) => {
+    const r = await call(costs, [{ role: 'user', content: PROMPT_A }])
     const content = (r.message.content ?? '').trim()
     const pass = content.length > 0 && r.message.toolCalls.length === 0
     return { pass, reason: pass ? `content: ${content.slice(0, 80)}` : 'empty content or unexpected tool call', raw: r }
   })
 
-  const b_single_tool = await step(async () => {
-    const r = await call([{ role: 'user', content: PROMPT_B }], [ECHO_TOOL])
+  const b_single_tool = await step(async (costs) => {
+    const r = await call(costs, [{ role: 'user', content: PROMPT_B }], [ECHO_TOOL])
     const v = isEchoCallWith(r.message.toolCalls, 'ping')
     return { pass: v.ok, reason: v.reason, raw: r }
   })
 
-  const c_two_tools = await step(async () => {
+  const c_two_tools = await step(async (costs) => {
     const first: ChatMessage[] = [{ role: 'user', content: PROMPT_B }]
-    const r1 = await call(first, [ECHO_TOOL])
+    const r1 = await call(costs, first, [ECHO_TOOL])
     const v1 = isEchoCallWith(r1.message.toolCalls, 'ping')
     if (!v1.ok) return { pass: false, reason: `turn 1: ${v1.reason}`, raw: { turn1: r1 } }
     const c1 = { ...r1.message.toolCalls[0], id: r1.message.toolCalls[0].id || 'call_probe_c1' }
     const r2 = await call(
+      costs,
       [
         ...first,
         { role: 'assistant', content: r1.message.content, tool_calls: [c1] },
@@ -100,8 +108,8 @@ export async function runProbe(
     return { pass: v2.ok, reason: v2.ok ? `turn 1 ${v1.reason}; turn 2 ${v2.reason}` : `turn 2: ${v2.reason}`, raw: { turn1: r1, turn2: r2 } }
   })
 
-  const d_nonexistent_tool = await step(async () => {
-    const r = await call([{ role: 'user', content: PROMPT_D }], [ECHO_TOOL])
+  const d_nonexistent_tool = await step(async (costs) => {
+    const r = await call(costs, [{ role: 'user', content: PROMPT_D }], [ECHO_TOOL])
     const foreign = r.message.toolCalls.filter((c) => c.name !== 'echo').map((c) => c.name)
     const pass = foreign.length === 0
     return { pass, reason: pass ? `no foreign tool call (${r.message.toolCalls.length} echo calls)` : `called: ${foreign.join(', ')}`, raw: r }

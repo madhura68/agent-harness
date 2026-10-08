@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { createCostGuard, parseCeilingNanos, type CostGuard } from '../cost.js'
 import type { Manifest } from '../manifest.js'
 import { runManifest, type AfterAnswerResult } from '../run.js'
 import { combineRegistries } from '../tools/registry.js'
@@ -7,8 +8,11 @@ import type { TaskConfig } from './config.js'
 import { findRecipe } from './config.js'
 import type { ClaimResult, LogArgs, StatusUpdate } from './control.js'
 import { buildScript, containerName, killLeftoverContainers, runInContainer } from './containers.js'
+import { costFailureText, costLogLine, sendFinalStatus, withMeasured } from './final-status.js'
 import { startHeartbeat } from './heartbeat.js'
 import { commitAll, diffGitAdmin, snapshotGitAdmin, type GitAdminSnapshot } from './host-git.js'
+import { failBeforeRunning, limitsFor, modelClientFor, modelSpecFor, resolveJobConfiguration } from './job-configuration.js'
+import { checkProbeForJob } from './probe-gate.js'
 import type { RunLog } from './run-log.js'
 import { createTaskTools, type VerifyRun } from './task-tools.js'
 import type { JobOutcome, WorkerDeps } from './worker.js'
@@ -19,7 +23,7 @@ import type { JobOutcome, WorkerDeps } from './worker.js'
 
 const nullableText = z.string().nullable().optional()
 
-/** The TASK_IMPLEMENTATION payload from scrum4me-mcp wait_for_job (source COPILOT); prompt_text and the rest are ignored. */
+/** The TASK_IMPLEMENTATION payload from scrum4me-mcp wait_for_job (source COPILOT); prompt_text and the rest are ignored, but `config` (the configuration and the cost ceiling of the job) is read by job-configuration.ts. */
 export const TaskPayloadSchema = z.object({
   job_id: z.string(),
   kind: z.literal('TASK_IMPLEMENTATION'),
@@ -139,6 +143,8 @@ function prepareFailure(run: VerifyRun): string {
 
 /** Readable failure for a run that did not complete, with the task limits (not the idea-chat ones). */
 function failureText(result: RunResult, limits: TaskConfig['limits']): string {
+  const costText = costFailureText(result)
+  if (costText) return costText
   if (result.error) return `${result.status}: ${result.error.code} ${result.error.message}`
   if (result.status === 'timed_out') return `timed_out: geen antwoord binnen maxWallSeconds=${limits.maxWallSeconds}`
   if (result.status === 'budget_exceeded') return `budget_exceeded: maxTurns=${limits.maxTurns} of maxOutputTokens=${limits.maxOutputTokens} bereikt`
@@ -170,9 +176,22 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
   const { jobId } = claim
 
+  // What every final status carries besides its own fields (M45-2d): the tokens of the run and the cost the guard of the job counted. Both
+  // stay empty for a job that never got as far as a run, which reports no cost figure.
+  let guard: CostGuard | undefined = undefined
+  let runUsage: RunResult['usage'] | undefined
+  let ceiling = 'ontbrekend'
+  let costLogged = false // one cost line per job, also when a refused `done` is followed by a `failed`
+  const sendFinal = (update: StatusUpdate) => {
+    const final = withMeasured(update, runUsage, guard)
+    if (!costLogged) runLog?.meta(costLogLine(final.cost, ceiling))
+    costLogged = true
+    return sendFinalStatus(control, jobId, final)
+  }
+
   const closeFailed = async (error: string, code: string): Promise<JobOutcome> => {
     runLog?.fail(code, error)
-    const res = await control.updateStatus(jobId, { status: 'failed', error: cut(error, ERROR_LIMIT) })
+    const res = await sendFinal({ status: 'failed', error: cut(error, ERROR_LIMIT) })
     if (!res.ok) log(`job ${jobId}: update_job_status(failed) mislukt: ${res.message ?? 'onbekend'}`)
     log(`job ${jobId}: failed`)
     return 'failed'
@@ -193,6 +212,16 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     return closeFailed(`payload ongeldig: ${parsed.error.issues.map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; ')}`, 'PAYLOAD_INVALID')
   }
   const p = parsed.data
+  // The job's own configuration and cost ceiling, from its payload: one that this worker does not have fails this job only, and like an
+  // invalid payload it leaves the task alone (nothing below this line has run).
+  const resolved = resolveJobConfiguration(config, claim.payload)
+  if (!resolved.ok) return failBeforeRunning(deps, jobId, runLog, resolved.failure)
+  const job = resolved.job
+  // The probe gate of that configuration, after the configuration and the ceiling and before anything touches the task: no accepted probe of the hash it has now fails this job only.
+  const probed = checkProbeForJob(config, deps.out, job.name)
+  if (!probed.ok) return failBeforeRunning(deps, jobId, runLog, probed.failure, job.maxCostUsd)
+  ceiling = job.maxCostUsd
+  guard = createCostGuard({ mode: job.configuration.costMode, ceilingNanos: parseCeilingNanos(job.maxCostUsd), configuration: job.name })
   runLog?.worktree(p.worktree_path)
   const task = config.task
   if (!task) return closeFailed('worker heeft geen task-config', 'NO_TASK_CONFIG')
@@ -281,7 +310,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     const msg = `container ${uncertain} niet aantoonbaar gestopt; worker gestopt, systemd herstart hem en de start ruimt achtergebleven containers op`
     let outcome: JobOutcome = 'abandoned'
     if (!lost) {
-      const res = await control.updateStatus(jobId, { status: 'failed', error: cut(msg, ERROR_LIMIT) })
+      const res = await sendFinal({ status: 'failed', error: cut(msg, ERROR_LIMIT) })
       if (!res.ok) log(`job ${jobId}: update_job_status(failed) mislukt: ${res.message ?? 'onbekend'}`)
       outcome = 'failed'
     }
@@ -321,7 +350,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     if (lost) return abandon()
     if (!inProgress.ok) return await failPath(`update_task_status in_progress mislukt: ${inProgress.message ?? 'onbekend'}`, 'JOB_FAILED')
     runLog?.step('task_status in_progress')
-    await logStep('implementation', { content: `lokaal model start: ${config.model.name}, recept ${repoUrl}` })
+    await logStep('implementation', { content: `model start: ${job.name}, recept ${repoUrl}` })
     const beforePrepare = interrupted()
     if (beforePrepare) return await beforePrepare
 
@@ -350,14 +379,14 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
       profile: 'tools',
       system: TASK_SYSTEM_PROMPT,
       prompt: renderTaskPrompt(p),
-      model: config.model,
+      model: modelSpecFor(config, job),
       tools: { server: { command: 'shared', args: [] }, allow: ['list_files', 'read_file', 'write_file', 'edit_file', 'search', 'run_tests', ...config.allow] },
-      limits: task.limits,
+      limits: limitsFor(task.limits, job),
     }
     let result: RunResult
     try {
       result = await runManifest(manifest, {
-        client: deps.modelClient,
+        client: modelClientFor(deps.modelClients, job.name),
         trace,
         connectRegistry: async (signal) => {
           const docs = await deps.registryView(signal)
@@ -371,6 +400,8 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
         signal: inner.signal,
         runStartExtra: { jobId, taskId: p.task.id },
         afterAnswer,
+        costGuard: guard,
+        retryOnce: job.configuration.costMode === 'hosted',
       })
     } catch (err) {
       await settleContainers()
@@ -378,6 +409,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
       if (afterThrow) return await afterThrow
       return await failPath(`harness: ${message(err)}`, 'HARNESS_ERROR')
     }
+    runUsage = result.usage
     // A gate or run_tests container may still be killing; its cleanup outcome decides what comes next.
     await settleContainers()
     // The uncertain flag first: runManifest reports that abort as an ordinary HARNESS_ERROR.
@@ -425,10 +457,9 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     const done: StatusUpdate = {
       status: 'done',
       summary: buildSummary(result.answer ?? '', recipe.verify),
-      model_id: result.model.reported ?? config.model.name,
-      ...(result.usage.source === 'provider_reported' ? { input_tokens: result.usage.inputTokens, output_tokens: result.usage.outputTokens } : {}),
+      model_id: result.model.reported ?? job.name,
     }
-    const outcome = await control.updateStatus(jobId, done)
+    const outcome = await sendFinal(done)
     // The MCP's answer is authoritative from here; a late heartbeat refusal (job now terminal) means nothing.
     stopBeat()
 

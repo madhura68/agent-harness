@@ -61,3 +61,8 @@ export function makeFifo(path: string, { delayMs = 1500, holdMs = 1000 } = {}): 
   const script = `sleep ${delayMs / 1000}; exec 3<>"$1"; sleep ${holdMs / 1000}`
   spawn('sh', ['-c', script, 'sh', path], { stdio: 'ignore', detached: true }).unref()
 }
+
+/** The run dirs of a worker in `out` (`job-<id>-<epoch>`): not the `probe-<configuration>` dirs the per-job probe gate reads from the same dir. */
+export function jobRunDirs(out: string): string[] {
+  return readdirSync(out).filter((name) => name.startsWith('job-'))
+}

@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 
 /** One wait_for_job answer: a timeout, a claimed job payload, a tool error, or a handler that keeps waiting. */
-export type ClaimStep = { timeout: true } | { job: unknown } | { error: string } | { hangMs: number }
+export type ClaimStep = { timeout: true } | { job: unknown } | { error: string } | { hangMs: number } | { runtimeMismatch: true }
 
 export type ToolCallRecord = { name: string; args: Record<string, unknown> }
 
@@ -13,6 +13,12 @@ export type UpdateOutcomeOverride = { status?: 'running' | 'done' | 'failed' | '
 
 const toolText = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value) }] })
 const toolError = (message: string) => ({ isError: true, content: [{ type: 'text' as const, text: message }] })
+
+/** What the fake `health` tool reports: `runtimes` as a list, `null` for a reply without that field (an MCP from before M45-2b), `noTool` for an MCP without the tool, `error` for a tool error. */
+export type HealthSetup = { runtimes?: unknown; noTool?: boolean; error?: string }
+
+/** The default `health` answer: the runtimes of an MCP release with M45-2b (shared `AGENT_RUNTIMES`). */
+export const DEFAULT_RUNTIMES = ['CLAUDE', 'CODEX', 'HARNESS']
 
 /**
  * In-process stand-in for the scrum4me MCP: the control tools (wait_for_job, job_heartbeat,
@@ -26,13 +32,25 @@ export async function startFakeScrum4meMcp(
     failUpdate?: Array<'running' | 'done' | 'failed'>
     updateOutcome?: Partial<Record<'running' | 'done' | 'failed' | 'skipped', UpdateOutcomeOverride>>
     verifyResult?: 'aligned' | 'partial' | 'empty' | 'divergent'
+    health?: HealthSetup
+    /** The MCP refuses the cost of every final update, as it does for a cost report it does not allow or does not accept (scrum4me-mcp harness-cost.ts). */
+    refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
   } = {},
 ) {
   const calls: ToolCallRecord[] = []
   const claims = [...(opts.claims ?? [])]
-  const state = { heartbeatOk: true, failUpdate: new Set(opts.failUpdate ?? []), updateOutcome: opts.updateOutcome ?? {}, verifyResult: opts.verifyResult ?? 'aligned' }
+  const state = { heartbeatOk: true, failUpdate: new Set(opts.failUpdate ?? []), updateOutcome: opts.updateOutcome ?? {}, verifyResult: opts.verifyResult ?? 'aligned', health: opts.health ?? {} }
   const server = new McpServer({ name: 'fake-scrum4me', version: '0.0.0' })
 
+  if (!state.health.noTool) {
+    server.registerTool('health', {}, async () => {
+      calls.push({ name: 'health', args: {} })
+      if (state.health.error !== undefined) return toolError(state.health.error)
+      // `runtimes: null` leaves the field out, like an MCP release that predates M45-2b.
+      const runtimes = 'runtimes' in state.health ? state.health.runtimes : DEFAULT_RUNTIMES
+      return toolText({ status: 'ok', version: '0.0.0', time: '2026-10-07T00:00:00.000Z', database: 'ok', ...(runtimes === null ? {} : { runtimes }) })
+    })
+  }
   server.registerTool('wait_for_job', { inputSchema: { wait_seconds: z.number().int().optional() } }, async (args) => {
     calls.push({ name: 'wait_for_job', args })
     const step = claims.shift() ?? { timeout: true }
@@ -41,6 +59,8 @@ export async function startFakeScrum4meMcp(
       return toolText({ status: 'timeout', message: 'No job available within wait window' })
     }
     if ('error' in step) return toolError(step.error)
+    // The real MCP sets exactly this text unchanged in `content` (errors.ts toolError); the claim was already returned to the queue.
+    if ('runtimeMismatch' in step) return toolError('RUNTIME_MISMATCH')
     if ('job' in step) return toolText(step.job)
     return toolText({ status: 'timeout', message: 'No job available within wait window' })
   })
@@ -60,10 +80,17 @@ export async function startFakeScrum4meMcp(
         model_id: z.string().optional(),
         input_tokens: z.number().int().optional(),
         output_tokens: z.number().int().optional(),
+        cache_read_tokens: z.number().int().optional(),
+        actual_thinking_tokens: z.number().int().optional(),
+        // The cost of the job (M45-2d): a decimal string or null, with where the figure came from.
+        cost: z
+          .object({ reported_cost_usd: z.string().nullable(), cost_source: z.enum(['provider_reported', 'local', 'none']), provider: z.string().optional() })
+          .optional(),
       },
     },
     async (args) => {
       calls.push({ name: 'update_job_status', args })
+      if (opts.refuseCost !== undefined && args.cost !== undefined) return toolError(`VALIDATION_ERROR: ${opts.refuseCost}`)
       const requested = args.status as 'running' | 'done' | 'failed' | 'skipped'
       if (state.failUpdate.has(requested as 'running' | 'done' | 'failed')) return toolError(`Job ${args.job_id} is already terminal`)
       const override = state.updateOutcome[requested] ?? {}

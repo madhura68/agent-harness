@@ -58,12 +58,12 @@ function dedupeEntries(entries: { name: string; value: string }[]): { name: stri
 
 /**
  * Scans every file under `dir` for the secrets in `collectSecretEntries(...workerSecretSources(config,
- * processEnv))`: the redaction's own selection, but also shorter than 8 characters, so a short secret
+ * processEnv, apiKeyEnv))`: the redaction's own selection, but also shorter than 8 characters, so a short secret
  * is checked and reported instead of silently skipped (spec §10 criterion 4). Never returns a value,
  * only names and counts.
  */
-export function checkRunLogs(config: WorkerConfig, processEnv: NodeJS.ProcessEnv, dir: string): { checked: number; results: SecretCheckResult[] } {
-  const entries = dedupeEntries(collectSecretEntries(...workerSecretSources(config, processEnv)))
+export function checkRunLogs(config: WorkerConfig, processEnv: NodeJS.ProcessEnv, dir: string, apiKeyEnv?: string): { checked: number; results: SecretCheckResult[] } {
+  const entries = dedupeEntries(collectSecretEntries(...workerSecretSources(config, processEnv, apiKeyEnv)))
   const texts = listFiles(dir).map((f) => readFileSync(f, 'utf8'))
   const results = entries.map(({ name, value }) => ({
     name,

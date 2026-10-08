@@ -7,6 +7,7 @@ import type { ServerSpec } from '../src/types.js'
 import { TaskConfigSchema } from '../src/worker/config.js'
 import { completion, startFakeModelServer } from './fakes/fake-model-server.js'
 import { startFakeMcp } from './fakes/fake-mcp-server.js'
+import { workerConfigInput } from './fakes/worker-config.js'
 import { allFiles, bodyWithKeyAt, dirContains, DUMMY_KEY, leakedFragments, readTrace, tmp } from './helpers.js'
 
 const stdioCalls: Array<{ server: ServerSpec; allow: string[] }> = []
@@ -452,19 +453,18 @@ describe('harness run — --api-key-env and model.extraBody', () => {
 })
 
 describe('harness worker — --extra-body-file', () => {
-  it('refuses it as a usage error: it only applies to probe, before the probe gate and before any request', async () => {
+  it('refuses it as a usage error: it only applies to probe, before the LiteLLM check and before any request', async () => {
     fake = await startFakeModelServer([])
     const dir = tmp('cli-worker-extra')
-    const config = writeJson(dir, 'worker.json', { model: { baseUrl: fake.baseUrl, name: 'm' }, mcp: { command: 'mcp-bin', args: [] } })
+    const config = writeJson(dir, 'worker.json', workerConfigInput({ mcp: { command: 'mcp-bin', args: [] } }, fake.baseUrl))
     const file = writeJson(dir, 'extra.json', extraBody)
-    // No probe.json on purpose: without the refusal this stops at PROBE_REQUIRED, so nothing can start either way.
     const { code, stderr } = await runMain(['worker', '--config', config, '--out', join(dir, 'runs'), '--once', '--extra-body-file', file])
-    expect(code).toBe(1)
+    expect(code).toBe(78) // a usage error of `worker` comes before the MCP child, and no restart cures it
     expect(stderr).toContain('--extra-body-file only applies to harness probe')
-    expect(stderr).toContain('put extraBody in the model block of the worker config')
+    expect(stderr).toContain('put extraBody in a configuration of the worker config')
     expect(stderr).toContain('Usage:')
-    expect(stderr).not.toContain('PROBE_REQUIRED')
     expect(fake.requests).toHaveLength(0)
+    expect(fake.modelsRequests).toHaveLength(0)
   })
 })
 

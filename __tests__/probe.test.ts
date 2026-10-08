@@ -98,6 +98,41 @@ describe('runProbe', () => {
   })
 })
 
+describe('runProbe — the cost of every answer (M45-2d T-2066)', () => {
+  const costed = (cost: number | null, over: Parameters<typeof completion>[0]) =>
+    ({ body: completion({ ...over, usage: { prompt_tokens: 10, completion_tokens: 5, ...(cost === null ? {} : { cost }) } }) })
+
+  it('keeps the amount of each answer per step: one for a, b and d, two for c_two_tools', async () => {
+    const r = await probe([
+      costed(0.001, { content: 'pong' }),
+      costed(0.002, { toolCalls: [{ id: 'c1', name: 'echo', arguments: JSON.stringify({ text: 'ping' }) }] }),
+      costed(0.003, { toolCalls: [{ id: 'c1', name: 'echo', arguments: JSON.stringify({ text: 'ping' }) }] }),
+      costed(0.004, { toolCalls: [{ id: 'c2', name: 'echo', arguments: JSON.stringify({ text: 'pong' }) }] }),
+      costed(0.005, { content: 'Dat kan ik niet doen.' }),
+    ])
+    expect(Object.fromEntries(Object.entries(r.steps).map(([k, v]) => [k, v.costsUsd]))).toEqual({
+      a_plain: [0.001], b_single_tool: [0.002], c_two_tools: [0.003, 0.004], d_nonexistent_tool: [0.005],
+    })
+  })
+
+  it('records null for an answer without an amount, and 0 for a free one: a missing amount is never 0', async () => {
+    const r = await probe([...good.slice(0, 4), costed(0, { content: 'Dat kan ik niet doen.' })])
+    expect(r.steps.a_plain.costsUsd).toEqual([null])
+    expect(r.steps.c_two_tools.costsUsd).toEqual([null, null])
+    expect(r.steps.d_nonexistent_tool.costsUsd).toEqual([0])
+  })
+
+  it('keeps the amount of turn 1 when turn 2 of c_two_tools fails, and has no amount for a step without any answer', async () => {
+    const script = [...good]
+    script[2] = costed(0.003, { toolCalls: [{ id: 'c1', name: 'echo', arguments: JSON.stringify({ text: 'ping' }) }] })
+    script[3] = { status: 500, body: { error: { message: 'boom' } } }
+    const r = await probe(script)
+    expect(r.steps.c_two_tools.costsUsd).toEqual([0.003])
+    const refused = await probe([{ status: 500, body: { error: { message: 'boom' } } }, ...good.slice(1)])
+    expect(refused.steps.a_plain.costsUsd).toEqual([])
+  })
+})
+
 describe('probeDir', () => {
   it('slugs model names with colons', () => {
     expect(probeDir('runs', 'qwen3:8b')).toBe(join('runs', 'probe-qwen3-8b'))
@@ -117,6 +152,15 @@ describe('harness probe CLI', () => {
     const text = readFileSync(join(probeDir(out, 'qwen3:8b'), 'probe.json'), 'utf8')
     expect(text).not.toContain('sk-test-secret')
     expect(JSON.parse(text)).toMatchObject({ model: 'qwen3:8b', baseUrl: fake.baseUrl, tool_calling: 'reliable' })
+  })
+
+  it('keeps the single-model form as it was, but with the cost of every answer and without the configuration fields', async () => {
+    fake = await startFakeModelServer(good)
+    const out = mkdtempSync(join(tmpdir(), 'harness-probe-'))
+    expect(await main(['probe', '--base-url', fake.baseUrl, '--model', 'm', '--out', out, '--step-timeout', '5'])).toBe(0)
+    const written = JSON.parse(readFileSync(join(probeDir(out, 'm'), 'probe.json'), 'utf8'))
+    expect(written.steps.c_two_tools.costsUsd).toEqual([null, null])
+    for (const field of ['configuration', 'costMode', 'hash', 'accepted', 'reasons']) expect(written).not.toHaveProperty(field)
   })
 
   it('exits 1 when the verdict is not reliable', async () => {

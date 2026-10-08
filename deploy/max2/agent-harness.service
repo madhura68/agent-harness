@@ -1,0 +1,29 @@
+# /etc/systemd/system/agent-harness.service: the M45-2d harness worker (runtime HARNESS) on max2. Installed by the ops wrapper;
+# 2d does not enable it (2e does, step 8.5). It replaces agent-harness-worker.service (the local_llm worker).
+[Unit]
+Description=agent-harness worker (runtime HARNESS, jobs via LiteLLM, M45-2d)
+After=network-online.target docker.service ollama.service
+Wants=network-online.target docker.service ollama.service
+
+[Service]
+Type=simple
+User=janpeter
+WorkingDirectory=/srv/agent-harness/current
+# worker.env holds the MCP secrets (SCRUM4ME_TOKEN, DATABASE_URL, DIRECT_URL, FORGEJO_PUSH_TOKEN);
+# harness-litellm.env holds LITELLM_MASTER_KEY and nothing else. Neither file lives in this repo.
+EnvironmentFile=/etc/agent-harness/worker.env
+EnvironmentFile=/etc/agent-harness/harness-litellm.env
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /srv/agent-harness/current/dist/cli.js worker --config /etc/agent-harness/harness.json --out /var/lib/agent-harness/runs --api-key-env LITELLM_MASTER_KEY
+Restart=always
+RestartSec=30
+# Exit 78 is a configuration or identity error (wrong runtime, missing key, failed start check): a restart cannot fix it.
+RestartPreventExitStatus=78
+# SIGINT = clean stop: a running job is closed as failed. Only the main process gets it; the harness closes its MCP child itself.
+KillSignal=SIGINT
+KillMode=mixed
+# Room for container clean-up (up to ~62 s) plus a clean finish after a stop.
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target

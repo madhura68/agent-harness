@@ -1,3 +1,5 @@
+import { TEST_CONFIGURATION } from './worker-config.js'
+
 /** A TASK_IMPLEMENTATION payload in the shape the scrum4me-mcp wait_for_job COPILOT branch returns. */
 export function taskPayload(opts: {
   jobId?: string
@@ -10,12 +12,15 @@ export function taskPayload(opts: {
   plan?: string | null
   storyDescription?: string | null
   acceptance?: string | null
+  runtime?: string
+  config?: Record<string, unknown>
 } = {}) {
   return {
     job_id: opts.jobId ?? 'job1',
     kind: 'TASK_IMPLEMENTATION',
     source: 'COPILOT',
     status: 'claimed',
+    config: opts.config ?? { runtime: opts.runtime ?? 'HARNESS', model: TEST_CONFIGURATION, max_cost_usd: '0.05' },
     task: {
       id: 'task-1',
       code: 'T-1',

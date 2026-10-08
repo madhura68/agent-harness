@@ -1,0 +1,13 @@
+# /etc/systemd/system/agent-harness-probe.service: one probe of every configuration in harness.json, started by the ops wrapper
+# (`probe`). It writes <out>/probe-<name>/probe.json, the proof the worker's probe gate asks for. It needs the master key only.
+[Unit]
+Description=agent-harness probe of all configurations (M45-2d)
+After=network-online.target docker.service ollama.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=janpeter
+WorkingDirectory=/srv/agent-harness/current
+EnvironmentFile=/etc/agent-harness/harness-litellm.env
+ExecStart=/usr/bin/node /srv/agent-harness/current/dist/cli.js probe --config /etc/agent-harness/harness.json --all --out /var/lib/agent-harness/runs --api-key-env LITELLM_MASTER_KEY --step-timeout 300

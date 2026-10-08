@@ -1,25 +1,26 @@
 import { execFile } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { promisify } from 'node:util'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createModelClient } from '../src/model-client.js'
+import { probeDir } from '../src/probe.js'
 import { createRegistryView } from '../src/tools/registry.js'
-import { WorkerConfigSchema } from '../src/worker/config.js'
 import type { SpawnFn } from '../src/worker/containers.js'
 import { createControlChannel } from '../src/worker/control.js'
 import { commitAll, snapshotGitAdmin } from '../src/worker/host-git.js'
 import { openRunLog } from '../src/worker/run-log.js'
 import { buildSummary, renderTaskPrompt, TaskPayloadSchema } from '../src/worker/task-impl.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
-import { completion, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
+import { completion, priced, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep, type UpdateOutcomeOverride } from './fakes/fake-scrum4me-mcp.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
+import { seedProbe, seedProbes } from './fakes/probe-seed.js'
 import { taskPayload } from './fakes/task-payload.js'
-import { readTrace } from './helpers.js'
+import { TEST_CONFIGURATION, testModelClients, testRunLogInit, testWorkerConfig } from './fakes/worker-config.js'
+import { jobRunDirs, readTrace } from './helpers.js'
 
 // Spies that call through: the tests assert that commitAll/snapshotGitAdmin are NOT called on some paths.
 vi.mock('../src/worker/host-git.js', async (importOriginal) => {
@@ -186,6 +187,10 @@ type Setup = {
   timeouts?: { prepare?: number; verify?: number }
   /** Overrides task.limits.maxWallSeconds after parse (the schema wants whole seconds). */
   maxWallSeconds?: number
+  /** Replaces the configurations of the worker (the default is one local configuration, TEST_CONFIGURATION). */
+  configurations?: Record<string, unknown>
+  /** The MCP refuses the cost of a final update (M45-2d T-2067). */
+  refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
 }
 
 async function setup(s: Setup = {}) {
@@ -197,26 +202,29 @@ async function setup(s: Setup = {}) {
     failUpdate: s.failUpdate,
     verifyResult: s.verifyResult,
     updateOutcome: { done: s.doneOutcome ?? PUSHED },
+    refuseCost: s.refuseCost,
   })
-  const config = WorkerConfigSchema.parse({
-    model: { baseUrl: model.baseUrl, name: 'qwen3-coder:30b' },
-    mcp: { command: 'unused', args: [] },
-    limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2 },
-    waitSeconds: 1,
-    ...(s.noTask
-      ? {}
-      : {
-          task: {
-            limits: { maxTurns: 10, maxOutputTokens: 20000, maxWallSeconds: 30, maxToolErrors: 3 },
-            image: 'node:24-bookworm',
-            uid: 1000,
-            gid: 1000,
-            npmCacheDir: '/tmp/npm-cache',
-            maxVerifyRepairs: s.maxVerifyRepairs ?? 3,
-            recipes: [{ repoUrl: 'https://git.example/repo', prepare: ['npm ci'], verify: 'npm test' }],
-          },
-        }),
-  })
+  const config = testWorkerConfig(
+    {
+      limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2 },
+      waitSeconds: 1,
+      ...(s.configurations ? { configurations: s.configurations } : {}),
+      ...(s.noTask
+        ? {}
+        : {
+            task: {
+              limits: { maxTurns: 10, maxOutputTokens: 20000, maxWallSeconds: 30, maxToolErrors: 3 },
+              image: 'node:24-bookworm',
+              uid: 1000,
+              gid: 1000,
+              npmCacheDir: '/tmp/npm-cache',
+              maxVerifyRepairs: s.maxVerifyRepairs ?? 3,
+              recipes: [{ repoUrl: 'https://git.example/repo', prepare: ['npm ci'], verify: 'npm test' }],
+            },
+          }),
+    },
+    model.baseUrl,
+  )
   // Sub-second container timeouts (the schema wants whole seconds; the runner just multiplies by 1000).
   if (config.task) {
     config.task.prepareTimeoutSeconds = s.timeouts?.prepare ?? 0.05
@@ -225,13 +233,14 @@ async function setup(s: Setup = {}) {
   }
   const docker = fakeDocker(s.docker)
   const out = tmp('out')
+  seedProbes(config, out) // every configuration has an accepted probe, unless a test takes it away (M45-2d T-2066)
   const runLogDir = tmp('runlog')
   const logs: string[] = []
   const client = mcp.client
   const deps: WorkerDeps = {
     control: createControlChannel(client),
     registryView: (signal) => createRegistryView(client, config.allow, signal),
-    modelClient: createModelClient({ baseUrl: config.model.baseUrl, name: config.model.name }),
+    modelClients: testModelClients(config),
     config,
     out,
     once: s.once ?? true,
@@ -242,8 +251,7 @@ async function setup(s: Setup = {}) {
     taskDeps: { spawn: docker.spawn, killGraceMs: 20, cleanupTimeoutMs: 500 },
     // M4 Taak 5: a real run-log writer on every test (best-effort — spec §6.3 — so it must never change a
     // job outcome). Taak 6 adds the task-job-specific run-log assertions; this task only wires it through.
-    runLogFor: (claim) =>
-      openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, { jobId: claim.jobId, kind: claim.kind, model: config.model, version: 'agent-harness@test', secrets: [] }),
+    runLogFor: (claim) => openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, testRunLogInit(config, claim)),
   }
   const branchSha = () => git(cloneDir, ['rev-parse', 'feature1'])
   return { deps, out, runLogDir, logs, mcp, model, docker, worktree, cloneDir, baseSha, branchSha, run: () => runWorker(deps) }
@@ -270,7 +278,7 @@ function controlTrail(m: McpFake): string[] {
 const jobUpdates = (m: McpFake) => m.calls.filter((c) => c.name === 'update_job_status').map((c) => c.args)
 const lastJobUpdate = (m: McpFake) => jobUpdates(m).at(-1)
 const taskUpdates = (m: McpFake) => m.calls.filter((c) => c.name === 'update_task_status').map((c) => c.args.status)
-const traceOf = (out: string) => readTrace(join(out, readdirSync(out)[0]))
+const traceOf = (out: string) => readTrace(join(out, jobRunDirs(out)[0]))
 
 // ---- run-log helpers (M4 Taak 6), mirroring worker.test.ts's ----
 
@@ -344,7 +352,7 @@ describe('runTaskJob — green path', () => {
     expect(String(done?.summary)).toBe('src/greet.ts toegevoegd; tests groen.\n\nVerify: groen (npm test)')
     const commit = t.mcp.calls.find((c) => c.name === 'log_commit')?.args
     expect(commit).toMatchObject({ commit_hash: await git(t.worktree, ['rev-parse', 'HEAD']), commit_message: 'feat: voeg greet() toe', task_id: 'task-1', story_id: 'story-1' })
-    expect(t.mcp.calls.find((c) => c.name === 'log_implementation')?.args.content).toBe('lokaal model start: qwen3-coder:30b, recept https://git.example/repo.git')
+    expect(t.mcp.calls.find((c) => c.name === 'log_implementation')?.args.content).toBe(`model start: ${TEST_CONFIGURATION}, recept https://git.example/repo.git`)
     expect(t.docker.runs().map((a) => a[a.indexOf('--name') + 1])).toEqual(['harness-job1-prepare-1', 'harness-job1-verify-2'])
     const containers = traceOf(t.out).filter((e) => e.type === 'container')
     expect(containers.map((e) => [e.kind, e.source])).toEqual([['prepare', 'prepare'], ['verify', 'gate']])
@@ -362,7 +370,7 @@ describe('runTaskJob — green path', () => {
       [1, Buffer.byteLength('npm ci: up to date')],
       [2, Buffer.byteLength('PASS greet.test.ts')],
     ])
-    const runDir = join(t.out, readdirSync(t.out)[0])
+    const runDir = join(t.out, jobRunDirs(t.out)[0])
     expect(readFileSync(join(runDir, 'containers', '1.txt'), 'utf8')).toBe('npm ci: up to date')
     expect(readFileSync(join(runDir, 'containers', '2.txt'), 'utf8')).toBe('PASS greet.test.ts')
   })
@@ -435,7 +443,7 @@ describe('runTaskJob — failures', () => {
     const t = await setup({ noTask: true, script: [answer('nee')] })
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
-    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'worker heeft geen task-config' }])
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'worker heeft geen task-config', cost: COST_LOCAL }])
     expect(taskUpdates(t.mcp)).toEqual([])
     expect(t.model.requests).toHaveLength(0)
     expect(t.docker.calls).toEqual([])
@@ -444,13 +452,13 @@ describe('runTaskJob — failures', () => {
   it('no recipe ⇒ failed without touching the task', async () => {
     const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, repoUrl: 'https://git.example/ander.git' }) }] })
     await t.run()
-    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'geen recept voor https://git.example/ander.git' }])
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'geen recept voor https://git.example/ander.git', cost: COST_LOCAL }])
     expect(taskUpdates(t.mcp)).toEqual([])
     expect(t.docker.runs()).toEqual([])
   })
 
   it('an invalid payload ⇒ failed, the task untouched, and the worker does not stop', async () => {
-    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION' } }, { job: ideaChatPayload({ jobId: 'job2' }) }], script: [answer('ok')], once: false })
+    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION', config: { runtime: 'HARNESS' } } }, { job: ideaChatPayload({ jobId: 'job2' }) }], script: [answer('ok')], once: false })
     const stop = new AbortController()
     t.deps.signal = stop.signal
     const orig = t.deps.control.updateStatus.bind(t.deps.control)
@@ -744,7 +752,7 @@ describe('runWorker — leftover containers', () => {
     const t = await setup({ script: [answer('nee')], docker: { leftovers: [{ out: 'abc123\n' }, { out: 'abc123\n' }], rmCode: 1 } })
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
-    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'achtergebleven harness-container niet aantoonbaar opgeruimd; geen taak uitgevoerd' }])
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'achtergebleven harness-container niet aantoonbaar opgeruimd; geen taak uitgevoerd', cost: COST_LOCAL }])
     expect(t.docker.runs()).toEqual([])
     expect(taskUpdates(t.mcp)).toEqual([])
     expect(t.model.requests).toHaveLength(0)
@@ -963,7 +971,7 @@ describe('runTaskJob — run-log (M4 Taak 6, spec §5.6)', () => {
   })
 
   it('an invalid payload ⇒ ERROR PAYLOAD_INVALID', async () => {
-    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION' } }] })
+    const t = await setup({ claims: () => [{ job: { job_id: 'job1', kind: 'TASK_IMPLEMENTATION', config: { runtime: 'HARNESS' } } }] })
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
     expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PAYLOAD_INVALID: payload ongeldig: /))
@@ -978,5 +986,327 @@ describe('runTaskJob — run-log (M4 Taak 6, spec §5.6)', () => {
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
     expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR HARNESS_ERROR: harness: /))
+  })
+})
+
+// ---- the configuration and the cost ceiling of a task job (M45-2d T-2065) ----
+
+const harnessConfig = (model: unknown, maxCost: unknown = '0.05') => ({ runtime: 'HARNESS', model, max_cost_usd: maxCost })
+const COST_NONE = { reported_cost_usd: null, cost_source: 'none' }
+const COST_LOCAL = { reported_cost_usd: '0', cost_source: 'local' }
+
+describe('runTaskJob — the configuration of a job (M45-2d T-2065)', () => {
+  const configurations = {
+    'fast-local': { costMode: 'local', contextTokens: 32768, reasoningEffort: 'none' },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768, reasoningEffort: 'high', extraBody: { temperature: 0.7 } },
+    tiny: { costMode: 'local', contextTokens: 1100 },
+  }
+  const manifestOf = (out: string, dirIndex: number) => {
+    const dir = join(out, jobRunDirs(out).sort()[dirIndex])
+    return readTrace(dir).find((e) => e.type === 'run_start') as unknown as { manifest: { model: Record<string, unknown>; limits: Record<string, unknown> } }
+  }
+
+  it('gives each task job the model client, the reasoning effort and the context window of its own configuration', async () => {
+    const t = await setup({
+      configurations,
+      claims: (wt) => [
+        { job: taskPayload({ worktree: wt, jobId: 'a', config: harnessConfig('fast-local') }) },
+        { job: taskPayload({ worktree: wt, jobId: 'b', config: harnessConfig('deep-hosted') }) },
+        { job: taskPayload({ worktree: wt, jobId: 'c', config: harnessConfig('tiny') }) },
+      ],
+      script: [write('a.txt', 'a\n', 'w1'), answer('een'), priced(write('b.txt', 'b\n', 'w2')), priced(answer('twee'))],
+      once: false,
+    })
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'c' && u.status === 'failed') stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'a', outcome: 'done' }, { jobId: 'b', outcome: 'done' }, { jobId: 'c', outcome: 'failed' }])
+    expect(t.model.requests).toHaveLength(4)
+    expect(t.model.requests.slice(0, 2).map((q) => q.body)).toEqual([expect.objectContaining({ model: 'fast-local', reasoning_effort: 'none' }), expect.objectContaining({ model: 'fast-local', reasoning_effort: 'none' })])
+    expect(t.model.requests[0].body).not.toHaveProperty('temperature')
+    expect(t.model.requests.slice(2).map((q) => q.body)).toEqual([expect.objectContaining({ model: 'deep-hosted', reasoning_effort: 'high', temperature: 0.7 }), expect.objectContaining({ model: 'deep-hosted', reasoning_effort: 'high', temperature: 0.7 })])
+    const base = t.deps.config.litellm.baseUrl
+    expect(manifestOf(t.out, 0).manifest.model).toEqual({ baseUrl: base, name: 'fast-local', reasoningEffort: 'none' })
+    expect(manifestOf(t.out, 0).manifest.limits).toMatchObject({ contextTokens: 32768, maxTurns: 10 })
+    expect(manifestOf(t.out, 1).manifest.model).toEqual({ baseUrl: base, name: 'deep-hosted', reasoningEffort: 'high', extraBody: { temperature: 0.7 } })
+    // The third job runs inside its own, small window: no request, CONTEXT_EXHAUSTED.
+    expect(String(jobUpdates(t.mcp).at(-1)?.error)).toContain('contextTokens=1100')
+    expect(manifestOf(t.out, 2).manifest.limits).toMatchObject({ contextTokens: 1100 })
+    // The log line of the task names the configuration.
+    expect(t.mcp.calls.filter((c) => c.name === 'log_implementation').map((c) => c.args.content)).toEqual([
+      'model start: fast-local, recept https://git.example/repo.git',
+      'model start: deep-hosted, recept https://git.example/repo.git',
+      'model start: tiny, recept https://git.example/repo.git',
+    ])
+  })
+
+  it('reports the configuration name as model_id when the provider does not name a model', async () => {
+    const unnamed = (turn: FakeTurn): FakeTurn => ({ body: { ...(turn.body as object), model: undefined } }) // no model name in any response
+    const t = await setup({ script: [unnamed(write('a.txt', 'a\n')), unnamed({ body: completion({ content: 'klaar', usage: { prompt_tokens: 5, completion_tokens: 2 } }) })] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({ status: 'done', model_id: TEST_CONFIGURATION })
+  })
+
+  it('fails an unknown configuration as UNKNOWN_CONFIGURATION: the task untouched, no container, no model call, and the worker carries on', async () => {
+    const t = await setup({
+      claims: (wt) => [{ job: taskPayload({ worktree: wt, jobId: 'bad', config: harnessConfig('nope') }) }, { job: ideaChatPayload({ jobId: 'job2' }) }],
+      script: [answer('idee-antwoord')],
+      once: false,
+    })
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'job2' && u.status === 'done') stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    expect(jobUpdates(t.mcp)[0]).toEqual({ job_id: 'bad', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE })
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+    expect(t.model.requests).toHaveLength(1) // only the idea chat of job2
+  })
+
+  it('writes ERROR UNKNOWN_CONFIGURATION to the run-log', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, config: harnessConfig('nope') }) }] })
+    await t.run()
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR UNKNOWN_CONFIGURATION: nope$/))
+  })
+
+  it.each([
+    ['missing', { runtime: 'HARNESS', model: TEST_CONFIGURATION }, 'COST_LIMIT_MISSING: ontbrekend'],
+    ["'0'", harnessConfig(TEST_CONFIGURATION, '0'), 'COST_LIMIT_MISSING: 0'],
+    ["'0.0000000001' (0 nanos)", harnessConfig(TEST_CONFIGURATION, '0.0000000001'), 'COST_LIMIT_MISSING: 0.0000000001'],
+    ["'abc'", harnessConfig(TEST_CONFIGURATION, 'abc'), 'COST_LIMIT_MISSING: abc'],
+    ["'1e-2'", harnessConfig(TEST_CONFIGURATION, '1e-2'), 'COST_LIMIT_MISSING: 1e-2'],
+    ['-1', harnessConfig(TEST_CONFIGURATION, -1), 'COST_LIMIT_MISSING: -1'],
+  ])('fails a ceiling that is %s as COST_LIMIT_MISSING, the task untouched, and the worker carries on', async (_what, config, error) => {
+    const t = await setup({
+      claims: (wt) => [{ job: taskPayload({ worktree: wt, jobId: 'bad', config }) }, { job: ideaChatPayload({ jobId: 'job2' }) }],
+      script: [answer('idee-antwoord')],
+      once: false,
+    })
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'job2' && u.status === 'done') stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    expect(jobUpdates(t.mcp)[0]).toEqual({ job_id: 'bad', status: 'failed', error, cost: COST_NONE })
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+  })
+
+  it('checks the configuration before the recipe, so an unknown configuration is reported even for a repo without recipe', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt, repoUrl: 'https://git.example/ander.git', config: harnessConfig('nope') }) }] })
+    await t.run()
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE }])
+  })
+})
+
+describe('runTaskJob — the probe gate per job (M45-2d T-2066)', () => {
+  const configurations = {
+    'fast-local': { costMode: 'local', contextTokens: 32768 },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768 },
+  }
+
+  it('fails a job on an unprobed configuration as CONFIGURATION_NOT_PROBED: the task untouched, no container, no model call, and the worker carries on', async () => {
+    const t = await setup({
+      configurations,
+      claims: (wt) => [
+        { job: taskPayload({ worktree: wt, jobId: 'bad', config: harnessConfig('fast-local') }) },
+        { job: ideaChatPayload({ jobId: 'job2', config: harnessConfig('deep-hosted') }) },
+      ],
+      script: [priced(answer('idee-antwoord'))],
+      once: false,
+    })
+    rmSync(join(probeDir(t.out, 'fast-local'), 'probe.json'))
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const orig = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, u) => { const r = await orig(id, u); if (id === 'job2' && (u.status === 'done' || u.status === 'failed')) stop.abort(); return r } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    expect(jobUpdates(t.mcp)[0]).toEqual({ job_id: 'bad', status: 'failed', error: expect.stringMatching(/^CONFIGURATION_NOT_PROBED: geen probe-uitslag/), cost: COST_NONE })
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+    expect(t.model.requests).toHaveLength(1) // only the idea chat of job2, on the other configuration
+    expect(t.model.requests[0].body).toMatchObject({ model: 'deep-hosted' })
+  })
+
+  it.each([
+    ['accepted: false', { accepted: false, reasons: ['stap c_two_tools: antwoord 2 heeft geen bedrag'] }, /niet aanvaard/],
+    ['another hash', { hash: '0'.repeat(64) }, /hash klopt niet/],
+  ])('fails a job on a probe with %s', async (_what, over, error) => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt }) }] })
+    seedProbe(t.deps.config, t.out, TEST_CONFIGURATION, over)
+    await t.run()
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: expect.stringMatching(error), cost: COST_NONE }])
+    expect(jobUpdates(t.mcp)[0].error).toMatch(/^CONFIGURATION_NOT_PROBED: /)
+    expect(taskUpdates(t.mcp)).toEqual([])
+    expect(t.docker.runs()).toEqual([])
+  })
+
+  it('writes ERROR CONFIGURATION_NOT_PROBED to the run-log', async () => {
+    const t = await setup({ claims: (wt) => [{ job: taskPayload({ worktree: wt }) }] })
+    rmSync(join(probeDir(t.out, TEST_CONFIGURATION), 'probe.json'))
+    await t.run()
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR CONFIGURATION_NOT_PROBED: geen probe-uitslag/))
+  })
+
+  it('checks an unknown configuration and a missing ceiling before the probe', async () => {
+    const t = await setup({
+      claims: (wt) => [{ job: taskPayload({ worktree: wt, config: harnessConfig('nope') }) }],
+    })
+    rmSync(join(probeDir(t.out, TEST_CONFIGURATION), 'probe.json'))
+    await t.run()
+    expect(jobUpdates(t.mcp)).toEqual([{ job_id: 'job1', status: 'failed', error: 'UNKNOWN_CONFIGURATION: nope', cost: COST_NONE }])
+  })
+})
+
+describe('runTaskJob — the tokens and the cost of a final status (M45-2d T-2067)', () => {
+  // The default configuration stays in: the run-log of a test is opened from it.
+  const configurations = {
+    [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 32768 },
+    'deep-hosted': { costMode: 'hosted', contextTokens: 32768 },
+  }
+  const hostedJob = (maxCost = '0.05') => (wt: string): ClaimStep[] => [{ job: taskPayload({ worktree: wt, config: harnessConfig('deep-hosted', maxCost) }) }]
+  /** A turn with what a provider measured: `usage.cost`, and optionally the provider, the cached and the thinking tokens. */
+  const turn = (
+    over: { cost?: number; provider?: string; cached?: number; thinking?: number; tool?: { path: string }; text?: string },
+    usage = { prompt_tokens: 100, completion_tokens: 20 },
+  ): FakeTurn => ({
+    body: completion({
+      ...(over.tool ? { toolCalls: [{ id: 'w1', name: 'write_file', arguments: { path: over.tool.path, content: 'x\n' } }] } : { content: over.text ?? 'klaar' }),
+      model: 'qwen3-coder:30b',
+      usage: {
+        ...usage,
+        ...(over.cost === undefined ? {} : { cost: over.cost }),
+        ...(over.cached === undefined ? {} : { prompt_tokens_details: { cached_tokens: over.cached } }),
+        ...(over.thinking === undefined ? {} : { completion_tokens_details: { reasoning_tokens: over.thinking } }),
+      },
+      ...(over.provider ? { provider: over.provider } : {}),
+    }),
+  })
+
+  it('hosted done: the exact sum of the answers (0.1 + 0.2), the providers, and the tokens summed with the cached and the thinking part', async () => {
+    const t = await setup({
+      configurations,
+      claims: hostedJob('1'),
+      script: [turn({ cost: 0.1, provider: 'DeepInfra', cached: 30, thinking: 4, tool: { path: 'a.txt' } }), turn({ cost: 0.2, provider: 'Fireworks', cached: 50, thinking: 6 })],
+    })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'done', summary: expect.any(String), model_id: 'qwen3-coder:30b',
+      input_tokens: 200, output_tokens: 40, cache_read_tokens: 80, actual_thinking_tokens: 10,
+      cost: { reported_cost_usd: '0.300000000', cost_source: 'provider_reported', provider: 'DeepInfra,Fireworks' },
+    })
+  })
+
+  it('local done: cost local "0", whatever the answers say they cost', async () => {
+    const t = await setup({ script: [turn({ cost: 3, tool: { path: 'a.txt' } }), turn({ cost: 4 })] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({ status: 'done', input_tokens: 200, output_tokens: 40, cost: COST_LOCAL })
+  })
+
+  it('hosted failed after paid answers (VERIFY_FAILED): the tokens and the cost spent so far', async () => {
+    const t = await setup({
+      configurations,
+      claims: hostedJob(),
+      script: [turn({ cost: 0.001, provider: 'DeepInfra', tool: { path: 'a.txt' } }), turn({ cost: 0.002 })],
+      docker: { verify: [RED()] },
+      maxVerifyRepairs: 1,
+    })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'failed', error: expect.stringMatching(/^failed: VERIFY_FAILED /),
+      input_tokens: 200, output_tokens: 40, cost: { reported_cost_usd: '0.003000000', cost_source: 'provider_reported', provider: 'DeepInfra' },
+    })
+  })
+
+  it('hosted COST_LIMIT_EXCEEDED after a paid answer with a tool call: failed with the exact totals; the tool did not run, no second call', async () => {
+    const t = await setup({ configurations, claims: hostedJob('0.05'), script: [turn({ cost: 0.06, tool: { path: 'a.txt' } }), turn({ cost: 0.01 })] })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'failed', error: expect.stringMatching(/^COST_LIMIT_EXCEEDED: 0\.060000000 ≥ 0\.050000000 USD na 1 aanroepen; /),
+      input_tokens: 100, output_tokens: 20, cost: { reported_cost_usd: '0.060000000', cost_source: 'provider_reported' },
+    })
+    expect(t.model.requests).toHaveLength(1)
+    expect(existsSync(join(t.worktree, 'a.txt'))).toBe(false)
+    expect(taskUpdates(t.mcp)).toEqual(['in_progress']) // the task is not put in review
+  })
+
+  it('hosted COST_LIMIT_EXCEEDED on the call after a red verify gate (afterAnswer retry): no further model call', async () => {
+    const t = await setup({
+      configurations,
+      claims: hostedJob('0.05'),
+      script: [turn({ cost: 0.01, tool: { path: 'a.txt' } }), turn({ cost: 0.05 }), turn({ cost: 0.01 })],
+      docker: { verify: [RED()] },
+    })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({
+      status: 'failed', error: expect.stringMatching(/^COST_LIMIT_EXCEEDED: 0\.060000000 ≥ 0\.050000000 USD na 2 aanroepen/), cost: { reported_cost_usd: '0.060000000', cost_source: 'provider_reported' },
+    })
+    expect(t.model.requests).toHaveLength(2)
+  })
+
+  it('hosted COST_UNKNOWN: failed, cost none, and the tokens the provider did report', async () => {
+    const t = await setup({ configurations, claims: hostedJob(), script: [turn({ tool: { path: 'a.txt' } })] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toEqual({
+      job_id: 'job1', status: 'failed', error: expect.stringMatching(/^COST_UNKNOWN: antwoord 1 van deep-hosted had geen bedrag; /),
+      input_tokens: 100, output_tokens: 20, cost: COST_NONE,
+    })
+    expect(existsSync(join(t.worktree, 'a.txt'))).toBe(false)
+  })
+
+  it('failures before the model ran: a hosted configuration has no figure (none), a local one reports local "0"', async () => {
+    const h = await setup({ configurations, claims: hostedJob(), docker: { prepare: RED('npm ERR') } })
+    await h.run()
+    expect(lastJobUpdate(h.mcp)).toEqual({ job_id: 'job1', status: 'failed', error: expect.stringMatching(/^prepare faalde/), cost: COST_NONE })
+    await model?.close()
+    await mcp?.close()
+    const l = await setup({ docker: { prepare: RED('npm ERR') } })
+    await l.run()
+    expect(lastJobUpdate(l.mcp)).toEqual({ job_id: 'job1', status: 'failed', error: expect.stringMatching(/^prepare faalde/), cost: COST_LOCAL })
+  })
+
+  it('a payload that is invalid carries no figure either: cost none', async () => {
+    const t = await setup({ claims: (wt) => [{ job: { ...taskPayload({ worktree: wt }), task: { id: '' } } }] })
+    await t.run()
+    expect(lastJobUpdate(t.mcp)).toMatchObject({ status: 'failed', error: expect.stringMatching(/^payload ongeldig/), cost: COST_NONE })
+  })
+
+  it.each(['COST_REPORT_INVALID', 'COST_REPORT_NOT_ALLOWED'] as const)('%s on the done update: the same status once more, without cost, and the job goes on as done', async (refusal) => {
+    const t = await setup({ configurations, claims: hostedJob('1'), script: [turn({ cost: 0.1, tool: { path: 'a.txt' } }), turn({ cost: 0.2 })], refuseCost: refusal })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    const dones = jobUpdates(t.mcp).filter((u) => u.status === 'done')
+    expect(dones).toHaveLength(2)
+    const { cost, ...rest } = dones[0]
+    expect(cost).toEqual({ reported_cost_usd: '0.300000000', cost_source: 'provider_reported' })
+    expect(dones[1]).toEqual(rest)
+    expect(taskUpdates(t.mcp)).toEqual(['in_progress', 'review'])
+  })
+
+  it('COST_REPORT_INVALID on a failed update: the same failed status once more, without cost', async () => {
+    const t = await setup({ docker: { prepare: RED('npm ERR') }, refuseCost: 'COST_REPORT_INVALID' })
+    await t.run()
+    const fails = jobUpdates(t.mcp).filter((u) => u.status === 'failed')
+    expect(fails).toHaveLength(2)
+    expect(fails[0]).toHaveProperty('cost')
+    expect(fails[1]).toEqual({ job_id: 'job1', status: 'failed', error: fails[0].error })
+  })
+
+  it('writes the cost line in the run-log before the closing block', async () => {
+    const t = await setup({ configurations, claims: hostedJob('0.5'), script: [turn({ cost: 0.1, provider: 'DeepInfra', tool: { path: 'a.txt' } }), turn({ cost: 0.2 })] })
+    await t.run()
+    const lines = runLogLines(t.runLogDir)
+    const at = lines.findIndex((l) => l.includes('[harness] cost source='))
+    expect(lines[at]).toMatch(/\[harness\] cost source=provider_reported amount=0\.300000000 provider=DeepInfra ceiling=0\.5$/)
+    expect(lines.filter((l) => l.includes('[harness] cost source='))).toHaveLength(1)
+    expect(at).toBeLessThan(lines.findIndex((l) => l.includes('"type":"harness.run_end"')))
   })
 })
