@@ -8,7 +8,7 @@ last_updated: 2026-10-08
 
 Recept en beheer van de nieuwe harness-dienst (M45-2d): `agent-harness.service` naast LiteLLM, beheerd door één root-wrapper die ops-agent via `sudo -n` aanroept. Spec: `docs/superpowers/specs/2026-10-05-harness-runtime-design.md` in Scrum4Me (revisie 9); plan: `docs/plans/M45-2d-harness-docker-dienst.md` in Scrum4Me (dubbel GO in planronde 7).
 
-**Stand na 2d.** De nieuwe dienst is geïnstalleerd, niet ingeschakeld en niet gestart. De oude dienst (`agent-harness-worker.service`, zijn dev-checkout `~/Development/agent-harness`, `/etc/agent-harness/worker.json` en `~/Development/scrum4me-mcp-stable`) blijft tot 2e ongemoeid; zie [idea-chat-worker.md](idea-chat-worker.md#productie-service-op-max2-sinds-2026-09-27) en [task-worker.md](task-worker.md) voor die dienst. Tot 2e staat er geen `HARNESS`-rij in de database.
+**Stand na M45-3.** `agent-harness.service` is de enige harness-dienst op max2 (ingeschakeld in 2e, stap 8.5). De oude dienst, zijn unit, dev-checkout en worker-config zijn in M45-3 verwijderd; de historische recepten staan in [idea-chat-worker.md](idea-chat-worker.md) en [task-worker.md](task-worker.md). `~/Development/scrum4me-mcp-stable` is de MCP-checkout van deze dienst.
 
 ## Indeling
 
@@ -19,10 +19,10 @@ Recept en beheer van de nieuwe harness-dienst (M45-2d): `agent-harness.service` 
 | Releases | `/srv/agent-harness/releases/<commit>` met een marker `.built` na een volledige build | `janpeter` (de map `releases` ook), `0755` |
 | `current` | `/srv/agent-harness/current`: symlink naar `releases/<commit>`, wijst altijd naar een gebouwde release | root; `/srv/agent-harness` is `root:root 0755` |
 | `release.prev` | `/var/lib/agent-harness/release.prev`: de release waar `current` naar wees vóór de laatste `release-update` | één commit en een newline |
-| `mcp.built` | `/var/lib/agent-harness/mcp.built`: de commit van de laatste geslaagde MCP-installatie in `~/Development/scrum4me-mcp-stable` (eerste gebruik: de `HEAD` waarop de oude dienst draait) | idem |
+| `mcp.built` | `/var/lib/agent-harness/mcp.built`: de commit van de laatste geslaagde MCP-installatie in `~/Development/scrum4me-mcp-stable` (eerste gebruik: de `HEAD` waarop de dienst draait) | idem |
 | `mcp.prev` | `/var/lib/agent-harness/mcp.prev`: de commit die `mcp.built` had vóór de laatste update naar een andere commit | idem |
 | Units | `/etc/systemd/system/agent-harness.service`, `agent-harness-probe.service` (uit `current/deploy/max2/`), `litellm-ollama-bridge.service` (uit `current/deploy/max2/litellm/`) | `644` |
-| Worker-config | `/etc/agent-harness/harness.json` (de nieuwe dienst) naast `worker.json` (de oude) | `root:root 0644` |
+| Worker-config | `/etc/agent-harness/harness.json` | `root:root 0644` |
 | LiteLLM-bestanden | `/etc/agent-harness/litellm/config.yaml` en `compose.yml` | `root:root 0644`, de map `0755` |
 | Sleutels | `/etc/agent-harness/litellm.env` (LiteLLM: masterkey en providersleutels) en `harness-litellm.env` (de harness en de probe: alleen de masterkey) | `root:root 0600` |
 | Runs en probe-uitslagen | `/var/lib/agent-harness/runs/` (`probe-<configuratie>/probe.json`) | `janpeter` |
@@ -65,7 +65,7 @@ De volgorde bij elke wijziging aan de dienst is: **eerst `stop-check.sh`, dan ee
 
 ## Eerst stoppen: `stop-check.sh`
 
-`deploy/max2/ops/stop-check.sh` draait op de beheerdersmachine (de Mac, bash 3.2 of 5; ssh-aliassen `scrum4me-srv` en `max2`). Het is het M4-recept ([M4-plan](../plans/M4-harness-run-logging.md), stappen 1–2) als script dat bij de eerste fout stopt, met het predicaat `runtime = 'HARNESS' or required_capability = 'local_llm'`:
+`deploy/max2/ops/stop-check.sh` draait op de beheerdersmachine (de Mac, bash 3.2 of 5; ssh-aliassen `scrum4me-srv` en `max2`). Het is het M4-recept ([M4-plan](../plans/M4-harness-run-logging.md), stappen 1–2) als script dat bij de eerste fout stopt, met het predicaat `runtime = 'HARNESS'`:
 
 1. Opname "voor" op srv, read-only (`BEGIN READ ONLY; SET LOCAL ROLE ops_readonly; …; ROLLBACK`) van `id, kind, status, retry_count`. Nooit de kolom `error`. Een opname telt alleen als `psql` met exit 0 eindigt: eerst een tussenbestand, daarna hernoemen.
 2. Staat er een rij in `CLAIMED` of `RUNNING`, dan stopt het script met die rijen (exit 1) en is er niets gestopt.
@@ -90,7 +90,7 @@ Stappen (plantaak 11):
 3. `harness_install`, losgekoppeld. `current` wijst daarna naar de gebouwde release, de units staan er maar zijn uitgeschakeld, en de bestanden en sleutels zijn aangemaakt met de modi uit de tabel hierboven. De masterkey ontstaat op max2 (`sk-` plus 48 hex-tekens) en komt identiek in beide env-bestanden; hij wordt nergens afgedrukt.
 4. **JP:** `sudo /usr/local/lib/agent-harness/ops/agent-harness-ops.sh provider-key OPENROUTER_API_KEY` aan een terminal (de waarde komt van stdin, zonder echo). Alleen JP plaatst providersleutels. De wrapper weigert een waarde met een teken dat compose in een env-bestand anders leest.
 5. `litellm_up`: de container wordt `healthy`, alleen op `127.0.0.1:4000`, de brug is actief en ingeschakeld, en de afgedrukte modelnamen zijn precies `gsq-lokaal` en `qwen3.8-or`.
-6. `harness_probe`, losgekoppeld: beide configuraties aanvaard, elk met een hash. De gsq-probe deelt Ollama met de oude dienst: lees eerst read-only de query van `stop-check.sh` stap 1 (zonder iets te stoppen); staat er een `local_llm`- of `HARNESS`-job op `CLAIMED` of `RUNNING`, wacht dan.
+6. `harness_probe`, losgekoppeld: beide configuraties aanvaard, elk met een hash. De gsq-probe deelt Ollama met de dienst: lees eerst read-only de query van `stop-check.sh` stap 1 (zonder iets te stoppen); staat er een `HARNESS`-job op `CLAIMED` of `RUNNING`, wacht dan.
 7. `harness_status`.
 
 Terugzetten van de installatie: `docker compose -p litellm -f /etc/agent-harness/litellm/compose.yml down`, `systemctl disable --now litellm-ollama-bridge`, het sudoers-bestand naar een back-upmap verplaatsen en de ops-agent-sleutels weghalen (live en baseline). De releases mogen blijven.
@@ -109,7 +109,7 @@ Een terugzetting wisselt `current` naar `release.prev` zonder build. Weer voorui
 
 ## De MCP bijwerken (2e, stap 8.1, en daarna)
 
-Voor mcp-stable gaat het in deze volgorde, nadat `stop-check.sh` is geslaagd (en in 2e nadat de oude dienst is gestopt en uitgeschakeld; beide diensten moeten stilstaan):
+Voor mcp-stable gaat het in deze volgorde, nadat `stop-check.sh` is geslaagd (`agent-harness.service` moet stilstaan):
 
 1. De doelcommit lezen: `origin/main` van scrum4me-mcp (`harness_status`, de regel `mcp origin/main`, of `git ls-remote`).
 2. Voorcontrole 2 van plantaak 10 voor die commit: elke migratie die hij verwacht staat als `finished` in `_prisma_migrations` (read-only). De wrapper kan de database niet lezen.
@@ -144,7 +144,7 @@ De cutover (Scrum4Me-plan `docs/plans/M45-2e-harness-cutover.md`, "Status 2e") i
 
 - **Diensten:**
   - `agent-harness.service` is `active` en `enabled`, op `current` = `b0152a4`.
-  - De oude `agent-harness-worker.service` is `inactive` en `disabled`, maar nog aanwezig: verwijderen hoort bij increment 3 (spec §7.3).
+  - De oude dienst was na 2e `inactive` en `disabled`; M45-3 heeft hem met zijn configuratie verwijderd (spec §7.3).
 - **mcp-stable** staat op `eaac101` (`mcp.built`), met `mcp.prev` = `285c98a`.
   - Nooit `harness_mcp_rollback` naar `285c98a` of een andere commit zonder `HARNESS`: er bestaan nu `HARNESS`-rijen.
   - Terugzetten kan alleen naar een vastgelegde commit mét `HARNESS`.

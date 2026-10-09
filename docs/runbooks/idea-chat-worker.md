@@ -1,14 +1,14 @@
 ---
 title: "IDEA_CHAT-worker op Ollama (max2): recept en praktijkbewijs"
-status: active
-last_updated: 2026-10-08
+status: deprecated
+last_updated: 2026-10-09
 ---
 
 # IDEA_CHAT-worker op Ollama (max2)
 
 Recept voor `harness worker` en het live bewijs van M2 ([spec](../specs/2026-09-26-idea-chat-local-llm-design.md), [plan](../plans/M2-idea-chat-local-llm.md)).
 
-> **Sinds de cutover van M45-2e (2026-10-08) is deze dienst uitgeschakeld.** `agent-harness-worker.service` (identiteit `local_llm`, direct tegen Ollama) is `inactive` en `disabled`. Idee-chat en taken van Agent-harness lopen nu via `agent-harness.service`, runtime `HARNESS`, via LiteLLM, met een productkeuze in workers `/context` (idee-chat `gsq-lokaal`). De env-lijst `IDEA_CHAT_LOCAL_PRODUCT_IDS` is weg uit web, en `dispatch_job` weigert `required_capability`. Beheer van de nieuwe dienst: [harness-service-max2.md](harness-service-max2.md). Unit, `worker.json` en de `local_llm`-code verwijderen hoort bij increment 3. Dit document blijft als recept en bewijs van M2–M4.
+> **Historisch.** De oude dienst is in M45-3 (2026-10-09) van max2 verwijderd. Dit document blijft als recept en bewijs van M2–M4. De huidige dienst staat in [harness-service-max2.md](harness-service-max2.md); lokaal draaien staat in de [README](../../README.md). Idee-chat en taken van Agent-harness lopen via `agent-harness.service`, runtime `HARNESS`, via LiteLLM, met een productkeuze in workers `/context`.
 
 Sinds M3 kan dezelfde worker ook `TASK_IMPLEMENTATION`-jobs met `required_capability: 'local_llm'` claimen (een `task`-blok in de config); zie [task-worker.md](task-worker.md) voor dat recept, de faalredenen en de volgorde-eis.
 

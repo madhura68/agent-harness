@@ -1,5 +1,5 @@
 # /etc/systemd/system/agent-harness.service: the M45-2d harness worker (runtime HARNESS) on max2. Installed by the ops wrapper;
-# 2d does not enable it (2e does, step 8.5). It replaces agent-harness-worker.service (the local_llm worker).
+# 2d installed it, 2e enabled it (step 8.5); it is the only harness worker on max2.
 [Unit]
 Description=agent-harness worker (runtime HARNESS, jobs via LiteLLM, M45-2d)
 After=network-online.target docker.service ollama.service

@@ -239,12 +239,12 @@ describe('ops wrapper: runuser en stilstand (helpers)', () => {
 
   it('eist stilstand van elke genoemde unit', () => {
     writeFileSync(join(dir, 'state', 'agent-harness.service'), 'inactive')
-    writeFileSync(join(dir, 'state', 'agent-harness-worker.service'), 'activating')
-    const res = runHelper('require_standstill agent-harness.service agent-harness-worker.service')
+    writeFileSync(join(dir, 'state', 'agent-harness-probe.service'), 'activating')
+    const res = runHelper('require_standstill agent-harness.service agent-harness-probe.service')
     expect(res.code).toBe(75)
-    expect(res.stderr).toContain('agent-harness-worker.service')
-    writeFileSync(join(dir, 'state', 'agent-harness-worker.service'), 'failed')
-    expect(runHelper('require_standstill agent-harness.service agent-harness-worker.service').code).toBe(0)
+    expect(res.stderr).toContain('agent-harness-probe.service')
+    writeFileSync(join(dir, 'state', 'agent-harness-probe.service'), 'failed')
+    expect(runHelper('require_standstill agent-harness.service agent-harness-probe.service').code).toBe(0)
   })
 })
 
@@ -1004,7 +1004,6 @@ exit 0`,
     mkdirSync(VAR())
     stateOf('agent-harness.service', 'inactive')
     stateOf('agent-harness-probe.service', 'inactive')
-    stateOf('agent-harness-worker.service', 'inactive')
     // node: the real one, except that a flag file makes the next call fail once (an interruption inside the switch)
     rmSync(join(dir, 'bin', 'node'))
     // (the flag fails only the switch of \`current\`; STUB_STATE_WRITE_FAIL fails every state-file writer; STUB_NODE_PRELOAD preloads a module)
@@ -1111,27 +1110,8 @@ exit 0`,
       }
     })
 
-    it.each(['mcp-update', 'mcp-rollback'])('%s weigert (75) ook bij een actieve of activerende oude dienst, zonder git of npm', (actie) => {
-      for (const toestand of ['active', 'activating']) {
-        writeFileSync(log, '')
-        stateOf('agent-harness-worker.service', toestand)
-        const res = act(actie)
-        expect(res.code, `${actie} ${toestand}`).toBe(75)
-        expect(res.stderr).toContain('agent-harness-worker.service')
-        expect(stubCalls()).toEqual(['flock -n 9', 'systemctl is-active agent-harness.service', 'systemctl is-active agent-harness-worker.service'])
-      }
-    })
-
-    it.each(['release-update', 'release-rollback'])('%s eist niets van de oude dienst: die mag draaien', (actie) => {
-      stateOf('agent-harness-worker.service', 'active')
-      writeFileSync(log, '')
-      act(actie)
-      expect(stubCalls().filter((c) => c.includes('agent-harness-worker.service'))).toEqual([])
-    })
-
     it.each(['failed', 'inactive'])('gaat bij %s door: geen weigering om de stilstand (een andere uitkomst kan er nog wel zijn)', (toestand) => {
       stateOf('agent-harness.service', toestand)
-      stateOf('agent-harness-worker.service', toestand)
       for (const actie of ACTIES) {
         const res = act(actie)
         expect(res.stderr, actie).not.toContain('is niet gestopt')
@@ -1398,7 +1378,6 @@ exit 0`,
       expect(view()).toEqual([
         'flock -n 9',
         'systemctl is-active agent-harness.service',
-        'systemctl is-active agent-harness-worker.service',
         `git -C ${d} status --porcelain`,
         `git -C ${d} fetch origin`,
         `git -C ${d} rev-parse origin/main`,
@@ -1798,7 +1777,6 @@ describe('ops wrapper: litellm-up, litellm-upgrade en status (deel e)', () => {
     mkdirSync(VAR())
     stateOf('agent-harness.service', 'inactive')
     stateOf('agent-harness-probe.service', 'inactive')
-    stateOf('agent-harness-worker.service', 'inactive')
     writeStub(
       'systemctl',
       `${LOG_LINE}
@@ -2260,7 +2238,6 @@ exit 0`,
       mkdirSync(MCP())
       stateOf('agent-harness.service', 'active')
       stateOf('agent-harness-probe.service', 'inactive')
-      stateOf('agent-harness-worker.service', 'active')
       stateOf(BRIDGE, 'active')
       writeProbe('gsq-lokaal', JSON.stringify({ accepted: true, hash: HEX64, ranAt: '2026-10-08T07:30:00.000Z', configuration: 'gsq-lokaal', reasons: [] }))
       writeProbe('qwen3.8-or', JSON.stringify({ accepted: false, hash: HEX64, ranAt: '2026-10-08T07:31:00.000Z', reasons: ['tool_calling is partial'] }))
@@ -2293,7 +2270,12 @@ exit 0`,
       const res = act('status')
       expect(res.stdout).toContain('unit agent-harness.service: active')
       expect(res.stdout).toContain('unit agent-harness-probe.service: inactive')
-      expect(res.stdout).toContain('unit agent-harness-worker.service: active')
+      // M45-3: de oude dienst bestaat niet meer; status toont precies deze drie units.
+      expect(res.stdout.match(/^unit .*$/gm)).toEqual([
+        'unit agent-harness.service: active',
+        'unit agent-harness-probe.service: inactive',
+        `unit ${BRIDGE}: active`,
+      ])
       expect(res.stdout).toContain(`unit ${BRIDGE}: active`)
       expect(res.stdout).toMatch(/litellm container: running/)
       expect(res.stdout).toContain('sha256:c2b7aba0e3ebac7618ed23d12c5c65e05c533fb6843a0c694ff5c77c53de3ddf')

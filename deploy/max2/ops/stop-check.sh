@@ -2,10 +2,10 @@
 # stop-check.sh: stop the agent-harness service on max2 without losing a claimed job. Runs on the admin machine (portable bash: macOS
 # 3.2 and bash 5, no GNU-only flags), with the ssh aliases `scrum4me-srv` and `max2`. It is the M4 stop procedure (docs/plans/
 # M4-harness-run-logging.md, step 1-2) as a script that stops at the first error, with the predicate of spec section 3 point 2:
-# the jobs of the harness are the rows with runtime HARNESS or required_capability local_llm.
+# the jobs of the harness are the rows with runtime HARNESS (the only route since M45-3).
 #
 #   1. snapshot "voor" on scrum4me-srv: one read-only transaction (BEGIN READ ONLY; SET LOCAL ROLE ops_readonly; ...; ROLLBACK) with
-#      `select id, kind, status, retry_count from claude_jobs where runtime = 'HARNESS' or required_capability = 'local_llm' order by id`.
+#      `select id, kind, status, retry_count from claude_jobs where runtime = 'HARNESS' order by id`.
 #      Never the column `error`: it can hold unredacted model or tool text. A snapshot counts only when psql ends with exit 0: it is
 #      written to a temporary file first and renamed after that, and every line must have the four fields.
 #   2. a row in CLAIMED or RUNNING: stop here with the ids (exit 1), nothing is stopped.
@@ -29,7 +29,7 @@ PSQL='docker exec -i scrum4me-postgres psql -U scrum4me -d scrum4me -X -q -v ON_
 
 SQL="BEGIN READ ONLY;
 SET LOCAL ROLE ops_readonly;
-select id, kind, status, retry_count from claude_jobs where runtime = 'HARNESS' or required_capability = 'local_llm' order by id;
+select id, kind, status, retry_count from claude_jobs where runtime = 'HARNESS' order by id;
 ROLLBACK;"
 
 work=$(mktemp -d) || { echo "stop-check: geen tijdelijke map te maken: niet gestopt" >&2; exit 1; }
