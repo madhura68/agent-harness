@@ -1,10 +1,12 @@
 ---
 title: "TASK_IMPLEMENTATION-worker op een lokaal model (max2): recept"
-status: active
-last_updated: 2026-09-28
+status: deprecated
+last_updated: 2026-10-09
 ---
 
 # TASK_IMPLEMENTATION-worker op een lokaal model (max2)
+
+> **Historisch.** De oude dienst is in M45-3 (2026-10-09) van max2 verwijderd. Dit document blijft als recept en bewijs van M2–M4. De huidige dienst staat in [harness-service-max2.md](harness-service-max2.md); lokaal draaien staat in de [README](../../README.md).
 
 Recept voor `harness worker` met een `task`-blok ([spec](../specs/2026-09-27-task-implementation-local-llm-design.md), [plan](../plans/M3-task-implementation-local-llm.md)). Bouwt voort op [idea-chat-worker.md](idea-chat-worker.md): dezelfde worker, dezelfde `local_llm`-identiteit, nu ook voor `TASK_IMPLEMENTATION`-jobs.
 
@@ -18,7 +20,7 @@ Recept voor `harness worker` met een `task`-blok ([spec](../specs/2026-09-27-tas
 
 ## Dispatchen en uitlezen
 
-Een sessie dispatcht zoals een gewone `TASK_IMPLEMENTATION`-job, met één toevoeging: `required_capability: 'local_llm'` (spec §5.1, alleen toegestaan bij die soort). Alleen taken op de default-branch komen in aanmerking — een taak die op ongemergd sprintwerk leunt hoort niet in de lokale wachtrij (spec §10). Status lezen gaat via de gewone taak-/jobtools; de taak zelf beheert de harness (`todo` → `in_progress` → `review`), niet de MCP.
+Een sessie dispatchte (M3) zoals een gewone `TASK_IMPLEMENTATION`-job; sinds M45 kiest het product de runtime (een `HARNESS`-configuratie) en kent `dispatch_job` geen capability-sleutel meer. Alleen taken op de default-branch komen in aanmerking — een taak die op ongemergd sprintwerk leunt hoort niet in de lokale wachtrij (spec §10). Status lezen gaat via de gewone taak-/jobtools; de taak zelf beheert de harness (`todo` → `in_progress` → `review`), niet de MCP.
 
 **Geen eigen `repo_url` als die gelijk is aan de product-repo.** Heeft de taak een `repo_url`, dan zoekt de MCP een repo-root onder `SCRUM4ME_REPO_ROOT_REPO_<repo-naam>`. Max2 heeft voor agent-harness alleen de product-sleutel `SCRUM4ME_REPO_ROOT_<product-id>`. Een taak met een expliciete agent-harness-`repo_url` faalt daardoor al bij de claim (`geen repo-root voor task.repo_url=… (local_llm vereist een expliciete SCRUM4ME_REPO_ROOT_*)`), zonder run-log. Zo ging het met T-44 op 2026-09-29. Laat `repo_url` leeg, dan gebruikt de MCP `product.repo_url`.
 
