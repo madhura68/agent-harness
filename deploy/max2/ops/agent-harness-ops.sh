@@ -88,14 +88,12 @@ AH_STATUS_TIMEOUT="${AH_STATUS_TIMEOUT:-20}"
 AH_RELEASE_PREV="$AH_STATE_DIR/release.prev"
 AH_MCP_BUILT="$AH_STATE_DIR/mcp.built"
 AH_MCP_PREV="$AH_STATE_DIR/mcp.prev"
-# The mcp-stable checkout of the old service (owner janpeter); only git fetch/merge/reset and the MCP install touch it (as the owner).
+# The mcp-stable checkout of the harness (owner janpeter); only git fetch/merge/reset and the MCP install touch it (as the owner).
 AH_MCP_DIR="${AH_MCP_DIR:-/home/janpeter/Development/scrum4me-mcp-stable}"
 
 UNIT_HARNESS="agent-harness.service"
 UNIT_PROBE="agent-harness-probe.service"
 UNIT_BRIDGE="litellm-ollama-bridge.service"
-# The old service: the mcp-* actions need it at a standstill too (its MCP checkout is the one they change).
-UNIT_WORKER="agent-harness-worker.service"
 LITELLM_PROJECT="litellm"
 LITELLM_CONTAINER="litellm"
 
@@ -712,7 +710,7 @@ action_status() {
     fi
   fi
 
-  for unit in "$UNIT_HARNESS" "$UNIT_PROBE" "$UNIT_WORKER" "$UNIT_BRIDGE"; do
+  for unit in "$UNIT_HARNESS" "$UNIT_PROBE" "$UNIT_BRIDGE"; do
     state=$(bounded systemctl is-active "$unit" 2>/dev/null || true)
     printf 'unit %s: %s\n' "$unit" "${state:-onbekend}"
   done
@@ -840,13 +838,13 @@ action_release_rollback() {
   printf '%s → %s\n' "${old:-onbekend}" "$prev"
 }
 
-# mcp-update: mcp.built holds the commit of the last successful install (first use: HEAD, on which the old service runs; written
+# mcp-update: mcp.built holds the commit of the last successful install (first use: HEAD, on which the harness runs; written
 # before anything changes). A dirty checkout is 75. fetch, then the target is origin/main. Only when the target differs from
 # mcp.built does mcp.built go to mcp.prev first, so a failed update (also a second attempt) leaves mcp.prev on the last good commit
 # and a repetition of a successful one leaves it on the commit before. merge --ff-only, install; only on success mcp.built becomes the target.
 action_mcp_update() {
   local dirty built target
-  require_standstill "$UNIT_HARNESS" "$UNIT_WORKER"
+  require_standstill "$UNIT_HARNESS"
   require_state_dir
   require_mcp_checkout
   dirty=$(owner_git -C "$AH_MCP_DIR" status --porcelain) || die 74 "git status in $AH_MCP_DIR mislukt"
@@ -879,7 +877,7 @@ action_mcp_update() {
 # repetition picks the same commit.
 action_mcp_rollback() {
   local old prev
-  require_standstill "$UNIT_HARNESS" "$UNIT_WORKER"
+  require_standstill "$UNIT_HARNESS"
   require_state_dir
   require_mcp_checkout
   read_state_commit "$AH_MCP_PREV"

@@ -99,7 +99,7 @@ describe('stop-check.sh', () => {
     for (const n of [1, 2]) {
       const sql = readFileSync(join(fake, `sql.${n}`), 'utf8')
       expect(sql).toMatch(/^BEGIN READ ONLY;\nSET LOCAL ROLE ops_readonly;\n/)
-      expect(sql).toContain("select id, kind, status, retry_count from claude_jobs where runtime = 'HARNESS' or required_capability = 'local_llm' order by id;")
+      expect(sql).toContain("select id, kind, status, retry_count from claude_jobs where runtime = 'HARNESS' order by id;")
       expect(sql.trimEnd().endsWith('ROLLBACK;')).toBe(true)
       expect(sql).not.toMatch(/\berror\b/i)
       expect(sql).not.toMatch(/insert|update|delete|drop|alter|create/i)
