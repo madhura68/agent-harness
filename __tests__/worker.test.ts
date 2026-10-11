@@ -1196,6 +1196,43 @@ describe('runWorker — AGENT_CHAT (test b)', () => {
   })
 })
 
+describe('runWorker — heartbeat interval per kind (M50-1b follow-up 6)', () => {
+  // Records the interval of every setInterval the job starts: the heartbeat is the only one of 10 s / 60 s. The turn is fast, so no beat fires; this
+  // pins which interval each kind asks for. That a refusal aborts the turn is covered above, with an injected heartbeatMs.
+  const intervalsOf = async (t: Awaited<ReturnType<typeof setup>>): Promise<unknown[]> => {
+    const spy = vi.spyOn(globalThis, 'setInterval')
+    try {
+      await t.run()
+      return spy.mock.calls.map((c) => c[1])
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  it('an AGENT_CHAT job without a heartbeatMs override beats every 10 s, so a cancelled turn stops within about 10 s', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('klaar')] })
+    delete t.deps.heartbeatMs
+    const intervals = await intervalsOf(t)
+    expect(intervals).toContain(10_000)
+    expect(intervals).not.toContain(60_000)
+  })
+
+  it('an IDEA_CHAT job without a heartbeatMs override keeps beating every 60 s', async () => {
+    const t = await setup({ claims: [job()], script: [answer('klaar')] })
+    delete t.deps.heartbeatMs
+    const intervals = await intervalsOf(t)
+    expect(intervals).toContain(60_000)
+    expect(intervals).not.toContain(10_000)
+  })
+
+  it('a heartbeatMs override still wins for an AGENT_CHAT job (tests and operators)', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('klaar')], heartbeatMs: 40 })
+    const intervals = await intervalsOf(t)
+    expect(intervals).toContain(40)
+    expect(intervals).not.toContain(10_000)
+  })
+})
+
 describe('runWorker — AGENT_CHAT payload and history (test g, a)', () => {
   it('an invalid payload fails that one job with PAYLOAD_INVALID and the worker goes on with the next job', async () => {
     const { pending: _pending, ...bad } = agentChatPayload({ jobId: 'bad' })

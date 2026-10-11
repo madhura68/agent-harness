@@ -5,6 +5,12 @@ import type { ToolDef, ToolRegistry, ToolSnapshot } from '../types.js'
 /** The budget of a chat run (plan M50-1b, decision 4): 48 000 characters of tool messages, 1 024 output tokens kept for the closing call. */
 export const AGENT_CHAT_BUDGET: ChatBudget = { toolChars: 48_000, closingReserve: 1_024 }
 
+/**
+ * Heartbeat interval of an AGENT_CHAT job. Cancelling a chat turn is only noticed when job_heartbeat refuses, and the harness runs one job
+ * at a time, so the next message waits until then: 10 s keeps a cancelled turn within about 10 s (60 s took 62 s in practice). One UPDATE per beat.
+ */
+export const AGENT_CHAT_HEARTBEAT_MS = 10_000
+
 const HistoryMessageSchema = z.object({ role: z.enum(['user', 'assistant']), content: z.string() })
 export type HistoryMessage = z.infer<typeof HistoryMessageSchema>
 
