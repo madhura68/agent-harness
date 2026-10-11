@@ -94,13 +94,14 @@ export function fitHistory(input: FitInput): FitResult {
 }
 
 /**
- * The product scope of a chat (spec §6.3, decision 2): a registry wrapper like capDocArgs. A call whose product_id is not the chat's own never
+ * The product scope of a chat (AGENT_CHAT, and IDEA_CHAT since ISS-10; spec §6.3, decision 2): a registry wrapper like capDocArgs. A call whose product_id is not the chat's own never
  * reaches the MCP; the model gets PRODUCT_SCOPE (a tool error, so it counts towards maxToolErrors) and sees it asked for another product.
  * The wrapper sits behind the policy, so a call without product_id is SCHEMA_MISMATCH before it gets here; the check here is for the case
  * a schema would let it through.
  */
-export function scopeToProduct(view: ToolRegistry, product: Product): ToolRegistry {
-  const label = product.code ?? product.name
+export function scopeToProduct(view: ToolRegistry, product: Product | { id: string; label: string }): ToolRegistry {
+  // The idea chat only knows the id of its product, so it passes its own label.
+  const label = 'label' in product ? product.label : (product.code ?? product.name)
   return {
     snapshot: view.snapshot,
     toOpenAiTools: () => view.toOpenAiTools(),

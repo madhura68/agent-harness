@@ -395,7 +395,16 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
     const result = await runManifest(manifest, {
       client: modelClientFor(deps.modelClients, job.name),
       trace: runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId),
-      connectRegistry: (signal) => deps.registryView(signal),
+      connectRegistry: async (signal) => {
+        // ISS-10: the idea chat reads the docs of the product of its idea only, like the chat-agent. A throw here is a failed job before the first model call.
+        const view = await deps.registryView(signal)
+        const unenforceable = checkProductScope(view.snapshot)
+        if (unenforceable.length > 0) {
+          await view.close().catch(() => undefined)
+          throw new RegistryError(`PRODUCT_SCOPE_UNENFORCEABLE: tools zonder verplicht product_id: ${unenforceable.join(', ')}`)
+        }
+        return scopeToProduct(view, { id: payload.idea.product_id, label: 'het product van dit idee' })
+      },
       signal: inner.signal,
       runStartExtra: { jobId, ideaId: payload.idea.id },
       costGuard: guard,
