@@ -5,7 +5,7 @@ import { connectWithin, runManifest } from '../run.js'
 import { RegistryError } from '../tools/registry.js'
 import { openTrace, type RunResult } from '../trace.js'
 import type { ToolRegistry } from '../types.js'
-import { AGENT_CHAT_BUDGET, AgentChatPayloadSchema, checkHistory, checkProductScope, fitHistory, productRule, scopeToProduct } from './agent-chat.js'
+import { AGENT_CHAT_BUDGET, AGENT_CHAT_HEARTBEAT_MS, AgentChatPayloadSchema, checkHistory, checkProductScope, fitHistory, productRule, scopeToProduct } from './agent-chat.js'
 import type { WorkerConfig } from './config.js'
 import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
@@ -249,7 +249,7 @@ async function runAgentChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | 
     deps.signal.addEventListener('abort', onStop, { once: true })
     if (deps.signal.aborted) inner.abort() // Ctrl-C during the running update: no model call
     let lost = false
-    const stopBeat = startHeartbeat(control, jobId, deps.heartbeatMs ?? 60_000, () => {
+    const stopBeat = startHeartbeat(control, jobId, deps.heartbeatMs ?? AGENT_CHAT_HEARTBEAT_MS, () => {
       lost = true
       inner.abort()
     })
