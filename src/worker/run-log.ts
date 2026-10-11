@@ -167,6 +167,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
   let firstFail: { code: string; message: string } | undefined
   let awaitingRunStart = false
   let pendingRunId: string | undefined
+  let pendingChatId: string | undefined
   let pendingPromptEstimate: number | undefined
   const pendingToolContent = new Map<string, string>()
   const pendingContainerOutput = new Map<number, string>()
@@ -206,6 +207,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
   function flushRunStart(tools: string[]): void {
     const fields: Record<string, unknown> = {
       runId: pendingRunId ?? jobId,
+      ...(pendingChatId !== undefined ? { chatId: pendingChatId } : {}),
       model: init.model.name,
       baseUrl: init.model.baseUrl,
       tools,
@@ -235,6 +237,7 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
         // used for RunResult.runId, so this recovers it without a direct import of the Manifest type.
         const id = (e.manifest as { id?: unknown } | null)?.id
         pendingRunId = typeof id === 'string' ? id : jobId
+        pendingChatId = e.job?.chatId
         awaitingRunStart = true
         break
       }
@@ -295,6 +298,9 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
         appendJsonLine('harness.container', redacted)
         break
       }
+      case 'closing_call':
+        appendMetaLine(`closing_call reason=${e.reason}`) // chatBudget (M50-1b): the one closing call without tools
+        break
       case 'after_answer': {
         const fields = { turn: e.turn, outcome: e.outcome }
         appendJsonLine('harness.gate', redactDeep(fields, secrets))
