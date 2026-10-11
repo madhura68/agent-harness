@@ -380,7 +380,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       if (res.message.toolCalls.length === 0) {
         if (res.finishReason === 'length') {
           if (!chat) return { status: 'budget_exceeded' }
-          messages.push({ role: 'assistant', content: res.message.content })
+          messages.push({ role: 'assistant', content: res.message.content ?? '' }) // like the retry below: some servers refuse content null without tool_calls
           // The cost ceiling stays a hard limit: if this answer itself reached it, beforeRequest stops the closing call (COST_LIMIT_EXCEEDED).
           closing = 'length'
           continue

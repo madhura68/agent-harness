@@ -318,6 +318,13 @@ describe('chatBudget — slotaanroep: maxTurns en uitvoertokens', () => {
     expectClosing(r, 1, 'length')
   })
 
+  it('een gewone aanroep op length met content null stuurt het assistant-bericht met content "" mee (sommige servers weigeren null zonder tool_calls)', async () => {
+    const r = await run((n) => (n === 1 ? reply({ content: null, finish: 'length', out: 3_072 }) : reply({ content: 'Rond af.' })))
+    expect(r.seen[1].messages.slice(-2)).toEqual([{ role: 'assistant', content: '' }, { role: 'user', content: CLOSING_PROMPT }])
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'Rond af.' })
+    expectClosing(r, 1, 'length')
+  })
+
   it('de slotaanroep na length zonder tekst is budget_exceeded (lege tekst, whitespace en null)', async () => {
     for (const content of ['', '  \n', null]) {
       const r = await run((n) => (n === 1 ? reply({ content: 'half', finish: 'length' }) : reply({ content })))
