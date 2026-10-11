@@ -1327,6 +1327,49 @@ describe('runWorker — AGENT_CHAT product scope (test d)', () => {
   })
 })
 
+describe('runWorker — IDEA_CHAT product scope (ISS-10)', () => {
+  const tool = (name: string, args: Record<string, unknown>) => ({ body: completion({ toolCalls: [{ id: 'c1', name, arguments: args }] }) })
+
+  // Guard test: this already passed before the fix and has to keep passing.
+  it('a doc call with the product of the idea goes through, with its arguments', async () => {
+    const args = { product_id: 'prod-harness', folder: 'runbooks', slug: 'worker-runbook' }
+    const t = await setup({ claims: [job()], script: [tool('get_product_doc', args), answer('Gelezen.')] })
+    await t.run()
+    expect(t.mcp.calls.filter((c) => c.name === 'get_product_doc').map((c) => c.args)).toEqual([args])
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', summary: 'Gelezen.' })
+  })
+
+  it('another product_id gives PRODUCT_SCOPE without a call on the MCP, names the right product_id, and the job ends done after the answer', async () => {
+    const t = await setup({ claims: [job()], script: [tool('get_product_doc', { product_id: 'ander-product', folder: 'runbooks', slug: 'x' }), answer('Kan niet.')] })
+    await t.run()
+    expect(t.mcp.calls.filter((c) => c.name === 'get_product_doc')).toEqual([])
+    expect(readTrace(firstRunDir(t)).find((e) => e.type === 'tool_result')).toMatchObject({ ok: false, errorCode: 'PRODUCT_SCOPE' })
+    const toolMessage = t.model.requests[1].body.messages.find((m: { role: string }) => m.role === 'tool').content as string
+    expect(toolMessage).toContain('PRODUCT_SCOPE')
+    expect(toolMessage).toContain('gebruik product_id prod-harness') // the model can correct itself
+    expect(toolMessage).not.toContain('undefined')
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', summary: 'Kan niet.' })
+  })
+
+  it('a snapshot with a tool that has no required product_id: PRODUCT_SCOPE_UNENFORCEABLE for that job, no model call, the view closed once', async () => {
+    const t = await setup({ claims: [job()], script: [answer('nee')] })
+    const inner = t.deps.registryView
+    let closed = 0
+    t.deps.registryView = async (signal) => {
+      const view = await inner(signal)
+      const entries = view.snapshot.entries.map((e) => (e.name === 'list_product_docs' ? { ...e, inputSchema: { type: 'object', properties: { folder: { type: 'string' } } } } : e))
+      return { ...view, snapshot: { entries, hash: 'x' }, close: async () => { closed++ } } satisfies ToolRegistry
+    }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    const failed = controlCalls(t.mcp).at(-1)
+    expect(failed).toMatchObject({ status: 'failed' })
+    expect(String(failed?.error)).toMatch(/PRODUCT_SCOPE_UNENFORCEABLE: .*list_product_docs/)
+    expect(t.model.requests).toHaveLength(0)
+    expect(closed).toBe(1)
+  })
+})
+
 describe('runWorker — AGENT_CHAT view and ownership (test g)', () => {
   const stopAfterDone = (t: Awaited<ReturnType<typeof setup>>, count: number) => {
     const stop = new AbortController()
