@@ -57,6 +57,8 @@ export type ErrorCode =
   | 'VERIFY_FAILED'
   | 'COST_LIMIT_EXCEEDED'
   | 'COST_UNKNOWN'
+  | 'PRODUCT_SCOPE'
+  | 'TOOL_BUDGET'
 
 // Tool contracts live here so run.ts and registry.ts share the same types.
 export type ServerSpec = { command: string; args: string[]; env?: Record<string, string> } // = Manifest.tools.server

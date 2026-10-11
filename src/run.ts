@@ -37,7 +37,7 @@ export type RunDeps = {
   /** External stop (worker: Ctrl-C or lost job ownership). Ends the run as failed/HARNESS_ERROR 'aborted'. */
   signal?: AbortSignal
   /** Worker context recorded on run_start as `job`. */
-  runStartExtra?: { jobId: string; ideaId?: string; taskId?: string }
+  runStartExtra?: { jobId: string; ideaId?: string; taskId?: string; chatId?: string }
   /**
    * Called when the model gives a final answer (no tool calls, finishReason !== 'length'). Runs within the same
    * deadline and within()-signal as everything else; an abort during the hook ends the run like a model abort
@@ -52,7 +52,19 @@ export type RunDeps = {
    * changes no total, so the check before it is the one at the top of the loop.
    */
   retryOnce?: boolean
+  /**
+   * Opt-in budget of a chat run (M50-1b, decision 4). Without it `runManifest` behaves exactly as before. With it: the tool messages of the
+   * run together stay within `toolChars` characters (each as it goes to the model, a batch reserving STUB_MAX per call); what does not fit
+   * is cut off or answered with TOOL_BUDGET; one closing call without tools follows when the budget, the turns or the output tokens run
+   * out; and a call with tools gets `closingReserve` output tokens less than what is left, which is kept for the closing call.
+   */
+  chatBudget?: ChatBudget
 }
+
+export type ChatBudget = { toolChars: number; closingReserve: number }
+
+/** Why the one closing call of a chat run was made (the `reason` of the `closing_call` trace event). */
+export type ClosingReason = 'tool_budget' | 'batch_dropped' | 'max_turns' | 'output_budget' | 'length'
 
 type Terminal = { status: RunStatus; answer?: string; error?: { code: ErrorCode | 'HARNESS_ERROR'; message: string } }
 
@@ -71,11 +83,42 @@ const ABORTED: Terminal = { status: 'failed', error: { code: 'HARNESS_ERROR', me
 // Context bookkeeping (limits.contextTokens). Characters per token, measured on 114 turns of real tool runs (JSON of
 // each message, spike 2026-09-27): p0 1.72, p50 3.06, p95 3.89. Added text counts at the dense end and removed text
 // at the sparse end, so the estimate errs high on both sides.
-const ADDED_CHARS_PER_TOKEN = 1.7
+export const ADDED_CHARS_PER_TOKEN = 1.7
 const REMOVED_CHARS_PER_TOKEN = 4
 /** Below this much room a turn cannot produce anything useful. */
 const MIN_TURN_TOKENS = 1024
-const charsOf = (value: unknown) => JSON.stringify(value).length
+export const charsOf = (value: unknown) => JSON.stringify(value).length
+/** chatBudget: the most a TOOL_BUDGET message may take, and the room below which a call is not executed but answered with it. */
+const STUB_MAX = 160
+const MIN_TOOL_ROOM = 360
+const TOOL_BUDGET_TEXT = 'de leesruimte is op; antwoord met wat je hebt'
+const TRUNCATION_NOTE = '\nafgekapt; vraag een sectie op met `heading`'
+const CLOSING_PROMPT = 'Je kunt geen tools meer gebruiken. Antwoord nu met wat je hebt.'
+
+/** The tool message as the model gets it: the serialised result. */
+const toolMessageContent = (r: Pick<ToolExecResult, 'ok' | 'errorCode' | 'content' | 'truncated'>) =>
+  JSON.stringify({ ok: r.ok, ...(r.errorCode ? { errorCode: r.errorCode } : {}), content: r.content, truncated: r.truncated })
+
+/**
+ * The tool message of `r` within `room` characters of serialised message. A result that does not fit is cut off (truncated: true, with a
+ * note); the cut is found by binary search on the length of the serialised message, so escapes count. `room` must hold the note.
+ */
+function fitToolMessage(r: ToolExecResult, room: number): { message: string; cut: boolean } {
+  const whole = toolMessageContent(r)
+  if (whole.length <= room) return { message: whole, cut: false }
+  const messageFor = (n: number) => toolMessageContent({ ...r, content: r.content.slice(0, n) + TRUNCATION_NOTE, truncated: true })
+  let lo = 0
+  let hi = r.content.length
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2)
+    if (messageFor(mid).length <= room) lo = mid
+    else hi = mid - 1
+  }
+  // No guard against a cut inside a surrogate pair is needed: JSON.stringify writes a lone half as a 6-character escape, so the message
+  // with the whole pair is shorter than the one with its first half. If the one fits, so does the other, and the search never stops on a split.
+  return { message: messageFor(lo), cut: true }
+}
+
 const COMPACTED_NOTE = (bytes: number) =>
   `[earlier tool output of ${bytes} bytes was left out to stay within the context window; call the tool again if you still need it]`
 
@@ -117,7 +160,7 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
 }
 
 /** Resolves with the connected registry, or rejects when the signal aborts first; a late registry is closed. */
-function connectWithin(connect: Promise<ToolRegistry>, signal: AbortSignal): Promise<ToolRegistry> {
+export function connectWithin(connect: Promise<ToolRegistry>, signal: AbortSignal): Promise<ToolRegistry> {
   return new Promise((resolve, reject) => {
     const onAbort = () => reject(new Error('MCP startup exceeded the deadline'))
     if (signal.aborted) onAbort()
@@ -244,14 +287,30 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       return window - after
     }
 
+    // chatBudget: characters of tool messages in the transcript, and the reason of the closing call that must come next.
+    const chat = deps.chatBudget
+    let toolSpent = 0
+    let closing: ClosingReason | undefined
+
     for (;;) {
       if (aborted()) return ABORTED
       const overCeiling = deps.costGuard?.beforeRequest()
       if (overCeiling) return overCeiling
-      if (turns + 1 > limits.maxTurns) return { status: 'budget_exceeded' }
+      // The closing call is one extra turn: it may go past maxTurns.
+      if (turns + 1 > limits.maxTurns) {
+        if (!chat) return { status: 'budget_exceeded' }
+        closing ??= 'max_turns'
+      }
       if (now() >= deadline) return { status: 'timed_out' }
       let maxTokens = limits.maxOutputTokens - outputTokens
       if (maxTokens <= 0) return { status: 'budget_exceeded' }
+      if (chat && !closing) {
+        // maxOutputTokens counts per run: a call with tools leaves the reserve for the closing call.
+        if (maxTokens - chat.closingReserve < MIN_TURN_TOKENS) closing = 'output_budget'
+        else maxTokens -= chat.closingReserve
+      }
+      if (closing) messages.push({ role: 'user', content: CLOSING_PROMPT })
+      const callTools = closing ? [] : tools
       const room = fitContext(maxTokens)
       if (room !== undefined) {
         if (room < MIN_TURN_TOKENS) {
@@ -264,8 +323,9 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       }
       turns++
 
+      if (closing) trace.event({ type: 'closing_call', reason: closing })
       trace.event({
-        type: 'model_request', turn: turns, messages: messages.length, tools: tools.length, maxTokens,
+        type: 'model_request', turn: turns, messages: messages.length, tools: callTools.length, maxTokens,
         ...(limits.contextTokens !== undefined ? { promptEstimate: estimate() } : {}),
       })
       const signal = within(deadline - now())
@@ -273,7 +333,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
       let res
       for (let attempt = 1; ; attempt++) {
         try {
-          res = await client.complete(messages, { signal, maxTokens, tools })
+          res = await client.complete(messages, { signal, maxTokens, tools: callTools })
           break
         } catch (err) {
           if (aborted()) return ABORTED
@@ -307,12 +367,24 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         ...(res.provider !== undefined ? { provider: res.provider } : {}),
       })
       // After the usage and before anything the response asks for: an unknown cost, or a reached ceiling with tools still to run, ends the run here.
-      const costStop = deps.costGuard?.afterResponse(res)
+      // The closing call is answered without tools whatever it asks for, so a reached ceiling does not stop it; an unknown cost still does.
+      const costStop = deps.costGuard?.afterResponse(closing ? { ...res, message: { ...res.message, toolCalls: [] } } : res)
       if (costStop) return costStop
 
+      if (closing) {
+        // The last word: any text is the answer (also one cut off by the token limit); tool calls in it are not executed.
+        const closingText = res.message.content ?? ''
+        return closingText.trim() === '' ? { status: 'budget_exceeded' } : { status: 'completed', answer: closingText }
+      }
       if (outputTokens > limits.maxOutputTokens) return { status: 'budget_exceeded' }
       if (res.message.toolCalls.length === 0) {
-        if (res.finishReason === 'length') return { status: 'budget_exceeded' }
+        if (res.finishReason === 'length') {
+          if (!chat) return { status: 'budget_exceeded' }
+          messages.push({ role: 'assistant', content: res.message.content ?? '' }) // like the retry below: some servers refuse content null without tool_calls
+          // The cost ceiling stays a hard limit: if this answer itself reached it, beforeRequest stops the closing call (COST_LIMIT_EXCEEDED).
+          closing = 'length'
+          continue
+        }
         const answerText = res.message.content ?? ''
         if (!deps.afterAnswer) return { status: 'completed', answer: answerText }
         if (aborted()) return ABORTED
@@ -346,13 +418,29 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         seenCallIds.add(id)
         return { ...c, id }
       })
+      if (chat && chat.toolChars - toolSpent < calls.length * STUB_MAX) {
+        // Not even a stub per call fits: the batch stays out of the transcript (an assistant message with tool_calls needs every answer).
+        closing = 'batch_dropped'
+        continue
+      }
       messages.push({ role: 'assistant', content: res.message.content, tool_calls: calls })
 
-      for (const call of calls) {
+      for (const [index, call] of calls.entries()) {
         if (aborted()) return ABORTED
         if (now() >= deadline) return { status: 'timed_out' }
         toolCalls++
         trace.event({ type: 'tool_call', callId: call.id, name: call.name, arguments: call.arguments, argumentsWasObject: call.argumentsWasObject })
+        // Room for this call: what is left, minus a stub for each later call of the batch.
+        const toolRoom = chat ? chat.toolChars - toolSpent - (calls.length - index - 1) * STUB_MAX : Infinity
+        if (chat && toolRoom < MIN_TOOL_ROOM) {
+          const stub: ToolExecResult = { ok: false, errorCode: 'TOOL_BUDGET', content: TOOL_BUDGET_TEXT, truncated: false }
+          recordToolResult(call.id, stub, false)
+          const stubMessage = toolMessageContent(stub)
+          toolSpent += stubMessage.length
+          messages.push({ role: 'tool', tool_call_id: call.id, content: stubMessage })
+          closing = 'tool_budget'
+          continue // not a tool error: it does not count towards maxToolErrors
+        }
         const toolSignal = within(deadline - now())
         const r = await executeCall(call, toolSignal)
         if (r.errorCode === 'TOOL_TIMEOUT' && aborted()) {
@@ -363,12 +451,11 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
           recordToolResult(call.id, r)
           return { status: 'timed_out' }
         }
-        recordToolResult(call.id, r)
-        messages.push({
-          role: 'tool',
-          tool_call_id: call.id,
-          content: JSON.stringify({ ok: r.ok, ...(r.errorCode ? { errorCode: r.errorCode } : {}), content: r.content, truncated: r.truncated }),
-        })
+        const fitted = chat ? fitToolMessage(r, toolRoom) : { message: toolMessageContent(r), cut: false }
+        const toolMessage = fitted.message
+        recordToolResult(call.id, r, fitted.cut)
+        toolSpent += toolMessage.length
+        messages.push({ role: 'tool', tool_call_id: call.id, content: toolMessage })
         if (!r.ok) {
           toolErrors++
           if (toolErrors > limits.maxToolErrors) {
@@ -376,16 +463,18 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
           }
         }
       }
+      if (chat && !closing && chat.toolChars - toolSpent < MIN_TOOL_ROOM) closing = 'tool_budget'
     }
   }
 
   // Spec §7: tools/<callId>.txt holds the full content; the model only ever sees the truncated text.
-  const recordToolResult = (callId: string, r: ToolExecResult) => {
+  // `cut`: the chat budget cut the content off, so the model saw truncated: true (the trace says so too).
+  const recordToolResult = (callId: string, r: ToolExecResult, cut = false) => {
     const full = r.fullContent ?? r.content
     trace.toolContent(callId, full)
     trace.event({
       type: 'tool_result', callId, ok: r.ok, ...(r.errorCode ? { errorCode: r.errorCode } : {}),
-      truncated: r.truncated, sha256: sha256(full), bytes: Buffer.byteLength(full),
+      truncated: r.truncated || cut, sha256: sha256(full), bytes: Buffer.byteLength(full),
     })
   }
 

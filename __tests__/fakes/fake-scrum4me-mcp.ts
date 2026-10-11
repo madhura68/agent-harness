@@ -139,22 +139,70 @@ export async function startFakeScrum4meMcp(
       return toolText({ ok: true })
     },
   )
-  server.registerTool('search_product_docs', { description: 'Search product docs', inputSchema: { product_id: z.string(), query: z.string() } }, async (args) => {
-    calls.push({ name: 'search_product_docs', args })
-    return toolText({ results: [{ doc_id: 'doc1', title: 'Worker-runbook', product_id: args.product_id }] })
-  })
-  server.registerTool('get_product_doc', { description: 'Read one product doc', inputSchema: { doc_id: z.string(), max_chars: z.number().int().optional() } }, async (args) => {
-    calls.push({ name: 'get_product_doc', args })
-    return toolText({ doc_id: args.doc_id, content_md: '# Worker-runbook' })
-  })
-  server.registerTool('list_product_docs', { description: 'List product docs', inputSchema: { product_id: z.string() } }, async (args) => {
-    calls.push({ name: 'list_product_docs', args })
-    return toolText({ docs: [] })
-  })
-  server.registerTool('related_product_docs', { description: 'Related product docs', inputSchema: { doc_id: z.string() } }, async (args) => {
-    calls.push({ name: 'related_product_docs', args })
-    return toolText({ related: [] })
-  })
+  // The four doc tools carry the input schemas of the real MCP (scrum4me-mcp src/tools/*-product-docs.ts): product_id is required in all of
+  // them, get/related address a doc by folder + slug. Fields the real tool defaults (limit, offset, include_*) are optional here: the SDK
+  // would put a default into the recorded arguments, and the tests compare those as sent.
+  const folder = z.enum(['adr', 'architecture', 'grills', 'patterns', 'plans', 'runbooks', 'specs', 'manual', 'api'])
+  server.registerTool(
+    'search_product_docs',
+    {
+      description: 'Search product docs',
+      inputSchema: {
+        query: z.string().min(2).max(200),
+        product_id: z.string().min(1),
+        folder: folder.optional(),
+        limit: z.number().int().min(1).max(50).optional(),
+        include_archived: z.boolean().optional(),
+        include_disabled: z.boolean().optional(),
+      },
+    },
+    async (args) => {
+      calls.push({ name: 'search_product_docs', args })
+      return toolText({ results: [{ doc_id: 'doc1', title: 'Worker-runbook', product_id: args.product_id }] })
+    },
+  )
+  server.registerTool(
+    'get_product_doc',
+    {
+      description: 'Read one product doc',
+      inputSchema: {
+        product_id: z.string().min(1),
+        folder,
+        slug: z.string().min(1).max(80),
+        max_chars: z.number().int().min(500).max(40_000).optional(),
+        offset: z.number().int().min(0).optional(),
+        heading: z.string().optional(),
+      },
+    },
+    async (args) => {
+      calls.push({ name: 'get_product_doc', args })
+      return toolText({ slug: args.slug, content_md: '# Worker-runbook' })
+    },
+  )
+  server.registerTool(
+    'list_product_docs',
+    {
+      description: 'List product docs',
+      inputSchema: {
+        product_id: z.string().min(1),
+        folder: folder.optional(),
+        status: z.enum(['draft', 'active', 'deprecated', 'archived']).optional(),
+        include_disabled: z.boolean().optional(),
+      },
+    },
+    async (args) => {
+      calls.push({ name: 'list_product_docs', args })
+      return toolText({ docs: [] })
+    },
+  )
+  server.registerTool(
+    'related_product_docs',
+    { description: 'Related product docs', inputSchema: { product_id: z.string().min(1), folder, slug: z.string().min(1).max(80) } },
+    async (args) => {
+      calls.push({ name: 'related_product_docs', args })
+      return toolText({ related: [] })
+    },
+  )
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   await server.connect(serverTransport)

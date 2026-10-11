@@ -335,6 +335,7 @@ describe('follow(): trace-event mapping (spec §5.4)', () => {
 
     expect(followed.dir).toBe(trace.dir)
     const runStart = readJsonLines().find((l) => l.type === 'harness.run_start')
+    expect(runStart).not.toHaveProperty('chatId') // only a chat job has one
     expect(runStart).toMatchObject({
       runId: 'job-1-171234',
       model: 'test-model',
@@ -471,6 +472,21 @@ describe('follow(): trace-event mapping (spec §5.4)', () => {
     followed.event({ type: 'context_compacted', turn: 3, messages: 2, bytes: 4096, estimateBefore: 9000, estimateAfter: 5000 })
     const line = readJsonLines().find((l) => l.type === 'harness.compacted')
     expect(line).toMatchObject({ turn: 3, messages: 2, bytes: 4096, estimateBefore: 9000, estimateAfter: 5000 })
+  })
+
+  it('closing_call -> a meta line with the reason (chatBudget, M50-1b)', () => {
+    const rl = openRunLog(cfg(), baseInit())!
+    const followed = rl.follow(fakeTrace())
+    followed.event({ type: 'closing_call', reason: 'tool_budget' })
+    expect(readLogText()).toMatch(/\[harness\] closing_call reason=tool_budget\n/)
+  })
+
+  it('run_start with a chat job -> harness.run_start carries chatId', () => {
+    const rl = openRunLog(cfg(), baseInit({ jobId: 'job-1' }))!
+    const followed = rl.follow(fakeTrace())
+    followed.event({ type: 'run_start', manifest: { id: 'job-1-1' }, job: { jobId: 'job-1', chatId: 'chat-7' } })
+    followed.event({ type: 'tool_snapshot', names: ['a'], hash: 'h' })
+    expect(readJsonLines().find((l) => l.type === 'harness.run_start')).toMatchObject({ runId: 'job-1-1', chatId: 'chat-7' })
   })
 
   it('after_answer -> harness.gate {turn, outcome}', () => {

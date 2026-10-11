@@ -4,11 +4,13 @@ import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { probeDir } from '../src/probe.js'
 import { createRegistryView } from '../src/tools/registry.js'
+import type { ToolRegistry } from '../src/types.js'
 import { createControlChannel } from '../src/worker/control.js'
 import { openRunLog } from '../src/worker/run-log.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
 import { completion, priced, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
 import { startFakeScrum4meMcp, type ClaimStep } from './fakes/fake-scrum4me-mcp.js'
+import { agentChatPayload } from './fakes/agent-chat-payload.js'
 import { ideaChatPayload } from './fakes/idea-chat-payload.js'
 import { seedProbe, seedProbes } from './fakes/probe-seed.js'
 import { TEST_CONFIGURATION, testModelClients, testRunLogInit, testWorkerConfig } from './fakes/worker-config.js'
@@ -1092,5 +1094,337 @@ describe('runWorker — the tokens and the cost of a final status (M45-2d T-2067
     const text = readdirSync(dir).map((f) => readFileSync(join(dir, f), 'utf8')).join('\n')
     expect(text).toMatch(/\[harness\] cost source=local amount=0 provider=- ceiling=0\.05\n/)
     expect(text).toMatch(/\[harness\] cost source=none amount=null provider=- ceiling=ontbrekend\n/)
+  })
+})
+
+// ---- AGENT_CHAT (M50-1b HA-2) ----
+
+// A 65 536-token window like the real chat configurations: the default test configuration (32 768) leaves almost nothing for the history after the
+// tool reserve of 48 000 characters (spec §6.2), which is the case of the CONTEXT_TOO_LARGE tests below, not of the other ones.
+const CHAT_CONFIGURATIONS = { [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 65_536 } }
+const chatSetup = (s: Setup) => setup({ configurations: CHAT_CONFIGURATIONS, ...s })
+const chatJob = (over: Parameters<typeof agentChatPayload>[0] = {}): ClaimStep => job(agentChatPayload(over))
+const DOC_TOOL_NAMES = ['get_product_doc', 'list_product_docs', 'related_product_docs', 'search_product_docs']
+
+/** Wraps the registryView of the deps: counts the views it opened and how often they were closed (the shared view's own close does nothing). */
+function trackViews(deps: WorkerDeps) {
+  const inner = deps.registryView
+  const stats = { opened: 0, closed: 0 }
+  deps.registryView = async (signal) => {
+    const view = await inner(signal)
+    stats.opened++
+    return { snapshot: view.snapshot, toOpenAiTools: () => view.toOpenAiTools(), execute: (n, a, sg) => view.execute(n, a, sg), close: async () => { stats.closed++; await view.close() } }
+  }
+  return stats
+}
+
+const firstRunDir = (t: { out: string }) => join(t.out, jobRunDirs(t.out)[0])
+const resultOf = (t: { out: string }) => JSON.parse(readFileSync(join(firstRunDir(t), 'result.json'), 'utf8')) as { usage: { toolErrors: number; toolCalls: number } }
+const roles = (r: { body: { messages: Array<{ role: string }> } }) => r.body.messages.map((m) => m.role)
+
+describe('runWorker — AGENT_CHAT (test b)', () => {
+  it('an empty history: system prompt + product rule, no history messages, the pending message as user; done with the answer and the tokens', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('Zie de worker-runbook.', { usage: { prompt_tokens: 120, completion_tokens: 30 } })] })
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'done' }], exitCode: 0 })
+    const messages = t.model.requests[0].body.messages
+    expect(messages).toHaveLength(2)
+    expect(messages[0].role).toBe('system')
+    expect(messages[0].content).toMatch(/^Je bent de chat-agent\. Antwoord in het Nederlands\.\n\nVaste regels \(niet uit de CLAUDE\.md\):\n- Product: Agent-harness \(code HARNESS, id prod-harness\)\./)
+    expect(messages[1]).toEqual({ role: 'user', content: 'Welke docs gaan over de worker?' })
+    expect(controlCalls(t.mcp)).toEqual([
+      { job_id: 'job1', status: 'running' },
+      { job_id: 'job1', status: 'done', summary: 'Zie de worker-runbook.', model_id: 'qwen3-coder:30b', input_tokens: 120, output_tokens: 30, cost: COST_LOCAL },
+    ])
+  })
+
+  it('two turns of history go before the pending message, in order', async () => {
+    const history = [
+      { role: 'user' as const, content: 'Vraag 1' },
+      { role: 'assistant' as const, content: 'Antwoord 1' },
+      { role: 'user' as const, content: 'Vraag 2' },
+      { role: 'assistant' as const, content: 'Antwoord 2' },
+    ]
+    const t = await chatSetup({ claims: [chatJob({ history })], script: [answer('Antwoord 3')] })
+    await t.run()
+    const messages = t.model.requests[0].body.messages
+    expect(roles(t.model.requests[0])).toEqual(['system', 'user', 'assistant', 'user', 'assistant', 'user'])
+    expect(messages.slice(1).map((m: { content: string }) => m.content)).toEqual(['Vraag 1', 'Antwoord 1', 'Vraag 2', 'Antwoord 2', 'Welke docs gaan over de worker?'])
+  })
+
+  it('the tool snapshot is exactly the four doc tools, and any other tool gives UNKNOWN_TOOL', async () => {
+    const t = await chatSetup({
+      claims: [chatJob()],
+      script: [
+        { body: completion({ toolCalls: [{ id: 'c1', name: 'update_job_status', arguments: { job_id: 'job1', status: 'done', summary: 'gehackt' } }] }) },
+        answer('Toch een antwoord.'),
+      ],
+    })
+    await t.run()
+    const trace = readTrace(firstRunDir(t))
+    expect(trace.find((e) => e.type === 'tool_snapshot')).toMatchObject({ names: DOC_TOOL_NAMES })
+    expect(t.model.requests[0].body.tools.map((x: { function: { name: string } }) => x.function.name).sort()).toEqual(DOC_TOOL_NAMES)
+    expect(trace.find((e) => e.type === 'tool_result')).toMatchObject({ errorCode: 'UNKNOWN_TOOL' })
+    expect(controlCalls(t.mcp).map((c) => c.summary)).not.toContain('gehackt')
+  })
+
+  it('records the chat on run_start, writes the history line in the run-log, and runs under the chat budget', async () => {
+    const history = [{ role: 'user' as const, content: 'Vraag 1' }, { role: 'assistant' as const, content: 'Antwoord 1' }]
+    const t = await chatSetup({ claims: [chatJob({ history })], script: [answer('Klaar.')], limits: { maxOutputTokens: 4096 } })
+    await t.run()
+    expect(readTrace(firstRunDir(t))[0]).toMatchObject({ type: 'run_start', job: { jobId: 'job1', chatId: 'chat1' } })
+    expect(runLogLines(t.runLogDir).join('\n')).toMatch(/\[harness\] history kept=1 dropped=0 est=\d+ budget=\d+\n/)
+    // chatBudget is on: a call with tools keeps closingReserve (1 024) of maxOutputTokens back for the closing call (plan 1b, decision 4: 3 072 of 4 096)
+    expect(t.model.requests[0].body.max_tokens).toBe(3072)
+  })
+
+  it('cuts a long answer at the 4 000 characters the MCP takes, with the mark (decision 1)', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('x'.repeat(5000))] })
+    await t.run()
+    const summary = String(controlCalls(t.mcp).at(-1)?.summary)
+    expect(summary).toHaveLength(4000)
+    expect(summary.endsWith('\n\n_[antwoord afgekapt]_')).toBe(true)
+  })
+
+  it('fails an unknown configuration before the view is opened', async () => {
+    const t = await chatSetup({ claims: [chatJob({ config: { runtime: 'HARNESS', model: 'bestaat-niet', max_cost_usd: '0.05' } })], script: [answer('nee')] })
+    const views = trackViews(t.deps)
+    await t.run()
+    expect(views.opened).toBe(0)
+    expect(String(controlCalls(t.mcp).at(-1)?.error)).toMatch(/^UNKNOWN_CONFIGURATION: /)
+    expect(t.model.requests).toHaveLength(0)
+  })
+})
+
+describe('runWorker — AGENT_CHAT payload and history (test g, a)', () => {
+  it('an invalid payload fails that one job with PAYLOAD_INVALID and the worker goes on with the next job', async () => {
+    const { pending: _pending, ...bad } = agentChatPayload({ jobId: 'bad' })
+    const t = await chatSetup({ claims: [job(bad), chatJob({ jobId: 'good' })], script: [answer('Gelukt.')], once: false })
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const origUpdate = t.deps.control.updateStatus.bind(t.deps.control)
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, input) => { const res = await origUpdate(id, input); if (input.status === 'done') stop.abort(); return res } }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'bad', outcome: 'failed' }, { jobId: 'good', outcome: 'done' }])
+    expect(r.exitCode).not.toBe(78) // no ClaimFilterError: the kind is right, the contract is broken, that costs one job
+    const failed = controlCalls(t.mcp).find((c) => c.job_id === 'bad')
+    expect(failed).toMatchObject({ status: 'failed', cost: COST_NONE })
+    expect(String(failed?.error)).toMatch(/^PAYLOAD_INVALID: .*pending/)
+    expect(controlCalls(t.mcp).filter((c) => c.job_id === 'bad')).toHaveLength(1) // no running
+    expect(t.model.requests).toHaveLength(1)
+  })
+
+  it('keeps the error text of a payload with very many faults within the 2 000 characters the MCP takes', async () => {
+    const history = Array.from({ length: 400 }, (_, i) => ({ role: 'USER', content: `m${i}` }))
+    const t = await chatSetup({ claims: [chatJob({ over: { history } })], script: [answer('nee')] })
+    await t.run()
+    const error = String(controlCalls(t.mcp).at(-1)?.error)
+    expect(error).toMatch(/^PAYLOAD_INVALID: /)
+    expect(error.length).toBeLessThanOrEqual(2000)
+    expect(controlCalls(t.mcp).at(-1)?.cost).toEqual(COST_NONE) // the fake refuses a longer error: the status itself arrived
+  })
+
+  it('a history that does not start with user fails that job with HISTORY_INVALID, before the view and the model', async () => {
+    const t = await chatSetup({ claims: [chatJob({ history: [{ role: 'assistant', content: 'a' }, { role: 'user', content: 'u' }] })], script: [answer('nee')] })
+    const views = trackViews(t.deps)
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(String(controlCalls(t.mcp).at(-1)?.error)).toMatch(/^HISTORY_INVALID: /)
+    expect(controlCalls(t.mcp).map((c) => c.status)).toEqual(['failed'])
+    expect(views.opened).toBe(0)
+    expect(t.model.requests).toHaveLength(0)
+  })
+
+  it('an unknown kind is still a ClaimFilterError (bewaking): the worker stops without restart', async () => {
+    const t = await chatSetup({ claims: [job({ ...agentChatPayload(), kind: 'PR_REVIEW' }), chatJob({ jobId: 'job2' })], script: [answer('nee')], once: false })
+    const r = await t.run()
+    expect(r).toEqual({ jobs: [{ jobId: 'job1', outcome: 'failed' }], exitCode: 78 })
+  })
+})
+
+describe('runWorker — AGENT_CHAT history budget (test c)', () => {
+  it('drops the oldest turn when three do not fit, and says so in the run-log', async () => {
+    // 6 messages of 12 000 characters: ~14 100 tokens per turn against a budget of ~33 000 -> two turns fit
+    const turn = (n: number) => [{ role: 'user' as const, content: `v${n}-`.padEnd(12_000, 'x') }, { role: 'assistant' as const, content: `a${n}-`.padEnd(12_000, 'y') }]
+    const t = await chatSetup({ claims: [chatJob({ history: [...turn(1), ...turn(2), ...turn(3)] })], script: [answer('Klaar.')] })
+    await t.run()
+    const sent = t.model.requests[0].body.messages as Array<{ role: string; content: string }>
+    expect(sent.map((m) => m.role)).toEqual(['system', 'user', 'assistant', 'user', 'assistant', 'user'])
+    expect(sent[1].content.startsWith('v2-')).toBe(true)
+    expect(sent[3].content.startsWith('v3-')).toBe(true)
+    expect(runLogLines(t.runLogDir).join('\n')).toMatch(/\[harness\] history kept=2 dropped=1 est=\d+ budget=\d+\n/)
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done' })
+  })
+
+  it('one pending message of 200 000 characters: CONTEXT_TOO_LARGE, no model call, no running, the view closed once, no message text in the error', async () => {
+    const t = await chatSetup({ claims: [chatJob({ pending: { message_id: 'm', content: 'GROOT-'.padEnd(200_000, 'z') } })], script: [answer('nee')] })
+    const views = trackViews(t.deps)
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(t.model.requests).toHaveLength(0)
+    expect(controlCalls(t.mcp).map((c) => c.status)).toEqual(['failed'])
+    const failed = controlCalls(t.mcp)[0]
+    expect(String(failed.error)).toMatch(/^CONTEXT_TOO_LARGE: /)
+    expect(String(failed.error)).not.toContain('GROOT-')
+    expect(failed.cost).toEqual(COST_NONE)
+    expect(views).toEqual({ opened: 1, closed: 1 }) // test g: an error after the opening and before connectRegistry closes the view exactly once
+  })
+
+  it('a window that the output budget and the tool reserve (28 236 tokens) fill on their own: CONTEXT_TOO_LARGE, however short the chat', async () => {
+    const t = await setup({ claims: [chatJob()], script: [answer('nee')], configurations: { [TEST_CONFIGURATION]: { costMode: 'local', contextTokens: 30_000 } } })
+    await t.run()
+    expect(t.model.requests).toHaveLength(0)
+    expect(String(controlCalls(t.mcp).at(-1)?.error)).toMatch(/^CONTEXT_TOO_LARGE: .*contextTokens=30000/)
+  })
+})
+
+describe('runWorker — AGENT_CHAT product scope (test d)', () => {
+  const tool = (name: string, args: Record<string, unknown>) => ({ body: completion({ toolCalls: [{ id: 'c1', name, arguments: args }] }) })
+
+  it('a doc call with the own product goes through, with its arguments', async () => {
+    const args = { product_id: 'prod-harness', folder: 'runbooks', slug: 'worker-runbook' }
+    const t = await chatSetup({ claims: [chatJob()], script: [tool('get_product_doc', args), answer('Gelezen.')] })
+    await t.run()
+    expect(t.mcp.calls.filter((c) => c.name === 'get_product_doc').map((c) => c.args)).toEqual([args])
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', summary: 'Gelezen.' })
+  })
+
+  it('another product_id gives PRODUCT_SCOPE without a call on the MCP, and counts as a tool error', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [tool('get_product_doc', { product_id: 'ander-product', folder: 'runbooks', slug: 'x' }), answer('Kan niet.')] })
+    await t.run()
+    expect(t.mcp.calls.filter((c) => c.name === 'get_product_doc')).toEqual([])
+    expect(readTrace(firstRunDir(t)).find((e) => e.type === 'tool_result')).toMatchObject({ ok: false, errorCode: 'PRODUCT_SCOPE' })
+    expect(resultOf(t).usage).toMatchObject({ toolCalls: 1, toolErrors: 1 })
+    // the model sees the refusal (not a silent rewrite) and names the product it may read
+    const toolMessage = t.model.requests[1].body.messages.find((m: { role: string }) => m.role === 'tool').content as string
+    expect(toolMessage).toContain('PRODUCT_SCOPE')
+    expect(toolMessage).toContain('HARNESS')
+    expect(toolMessage).toContain('gebruik product_id prod-harness (HARNESS)') // the model can correct itself
+  })
+
+  it('a call without product_id is still SCHEMA_MISMATCH (the policy comes first), and nothing reaches the MCP', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [tool('get_product_doc', { folder: 'runbooks', slug: 'x' }), answer('Kan niet.')] })
+    await t.run()
+    expect(t.mcp.calls.filter((c) => c.name === 'get_product_doc')).toEqual([])
+    expect(readTrace(firstRunDir(t)).find((e) => e.type === 'tool_result')).toMatchObject({ errorCode: 'SCHEMA_MISMATCH' })
+  })
+
+  it('a snapshot with a tool that has no required product_id: PRODUCT_SCOPE_UNENFORCEABLE for that job, no running, the view closed once', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('nee')] })
+    const inner = t.deps.registryView
+    let closed = 0
+    t.deps.registryView = async (signal) => {
+      const view = await inner(signal)
+      const entries = view.snapshot.entries.map((e) => (e.name === 'list_product_docs' ? { ...e, inputSchema: { type: 'object', properties: { folder: { type: 'string' } } } } : e))
+      return { ...view, snapshot: { entries, hash: 'x' }, close: async () => { closed++ } } satisfies ToolRegistry
+    }
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
+    expect(controlCalls(t.mcp).map((c) => c.status)).toEqual(['failed'])
+    expect(String(controlCalls(t.mcp)[0].error)).toMatch(/^PRODUCT_SCOPE_UNENFORCEABLE: .*list_product_docs/)
+    expect(t.model.requests).toHaveLength(0)
+    expect(closed).toBe(1)
+  })
+})
+
+describe('runWorker — AGENT_CHAT view and ownership (test g)', () => {
+  const stopAfterDone = (t: Awaited<ReturnType<typeof setup>>, count: number) => {
+    const stop = new AbortController()
+    t.deps.signal = stop.signal
+    const origUpdate = t.deps.control.updateStatus.bind(t.deps.control)
+    let done = 0
+    t.deps.control = {
+      ...t.deps.control,
+      updateStatus: async (id, input) => {
+        const res = await origUpdate(id, input)
+        if (input.status === 'done' && ++done === count) stop.abort()
+        return res
+      },
+    }
+  }
+
+  it('a refused running: abandoned, no model call, and the view is closed', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('nee')], failUpdate: ['running'] })
+    const views = trackViews(t.deps)
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('abandoned')
+    expect(t.model.requests).toHaveLength(0)
+    expect(controlCalls(t.mcp).map((c) => c.status)).toEqual(['running'])
+    expect(views).toEqual({ opened: 1, closed: 1 })
+  })
+
+  it('a refused done (JOB_CANCELLED) is logged and the worker claims the next job; each view is closed once', async () => {
+    const t = await chatSetup({ claims: [chatJob(), chatJob({ jobId: 'job2' })], script: [answer('een'), answer('twee')], once: false })
+    const views = trackViews(t.deps)
+    stopAfterDone(t, 1) // job1's done is refused below and never gets here: the stop follows the done of job2
+    const orig = t.deps.control.updateStatus
+    t.deps.control = { ...t.deps.control, updateStatus: async (id, input) => (id === 'job1' && input.status === 'done' ? { ok: false, message: 'JOB_CANCELLED' } : orig(id, input)) }
+    const r = await t.run()
+    expect(r.jobs.map((j) => j.jobId)).toEqual(['job1', 'job2'])
+    expect(r.jobs[1].outcome).toBe('done')
+    expect(t.logs.join('\n')).toMatch(/job job1: update_job_status\(done\) mislukt: JOB_CANCELLED/)
+    expect(t.model.requests).toHaveLength(2)
+    expect(views).toEqual({ opened: 2, closed: 2 })
+  })
+
+  it('a registryView that refuses: TOOL_NOT_AVAILABLE for that job, no running, the next job runs', async () => {
+    const t = await chatSetup({ claims: [chatJob(), chatJob({ jobId: 'job2' })], script: [answer('twee')], once: false })
+    const inner = t.deps.registryView
+    let n = 0
+    t.deps.registryView = (signal) => (++n === 1 ? Promise.reject(new Error('MCP weigert')) : inner(signal))
+    stopAfterDone(t, 1)
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    const first = controlCalls(t.mcp).filter((c) => c.job_id === 'job1')
+    expect(first.map((c) => c.status)).toEqual(['failed'])
+    expect(String(first[0].error)).toMatch(/^TOOL_NOT_AVAILABLE: .*MCP weigert/)
+    expect(first[0].cost).toEqual(COST_NONE)
+  })
+
+  it('a registryView that ignores the signal and hangs: failed with TOOL_NOT_AVAILABLE after the limit, no running, the next job runs', async () => {
+    const t = await chatSetup({ claims: [chatJob(), chatJob({ jobId: 'job2' })], script: [answer('twee')], once: false, limits: { maxWallSeconds: 1 } })
+    const inner = t.deps.registryView
+    let n = 0
+    t.deps.registryView = (signal) => (++n === 1 ? new Promise<ToolRegistry>(() => undefined) : inner(signal))
+    stopAfterDone(t, 1)
+    const started = Date.now()
+    const r = await t.run()
+    expect(Date.now() - started).toBeGreaterThanOrEqual(900)
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
+    const first = controlCalls(t.mcp).filter((c) => c.job_id === 'job1')
+    expect(first.map((c) => c.status)).toEqual(['failed'])
+    expect(String(first[0].error)).toMatch(/^TOOL_NOT_AVAILABLE: /)
+  })
+
+  it('a view that arrives after the limit is closed', async () => {
+    const t = await chatSetup({ claims: [chatJob(), chatJob({ jobId: 'job2' })], script: [answer('twee')], once: false, limits: { maxWallSeconds: 1 } })
+    const inner = t.deps.registryView
+    let lateClosed = 0
+    let n = 0
+    t.deps.registryView = (signal) =>
+      ++n === 1
+        ? new Promise<ToolRegistry>((resolve) =>
+            setTimeout(async () => {
+              const view = await inner()
+              resolve({ ...view, close: async () => { lateClosed++ } })
+            }, 1400),
+          )
+        : inner(signal)
+    stopAfterDone(t, 1)
+    await t.run()
+    for (let i = 0; i < 40 && lateClosed === 0; i++) await new Promise((r) => setTimeout(r, 50))
+    expect(lateClosed).toBe(1)
+    expect(controlCalls(t.mcp).filter((c) => c.job_id === 'job1').map((c) => c.status)).toEqual(['failed'])
+  })
+
+  it('a stop of the worker while the view is opening: abandoned, nothing sent to the MCP', async () => {
+    const stop = new AbortController()
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('nee')], signal: stop.signal })
+    t.deps.registryView = () => new Promise<ToolRegistry>(() => undefined)
+    setTimeout(() => stop.abort(), 150)
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'abandoned' }])
+    expect(controlCalls(t.mcp)).toEqual([])
+    expect(t.model.requests).toHaveLength(0)
   })
 })
