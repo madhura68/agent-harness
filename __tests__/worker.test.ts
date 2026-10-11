@@ -1299,6 +1299,7 @@ describe('runWorker — AGENT_CHAT product scope (test d)', () => {
     const toolMessage = t.model.requests[1].body.messages.find((m: { role: string }) => m.role === 'tool').content as string
     expect(toolMessage).toContain('PRODUCT_SCOPE')
     expect(toolMessage).toContain('HARNESS')
+    expect(toolMessage).toContain('gebruik product_id prod-harness (HARNESS)') // the model can correct itself
   })
 
   it('a call without product_id is still SCHEMA_MISMATCH (the policy comes first), and nothing reaches the MCP', async () => {

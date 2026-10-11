@@ -186,14 +186,14 @@ describe('scopeToProduct (test d)', () => {
     const f = fakeView([entry])
     const r = await scopeToProduct(f.view, product).execute('get_product_doc', { product_id: 'prod-2' }, signal)
     expect(r).toMatchObject({ ok: false, errorCode: 'PRODUCT_SCOPE', truncated: false })
-    expect(r.content).toBe('deze chat kan alleen docs van SCRUM4ME lezen')
+    expect(r.content).toBe('deze chat kan alleen docs van SCRUM4ME lezen; gebruik product_id prod-1 (SCRUM4ME)')
     expect(f.executed).toEqual([])
   })
 
   it('names the product when it has no code', async () => {
     const f = fakeView([entry])
     const r = await scopeToProduct(f.view, { id: 'prod-1', name: 'Zonder code', code: null }).execute('x', { product_id: 'prod-2' }, signal)
-    expect(r.content).toBe('deze chat kan alleen docs van Zonder code lezen')
+    expect(r.content).toBe('deze chat kan alleen docs van Zonder code lezen; gebruik product_id prod-1 (Zonder code)')
   })
 
   it('also refuses a call without a (string) product_id when it reaches the wrapper', async () => {

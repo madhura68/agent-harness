@@ -100,12 +100,13 @@ export function fitHistory(input: FitInput): FitResult {
  * a schema would let it through.
  */
 export function scopeToProduct(view: ToolRegistry, product: Product): ToolRegistry {
+  const label = product.code ?? product.name
   return {
     snapshot: view.snapshot,
     toOpenAiTools: () => view.toOpenAiTools(),
     async execute(name, args, signal) {
       if (args.product_id !== product.id) {
-        return { ok: false, errorCode: 'PRODUCT_SCOPE', content: `deze chat kan alleen docs van ${product.code ?? product.name} lezen`, truncated: false }
+        return { ok: false, errorCode: 'PRODUCT_SCOPE', content: `deze chat kan alleen docs van ${label} lezen; gebruik product_id ${product.id} (${label})`, truncated: false }
       }
       return view.execute(name, args, signal)
     },
