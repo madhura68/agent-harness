@@ -1,9 +1,11 @@
 import { createCostGuard, parseCeilingNanos, type CostGuard } from '../cost.js'
 import type { Manifest } from '../manifest.js'
 import type { ModelClient } from '../model-client.js'
-import { runManifest } from '../run.js'
+import { connectWithin, runManifest } from '../run.js'
+import { RegistryError } from '../tools/registry.js'
 import { openTrace, type RunResult } from '../trace.js'
 import type { ToolRegistry } from '../types.js'
+import { AGENT_CHAT_BUDGET, AgentChatPayloadSchema, checkHistory, checkProductScope, fitHistory, productRule, scopeToProduct } from './agent-chat.js'
 import type { WorkerConfig } from './config.js'
 import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
@@ -118,7 +120,7 @@ function ideaChatFailCode(result: RunResult): string {
   return 'JOB_FAILED'
 }
 
-/** Routes a claim by kind: IDEA_CHAT and TASK_IMPLEMENTATION; anything else is a claim-filter breach. */
+/** Routes a claim by kind: TASK_IMPLEMENTATION, AGENT_CHAT and IDEA_CHAT; anything else is a claim-filter breach (runIdeaChatJob refuses it). */
 export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJobContext): Promise<JobOutcome> {
   const started = Date.now()
   const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
@@ -131,9 +133,9 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJo
   }
   let outcome: JobOutcome = 'failed'
   try {
-    outcome = claim.kind === 'TASK_IMPLEMENTATION'
-      ? await runTaskJob(deps, claim, taskCtx, runLog)
-      : await runIdeaChatJob(deps, claim, runLog)
+    if (claim.kind === 'TASK_IMPLEMENTATION') outcome = await runTaskJob(deps, claim, taskCtx, runLog)
+    else if (claim.kind === 'AGENT_CHAT') outcome = await runAgentChatJob(deps, claim, runLog)
+    else outcome = await runIdeaChatJob(deps, claim, runLog)
     return outcome
   } catch (err) {
     if (err instanceof ContainerUncertainError) outcome = err.outcome
@@ -141,6 +143,174 @@ export async function runOneJob(deps: WorkerDeps, claim: Claim, taskCtx?: TaskJo
     throw err // de worker-lus handelt de fout af zoals nu
   } finally {
     runLog?.end(outcome, Date.now() - started)
+  }
+}
+
+/** The first faults of a failed payload parse as one line: `<path>: <message>` per issue, at most ten. */
+function issueText(error: { issues: Array<{ path: PropertyKey[]; message: string }> }): string {
+  const shown = error.issues.slice(0, 10).map((i) => `${i.path.join('.') || '<root>'}: ${i.message}`)
+  const more = error.issues.length - shown.length
+  return shown.join('; ') + (more > 0 ? ` (+${more} meer)` : '')
+}
+
+/**
+ * An AGENT_CHAT job (M50-1b, spec §6.1): the same order of checks as runIdeaChatJob, with one difference that matters. The kind is right, so a
+ * broken payload or history costs this one job (failBeforeRunning) and never the worker (no ClaimFilterError, which stops it without restart).
+ *
+ * The registry view is opened here, before `running`, to check its snapshot for the product scope and to measure the tool definitions for the
+ * history budget (decision 3). It is then handed to runManifest through connectRegistry, which closes it; until that moment the one `finally`
+ * below owns it.
+ */
+async function runAgentChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | null): Promise<JobOutcome> {
+  const { control, config } = deps
+  const log = deps.log ?? ((line: string) => process.stderr.write(`${line}\n`))
+  const { jobId } = claim
+
+  let guard: CostGuard | undefined = undefined
+  let runUsage: RunResult['usage'] | undefined
+  let ceiling = 'ontbrekend'
+  const close = async (update: StatusUpdate): Promise<JobOutcome> => {
+    const final = withMeasured(update, runUsage, guard)
+    if (final.cost) runLog?.meta(costLogLine(final.cost, ceiling))
+    const res = await sendFinalStatus(control, jobId, final)
+    if (!res.ok) log(`job ${jobId}: update_job_status(${update.status}) mislukt: ${res.message ?? 'onbekend'}`)
+    runLog?.step(`job_status ${update.status === 'done' ? 'done' : 'failed'}`)
+    return update.status === 'done' ? 'done' : 'failed'
+  }
+  // The error text of a job is `<code>: <detail>` and the MCP takes 2 000 characters of it: a long list of faults must not make it refuse the status.
+  const failJob = (code: string, detail: string) =>
+    failBeforeRunning(deps, jobId, runLog, { code, detail: cut(detail, ERROR_LIMIT - code.length - 2) }, ceiling)
+
+  const parsed = AgentChatPayloadSchema.safeParse(claim.payload)
+  if (!parsed.success) return failJob('PAYLOAD_INVALID', issueText(parsed.error))
+  const payload = parsed.data
+  const historyCheck = checkHistory(payload.history)
+  if (!historyCheck.ok) return failJob('HISTORY_INVALID', historyCheck.detail)
+
+  const resolved = resolveJobConfiguration(config, claim.payload)
+  if (!resolved.ok) return failBeforeRunning(deps, jobId, runLog, resolved.failure)
+  const job = resolved.job
+  const probed = checkProbeForJob(config, deps.out, job.name)
+  if (!probed.ok) return failBeforeRunning(deps, jobId, runLog, probed.failure, job.maxCostUsd)
+  ceiling = job.maxCostUsd
+  guard = createCostGuard({ mode: job.configuration.costMode, ceilingNanos: parseCeilingNanos(job.maxCostUsd), configuration: job.name })
+  const limits = limitsFor(config.limits, job)
+
+  let view: ToolRegistry | undefined
+  let handedOver = false
+  try {
+    // A signal that ends at the worker's stop or after maxWallSeconds; a view that ignores it cannot hold the job (connectWithin races it, and closes a late view).
+    const bounded = AbortSignal.any([deps.signal, AbortSignal.timeout(limits.maxWallSeconds * 1000)])
+    try {
+      view = await connectWithin(
+        Promise.resolve().then(() => deps.registryView(bounded)).then((v) => scopeToProduct(v, payload.chat.product)),
+        bounded,
+      )
+    } catch (err) {
+      if (deps.signal.aborted) {
+        log(`job ${jobId}: worker gestopt tijdens het openen van de doc-tools; overgeslagen`)
+        runLog?.fail('ABANDONED', 'worker gestopt tijdens het openen van de doc-tools')
+        return 'abandoned'
+      }
+      return await failJob('TOOL_NOT_AVAILABLE', err instanceof RegistryError ? err.message : `MCP server unavailable: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    const unenforceable = checkProductScope(view.snapshot)
+    if (unenforceable.length > 0) {
+      return await failJob('PRODUCT_SCOPE_UNENFORCEABLE', `tools zonder verplicht product_id: ${unenforceable.join(', ')}`)
+    }
+
+    const system = `${payload.system_prompt}\n\n${productRule(payload.chat.product)}`
+    const fit = fitHistory({
+      system,
+      pending: payload.pending.content,
+      tools: view.toOpenAiTools(),
+      history: payload.history,
+      contextTokens: job.configuration.contextTokens,
+      maxOutputTokens: limits.maxOutputTokens,
+    })
+    if (!fit.ok) {
+      return await failJob(
+        'CONTEXT_TOO_LARGE',
+        `systeemprompt, nieuw bericht en tooldefinities laten geen ruimte voor de geschiedenis (budget ${fit.budget} tokens bij contextTokens=${job.configuration.contextTokens}, maxOutputTokens=${limits.maxOutputTokens})`,
+      )
+    }
+    runLog?.meta(`history kept=${fit.kept} dropped=${fit.dropped} est=${fit.est} budget=${fit.budget}`)
+
+    const running = await control.updateStatus(jobId, { status: 'running' })
+    if (!running.ok) {
+      log(`job ${jobId}: niet (meer) van deze worker (${running.message ?? 'onbekend'}); overgeslagen`)
+      runLog?.fail('ABANDONED', `niet (meer) van deze worker (${running.message ?? 'onbekend'})`)
+      return 'abandoned'
+    }
+    runLog?.step('job_status running')
+
+    const inner = new AbortController()
+    const onStop = () => inner.abort()
+    deps.signal.addEventListener('abort', onStop, { once: true })
+    if (deps.signal.aborted) inner.abort() // Ctrl-C during the running update: no model call
+    let lost = false
+    const stopBeat = startHeartbeat(control, jobId, deps.heartbeatMs ?? 60_000, () => {
+      lost = true
+      inner.abort()
+    })
+
+    let update: StatusUpdate
+    let failInfo: { code: string; message: string } | undefined
+    try {
+      const runId = runIdFor(jobId)
+      const opened = view
+      const manifest: Manifest = {
+        id: runId,
+        profile: 'tools',
+        system,
+        prompt: payload.pending.content,
+        ...(fit.history.length > 0 ? { history: fit.history } : {}),
+        model: modelSpecFor(config, job),
+        tools: { server: { command: 'shared', args: [] }, allow: config.allow },
+        limits,
+      }
+      const result = await runManifest(manifest, {
+        client: modelClientFor(deps.modelClients, job.name),
+        trace: runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId),
+        connectRegistry: () => {
+          handedOver = true // from here runManifest closes the view
+          return Promise.resolve(opened)
+        },
+        signal: inner.signal,
+        runStartExtra: { jobId, chatId: payload.chat.id },
+        costGuard: guard,
+        retryOnce: job.configuration.costMode === 'hosted',
+        chatBudget: AGENT_CHAT_BUDGET,
+      })
+      runUsage = result.usage
+      update = closingUpdate(result, config, job.name)
+      if (update.status === 'failed') failInfo = { code: ideaChatFailCode(result), message: update.error ?? '' }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      update = { status: 'failed', error: cut(`harness: ${msg}`, ERROR_LIMIT) }
+      failInfo = { code: 'HARNESS_ERROR', message: msg }
+    } finally {
+      stopBeat()
+      deps.signal.removeEventListener('abort', onStop)
+    }
+
+    if (lost) {
+      log(`job ${jobId}: eigendom kwijt tijdens de beurt (heartbeat geweigerd); niets afgesloten`)
+      runLog?.fail('ABANDONED', 'eigendom kwijt tijdens de beurt (heartbeat geweigerd)')
+      return 'abandoned'
+    }
+    // A stop that lands after a completed turn keeps the answer.
+    if (deps.signal.aborted && update.status !== 'done') {
+      update = { status: 'failed', error: 'worker gestopt' }
+      failInfo = { code: 'STOPPED', message: 'worker gestopt' }
+    }
+    if (update.status !== 'done' && failInfo) runLog?.fail(failInfo.code, failInfo.message)
+    const outcome = await close(update)
+    log(`job ${jobId}: ${outcome}`)
+    return outcome
+  } finally {
+    // The one place that closes a view runManifest never got (a refusal, an error or a stop before connectRegistry).
+    if (view && !handedOver) await view.close().catch(() => undefined)
   }
 }
 
@@ -163,7 +333,7 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
     return update.status === 'done' ? 'done' : 'failed'
   }
 
-  // Second lock behind the claim filter: this worker runs IDEA_CHAT and TASK_IMPLEMENTATION only.
+  // Second lock behind the claim filter: this worker runs IDEA_CHAT, AGENT_CHAT (own branch) and TASK_IMPLEMENTATION only.
   if (claim.kind !== 'IDEA_CHAT') {
     runLog?.fail('CLAIM_FILTER', `kind ${claim.kind} niet ondersteund door agent-harness`)
     await close({ status: 'failed', error: `kind ${claim.kind} niet ondersteund door agent-harness` }, false) // not a job of this worker: no cost report
