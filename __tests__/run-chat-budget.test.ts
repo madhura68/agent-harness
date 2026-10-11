@@ -133,6 +133,37 @@ describe('chatBudget — toolbudget: afkappen', () => {
     expect(closingEvents(r.events)).toHaveLength(0)
   })
 
+  it('de afkap houdt het bericht geldige JSON, binnen de ruimte en zonder losse surrogaat, ook met emoji en stuurtekens', async () => {
+    const content = '😀\u0001a'.repeat(500)
+    for (let toolChars = 360; toolChars <= 420; toolChars++) {
+      const r = await run((n) => (n === 1 ? reply({ calls: 1 }) : reply({ content: 'ok' })), { chat: { toolChars, closingReserve: 1_024 }, handler: () => ok(content) })
+      const msg = toolMessages(r.seen[1])[0].content
+      expect(msg.length, `ruimte ${toolChars}`).toBeLessThanOrEqual(toolChars)
+      const parsed = JSON.parse(msg) as { content: string; truncated: boolean } // throws on invalid JSON
+      expect(parsed.truncated).toBe(true)
+      expect(parsed.content, `ruimte ${toolChars}`).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/)
+      expect(msg, `ruimte ${toolChars}`).not.toMatch(/\\ud[89ab][0-9a-f]{2}|\\ud[c-f][0-9a-f]{2}/i) // no escaped half either
+      expect(content.startsWith(parsed.content.slice(0, parsed.content.indexOf('\nafgekapt')))).toBe(true)
+    }
+  })
+
+  it('het tool_result-event zegt truncated: true als de chatbudget afkapt, ook als het registryresultaat dat niet was', async () => {
+    const cut = await run((n) => (n === 1 ? reply({ calls: 1 }) : reply({ content: 'ok' })), { chat: { toolChars: 1_000, closingReserve: 1_024 }, handler: () => ok('x'.repeat(5_000)) })
+    expect(cut.events.find((e) => e.type === 'tool_result')).toMatchObject({ ok: true, truncated: true })
+    expect(JSON.parse(toolMessages(cut.seen[1])[0].content).truncated).toBe(true)
+    const whole = await run((n) => (n === 1 ? reply({ calls: 1 }) : reply({ content: 'ok' })), { handler: () => ok('kort') })
+    expect(whole.events.find((e) => e.type === 'tool_result')).toMatchObject({ truncated: false })
+    const registryCut = await run((n) => (n === 1 ? reply({ calls: 1 }) : reply({ content: 'ok' })), { handler: () => ({ ok: true, content: 'kort', truncated: true }) })
+    expect(registryCut.events.find((e) => e.type === 'tool_result')).toMatchObject({ truncated: true })
+    const stub = await run((n) => (n === 1 ? reply({ calls: 1 }) : reply({ content: 'ok' })), { chat: { toolChars: 300, closingReserve: 1_024 } })
+    expect(stub.events.find((e) => e.type === 'tool_result')).toMatchObject({ ok: false, errorCode: 'TOOL_BUDGET', truncated: false })
+  })
+
+  it('bewaking: zonder chatBudget meldt tool_result alleen de truncated van de registry', async () => {
+    const r = await run((n) => (n === 1 ? reply({ calls: 1 }) : reply({ content: 'ok' })), { chat: null, handler: () => ok('x'.repeat(60_000)) })
+    expect(r.events.find((e) => e.type === 'tool_result')).toMatchObject({ truncated: false })
+  })
+
   it('telt de som van alle tool-berichten, ook bij grote batches, en laat nooit een aanroep zonder antwoord', async () => {
     for (const perBatch of [25, 40, 150]) {
       const r = await run((_n, s) => (s.tools.length > 0 ? reply({ calls: perBatch }) : reply({ content: 'Klaar.' })), {
@@ -185,16 +216,20 @@ describe('chatBudget — TOOL_BUDGET en batch-reservering', () => {
     expectClosing(r, 1, 'batch_dropped')
   })
 
-  it('een batch van 40 bij precies genoeg ruimte voor de stubs komt wel in het transcript: 40 antwoorden, hooguit toolChars, de eerste aanroepen zijn stubs', async () => {
+  it('een batch van 40 bij precies genoeg ruimte voor de stubs komt wel in het transcript: eerst 5 stubs, dan 35 uitgevoerd, hooguit toolChars', async () => {
     const r = await run((n) => (n === 1 ? reply({ calls: 40 }) : reply({ content: 'ok' })), { chat: { toolChars: 40 * STUB_MAX, closingReserve: 1_024 } })
     const msgs = toolMessages(r.seen[1])
     expect(msgs).toHaveLength(40)
     expectEveryCallAnswered(r.seen[1].messages)
-    // the first call has 6400 − 39 × 160 = 160 left, below 360: a stub; the stubs are shorter than their reserve, so later calls do run
-    expect(JSON.parse(msgs[0].content)).toMatchObject({ errorCode: 'TOOL_BUDGET' })
-    expect(r.executed.length + msgs.filter((m) => JSON.parse(m.content).errorCode === 'TOOL_BUDGET').length).toBe(40)
+    // Room of call i = 6400 − spent − (39 − i) × 160, a stub being 114 characters and a result of 'klein' 47:
+    // i=0: 160, i=1: 206, i=2: 252, i=3: 298, i=4: 344 (all below 360: a stub); i=5: 390 and from there on more: executed.
+    const kinds = msgs.map((m) => (JSON.parse(m.content).errorCode === 'TOOL_BUDGET' ? 'stub' : 'uitgevoerd'))
+    expect(kinds).toEqual([...Array(5).fill('stub'), ...Array(35).fill('uitgevoerd')])
+    expect(msgs.slice(0, 5).map((m) => m.content.length)).toEqual([114, 114, 114, 114, 114])
+    expect(msgs[5].content).toBe(JSON.stringify({ ok: true, content: 'klein', truncated: false }))
+    expect(r.executed).toHaveLength(35)
     expect(msgs.reduce((total, m) => total + m.content.length, 0)).toBeLessThanOrEqual(40 * STUB_MAX)
-    expectClosing(r, 1, 'tool_budget')
+    expectClosing(r, 1, 'tool_budget') // a stub was given: the closing call follows
   })
 
   it('ruimte 300 (onder 360): TOOL_BUDGET zonder uitvoering', async () => {
@@ -315,6 +350,16 @@ describe('chatBudget — slotaanroep: maxTurns en uitvoertokens', () => {
     const guard = createCostGuard({ mode: 'hosted', ceilingNanos: parseCeilingNanos('1'), configuration: 'cfg' })
     const r = await run((n) => (n === 1 ? reply({ calls: 1, cost: 0.001 }) : reply({ content: 'Dit heb ik.' })), { limits: { maxTurns: 1 }, costGuard: guard })
     expect(r.result).toMatchObject({ status: 'failed', error: { code: 'COST_UNKNOWN' } })
+  })
+})
+
+describe('chatBudget — kostenplafond blijft hard', () => {
+  it('een hosted direct antwoord op length dat zelf het plafond bereikt: de slotaanroep wordt niet gedaan (COST_LIMIT_EXCEEDED)', async () => {
+    const guard = createCostGuard({ mode: 'hosted', ceilingNanos: parseCeilingNanos('0.01'), configuration: 'cfg' })
+    const r = await run(() => reply({ content: 'half antwoord', finish: 'length', cost: 0.02 }), { costGuard: guard })
+    expect(r.result).toMatchObject({ status: 'failed', error: { code: 'COST_LIMIT_EXCEEDED' } })
+    expect(r.seen).toHaveLength(1)
+    expect(closingEvents(r.events)).toHaveLength(0)
   })
 })
 

@@ -103,9 +103,9 @@ const toolMessageContent = (r: Pick<ToolExecResult, 'ok' | 'errorCode' | 'conten
  * The tool message of `r` within `room` characters of serialised message. A result that does not fit is cut off (truncated: true, with a
  * note); the cut is found by binary search on the length of the serialised message, so escapes count. `room` must hold the note.
  */
-function fitToolMessage(r: ToolExecResult, room: number): string {
+function fitToolMessage(r: ToolExecResult, room: number): { message: string; cut: boolean } {
   const whole = toolMessageContent(r)
-  if (whole.length <= room) return whole
+  if (whole.length <= room) return { message: whole, cut: false }
   const messageFor = (n: number) => toolMessageContent({ ...r, content: r.content.slice(0, n) + TRUNCATION_NOTE, truncated: true })
   let lo = 0
   let hi = r.content.length
@@ -114,9 +114,9 @@ function fitToolMessage(r: ToolExecResult, room: number): string {
     if (messageFor(mid).length <= room) lo = mid
     else hi = mid - 1
   }
-  // no half surrogate pair at the cut
-  if (lo > 0 && /[\uD800-\uDBFF]/.test(r.content[lo - 1])) lo--
-  return messageFor(lo)
+  // No guard against a cut inside a surrogate pair is needed: JSON.stringify writes a lone half as a 6-character escape, so the message
+  // with the whole pair is shorter than the one with its first half. If the one fits, so does the other, and the search never stops on a split.
+  return { message: messageFor(lo), cut: true }
 }
 
 const COMPACTED_NOTE = (bytes: number) =>
@@ -381,6 +381,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         if (res.finishReason === 'length') {
           if (!chat) return { status: 'budget_exceeded' }
           messages.push({ role: 'assistant', content: res.message.content })
+          // The cost ceiling stays a hard limit: if this answer itself reached it, beforeRequest stops the closing call (COST_LIMIT_EXCEEDED).
           closing = 'length'
           continue
         }
@@ -433,7 +434,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         const toolRoom = chat ? chat.toolChars - toolSpent - (calls.length - index - 1) * STUB_MAX : Infinity
         if (chat && toolRoom < MIN_TOOL_ROOM) {
           const stub: ToolExecResult = { ok: false, errorCode: 'TOOL_BUDGET', content: TOOL_BUDGET_TEXT, truncated: false }
-          recordToolResult(call.id, stub)
+          recordToolResult(call.id, stub, false)
           const stubMessage = toolMessageContent(stub)
           toolSpent += stubMessage.length
           messages.push({ role: 'tool', tool_call_id: call.id, content: stubMessage })
@@ -450,8 +451,9 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
           recordToolResult(call.id, r)
           return { status: 'timed_out' }
         }
-        recordToolResult(call.id, r)
-        const toolMessage = chat ? fitToolMessage(r, toolRoom) : toolMessageContent(r)
+        const fitted = chat ? fitToolMessage(r, toolRoom) : { message: toolMessageContent(r), cut: false }
+        const toolMessage = fitted.message
+        recordToolResult(call.id, r, fitted.cut)
         toolSpent += toolMessage.length
         messages.push({ role: 'tool', tool_call_id: call.id, content: toolMessage })
         if (!r.ok) {
@@ -466,12 +468,13 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
   }
 
   // Spec §7: tools/<callId>.txt holds the full content; the model only ever sees the truncated text.
-  const recordToolResult = (callId: string, r: ToolExecResult) => {
+  // `cut`: the chat budget cut the content off, so the model saw truncated: true (the trace says so too).
+  const recordToolResult = (callId: string, r: ToolExecResult, cut = false) => {
     const full = r.fullContent ?? r.content
     trace.toolContent(callId, full)
     trace.event({
       type: 'tool_result', callId, ok: r.ok, ...(r.errorCode ? { errorCode: r.errorCode } : {}),
-      truncated: r.truncated, sha256: sha256(full), bytes: Buffer.byteLength(full),
+      truncated: r.truncated || cut, sha256: sha256(full), bytes: Buffer.byteLength(full),
     })
   }
 
