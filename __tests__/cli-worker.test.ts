@@ -258,14 +258,14 @@ describe('harness worker', () => {
 
   it('caps max_chars of get_product_doc at 12 000 on its way to the MCP (ISS-1)', async () => {
     const m = await litellm([
-      { body: completion({ toolCalls: [{ id: 'c1', name: 'get_product_doc', arguments: JSON.stringify({ doc_id: 'doc1', max_chars: 40_000 }) }], model: 'qwen3-coder:30b' }) },
+      { body: completion({ toolCalls: [{ id: 'c1', name: 'get_product_doc', arguments: JSON.stringify({ product_id: 'prod-harness', folder: 'runbooks', slug: 'worker-runbook', max_chars: 40_000 }) }], model: 'qwen3-coder:30b' }) },
       { body: completion({ content: 'Antwoord.', model: 'qwen3-coder:30b' }) },
     ])
     process.env.SCRUM4ME_TOKEN = 'x'
     claims = [{ job: ideaChatPayload() }]
     const { code } = await runWorkerCli(m.baseUrl)
     expect(code).toBe(0)
-    expect(fakeMcp?.calls.filter((c) => c.name === 'get_product_doc').map((c) => c.args)).toEqual([{ doc_id: 'doc1', max_chars: 12_000 }])
+    expect(fakeMcp?.calls.filter((c) => c.name === 'get_product_doc').map((c) => c.args)).toEqual([{ product_id: 'prod-harness', folder: 'runbooks', slug: 'worker-runbook', max_chars: 12_000 }])
   })
 })
 
