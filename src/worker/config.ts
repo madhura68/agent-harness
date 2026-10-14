@@ -20,6 +20,59 @@ export const CONTROL_TOOLS = [
 
 const DEFAULT_LIMITS = { maxTurns: 6, maxOutputTokens: 2048, maxWallSeconds: 240, maxToolErrors: 2 }
 
+/** The tools the model may call, per chat kind (IDEA-262, spec §3.1). The idea chat never gets more than the doc tools. */
+export type AllowByKind = { IDEA_CHAT: string[]; AGENT_CHAT: string[] }
+/** The job kinds a registry view is opened for; a task job always gets DOC_TOOLS next to its task tools. */
+export type ViewKind = 'IDEA_CHAT' | 'AGENT_CHAT' | 'TASK_IMPLEMENTATION'
+
+const toolList = z.array(z.string().min(1)).min(1)
+const AllowObjectSchema = z.strictObject({ IDEA_CHAT: toolList.optional(), AGENT_CHAT: toolList })
+
+/**
+ * `allow` is the array form (one list, doc tools only, for both chat kinds) or the object form `{ IDEA_CHAT?, AGENT_CHAT }`. The paths of
+ * the issues are relative: zod prefixes the property name `allow` itself, so loadWorkerConfig prints `allow: …` and `allow.AGENT_CHAT: …`.
+ */
+function parseAllow(raw: unknown, ctx: z.RefinementCtx): AllowByKind {
+  const docTools: readonly string[] = DOC_TOOLS
+  const controlTools: readonly string[] = CONTROL_TOOLS
+  if (raw === undefined) return { IDEA_CHAT: [...DOC_TOOLS], AGENT_CHAT: [...DOC_TOOLS] }
+  if (Array.isArray(raw)) {
+    const list = toolList.safeParse(raw)
+    if (!list.success) {
+      for (const issue of list.error.issues) ctx.addIssue({ code: 'custom', message: issue.message, path: issue.path })
+      return z.NEVER
+    }
+    // Stricter than banning the control tools: in the array form anything outside the doc tools could write.
+    const bad = list.data.find((tool) => !docTools.includes(tool))
+    if (bad !== undefined) {
+      ctx.addIssue({ code: 'custom', path: [], message: `tool ${bad} is niet toegestaan in de arrayvorm (alleen ${DOC_TOOLS.join(', ')}); zet hem onder AGENT_CHAT` })
+      return z.NEVER
+    }
+    return { IDEA_CHAT: [...list.data], AGENT_CHAT: [...list.data] }
+  }
+  if (typeof raw === 'object' && raw !== null) {
+    const obj = AllowObjectSchema.safeParse(raw)
+    if (!obj.success) {
+      for (const issue of obj.error.issues) ctx.addIssue({ code: 'custom', message: issue.message, path: issue.path })
+      return z.NEVER
+    }
+    const ideaChat = obj.data.IDEA_CHAT ?? [...DOC_TOOLS]
+    const badIdea = ideaChat.find((tool) => !docTools.includes(tool))
+    if (badIdea !== undefined) {
+      ctx.addIssue({ code: 'custom', path: ['IDEA_CHAT'], message: `tool ${badIdea} is niet toegestaan voor de idee-chat (alleen ${DOC_TOOLS.join(', ')})` })
+      return z.NEVER
+    }
+    const badAgent = obj.data.AGENT_CHAT.find((tool) => controlTools.includes(tool))
+    if (badAgent !== undefined) {
+      ctx.addIssue({ code: 'custom', path: ['AGENT_CHAT'], message: `tool ${badAgent} is een besturingstool van de harness en wordt nooit aan het model aangeboden` })
+      return z.NEVER
+    }
+    return { IDEA_CHAT: ideaChat, AGENT_CHAT: obj.data.AGENT_CHAT }
+  }
+  ctx.addIssue({ code: 'custom', path: [], message: 'allow is een lijst van toolnamen of een object { IDEA_CHAT?, AGENT_CHAT }' })
+  return z.NEVER
+}
+
 // Run-log path segments (spec docs/specs/2026-09-28-harness-run-logging-design.md §5.1); matches the
 // worker-log pipeline's own NAME_SEGMENT_RE (scrum4me-docker/Ops-dashboard lib/worker-logs.ts).
 const SEGMENT = /^[A-Za-z0-9._-]{1,64}$/
@@ -137,7 +190,7 @@ export const WorkerConfigSchema = z
       .record(z.string().regex(CONFIGURATION_NAME, { message: `een configuratienaam volgt ${CONFIGURATION_NAME}` }), ConfigurationSchema)
       .refine((all) => Object.keys(all).length > 0, { message: 'minstens één configuratie is nodig' }),
     mcp: z.strictObject({ command: z.string().min(1), args: z.array(z.string()), env: z.record(z.string(), z.string()).optional() }),
-    allow: z.array(z.string().min(1)).min(1).default([...DOC_TOOLS]),
+    allow: z.unknown().optional().transform(parseAllow),
     limits: z
       .strictObject({
         maxTurns: z.number().int().positive().default(DEFAULT_LIMITS.maxTurns),
@@ -150,17 +203,13 @@ export const WorkerConfigSchema = z
     task: WorkerTaskConfigSchema.optional(),
     workerLog: z.strictObject({ dir: z.string().min(1), pool: z.string().regex(SEGMENT), instance: z.string().regex(SEGMENT) }).optional(),
   })
-  .superRefine((cfg, ctx) => {
-    // Stricter than banning the control tools: anything outside the doc tools could write.
-    const docTools: readonly string[] = DOC_TOOLS
-    for (const tool of cfg.allow) {
-      if (!docTools.includes(tool)) {
-        ctx.addIssue({ code: 'custom', path: ['allow'], message: `tool ${tool} is niet toegestaan in worker-modus (alleen ${DOC_TOOLS.join(', ')})` })
-      }
-    }
-  })
 
 export type WorkerConfig = z.infer<typeof WorkerConfigSchema>
+
+/** The tools the view of a job of `kind` offers: the doc tools for a task job, the configured list for a chat kind. */
+export function allowFor(config: WorkerConfig, kind: ViewKind): string[] {
+  return kind === 'TASK_IMPLEMENTATION' ? [...DOC_TOOLS] : config.allow[kind]
+}
 
 /** Reads and validates a worker config. Expands NOTHING, like loadManifest. */
 export function loadWorkerConfig(path: string): WorkerConfig {

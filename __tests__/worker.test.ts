@@ -3,9 +3,10 @@ import { join } from 'node:path'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { probeDir } from '../src/probe.js'
-import { createRegistryView } from '../src/tools/registry.js'
 import type { ToolRegistry } from '../src/types.js'
+import type { ViewKind } from '../src/worker/config.js'
 import { createControlChannel } from '../src/worker/control.js'
+import { workerRegistryView } from '../src/worker/doc-tools.js'
 import { openRunLog } from '../src/worker/run-log.js'
 import { runWorker, type WorkerDeps } from '../src/worker/worker.js'
 import { completion, priced, startFakeModelServer, type FakeTurn } from './fakes/fake-model-server.js'
@@ -44,6 +45,8 @@ type Setup = {
   requestTimeoutMs?: number
   /** The MCP refuses the cost of a final update (M45-2d T-2067). */
   refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
+  /** The raw `allow` of the worker config (array or object form, IDEA-262); the schema default without it. */
+  allow?: unknown
 }
 
 async function setup(s: Setup) {
@@ -54,6 +57,7 @@ async function setup(s: Setup) {
       limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2, ...s.limits },
       waitSeconds: 1,
       ...(s.configurations ? { configurations: s.configurations } : {}),
+      ...(s.allow !== undefined ? { allow: s.allow } : {}),
     },
     model.baseUrl,
   )
@@ -62,9 +66,15 @@ async function setup(s: Setup) {
   const runLogDir = tmp('runlog')
   const logs: string[] = []
   const client = mcp.client
+  // The production wiring (workerRegistryView: allow per kind + capDocArgs) behind a spy that records the kind of every view opened.
+  const viewKinds: ViewKind[] = []
+  const productionView = workerRegistryView(client, config)
   const deps: WorkerDeps = {
     control: createControlChannel(client, s.requestTimeoutMs ? { requestTimeoutMs: s.requestTimeoutMs } : {}),
-    registryView: (signal) => createRegistryView(client, config.allow, signal),
+    registryView: (kind, signal) => {
+      viewKinds.push(kind)
+      return productionView(kind, signal)
+    },
     modelClients: testModelClients(config, s.apiKey),
     config,
     out,
@@ -77,7 +87,7 @@ async function setup(s: Setup) {
     // change a job outcome); individual tests below override runLogFor for their own scenario.
     runLogFor: (claim) => openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, testRunLogInit(config, claim)),
   }
-  return { deps, out, runLogDir, logs, mcp, model, run: () => runWorker(deps) }
+  return { deps, out, runLogDir, logs, mcp, model, viewKinds, run: () => runWorker(deps) }
 }
 
 const controlCalls = (m: McpFake) => m.calls.filter((c) => c.name === 'update_job_status').map((c) => c.args)
@@ -1110,8 +1120,8 @@ const DOC_TOOL_NAMES = ['get_product_doc', 'list_product_docs', 'related_product
 function trackViews(deps: WorkerDeps) {
   const inner = deps.registryView
   const stats = { opened: 0, closed: 0 }
-  deps.registryView = async (signal) => {
-    const view = await inner(signal)
+  deps.registryView = async (kind, signal) => {
+    const view = await inner(kind, signal)
     stats.opened++
     return { snapshot: view.snapshot, toOpenAiTools: () => view.toOpenAiTools(), execute: (n, a, sg) => view.execute(n, a, sg), close: async () => { stats.closed++; await view.close() } }
   }
@@ -1346,21 +1356,62 @@ describe('runWorker — AGENT_CHAT product scope (test d)', () => {
     expect(readTrace(firstRunDir(t)).find((e) => e.type === 'tool_result')).toMatchObject({ errorCode: 'SCHEMA_MISMATCH' })
   })
 
-  it('a snapshot with a tool that has no required product_id: PRODUCT_SCOPE_UNENFORCEABLE for that job, no running, the view closed once', async () => {
-    const t = await chatSetup({ claims: [chatJob()], script: [answer('nee')] })
+  it('a snapshot with a tool without required product_id runs: schema-scope, no PRODUCT_SCOPE_UNENFORCEABLE (IDEA-262)', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('Zonder scope-fout.')] })
     const inner = t.deps.registryView
     let closed = 0
-    t.deps.registryView = async (signal) => {
-      const view = await inner(signal)
+    t.deps.registryView = async (kind, signal) => {
+      const view = await inner(kind, signal)
       const entries = view.snapshot.entries.map((e) => (e.name === 'list_product_docs' ? { ...e, inputSchema: { type: 'object', properties: { folder: { type: 'string' } } } } : e))
       return { ...view, snapshot: { entries, hash: 'x' }, close: async () => { closed++ } } satisfies ToolRegistry
     }
     const r = await t.run()
-    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }])
-    expect(controlCalls(t.mcp).map((c) => c.status)).toEqual(['failed'])
-    expect(String(controlCalls(t.mcp)[0].error)).toMatch(/^PRODUCT_SCOPE_UNENFORCEABLE: .*list_product_docs/)
-    expect(t.model.requests).toHaveLength(0)
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(controlCalls(t.mcp).map((c) => c.status)).toEqual(['running', 'done'])
+    expect(t.model.requests).toHaveLength(1)
     expect(closed).toBe(1)
+  })
+})
+
+describe('runWorker — AGENT_CHAT with the wider toolset (IDEA-262, stap C test C2)', () => {
+  const tool = (name: string, args: Record<string, unknown>) => ({ body: completion({ toolCalls: [{ id: 'c1', name, arguments: args }] }) })
+  const WIDER = { AGENT_CHAT: [...DOC_TOOL_NAMES, 'list_issues', 'create_note', 'get_issue'] }
+  const wider = (script: FakeTurn[]) => chatSetup({ claims: [chatJob()], script, allow: WIDER })
+
+  it('(h) list_issues with another product_id: PRODUCT_SCOPE in the trace, no call on the MCP, the job ends done', async () => {
+    const t = await wider([tool('list_issues', { product_id: 'other' }), answer('Kan niet.')])
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(readTrace(firstRunDir(t)).find((e) => e.type === 'tool_result')).toMatchObject({ ok: false, errorCode: 'PRODUCT_SCOPE' })
+    expect(t.mcp.calls.filter((c) => c.name === 'list_issues')).toEqual([])
+  })
+
+  it('(i) get_issue, a tool without product_id field, reaches the MCP with its arguments', async () => {
+    const t = await wider([tool('get_issue', { issue_id: 'iss1' }), answer('Gelezen.')])
+    await t.run()
+    expect(t.mcp.calls.filter((c) => c.name === 'get_issue').map((c) => c.args)).toEqual([{ issue_id: 'iss1' }])
+    expect(controlCalls(t.mcp).at(-1)).toMatchObject({ status: 'done', summary: 'Gelezen.' })
+  })
+
+  it('(j) create_note without product_id reaches the MCP as sent: nothing is filled in', async () => {
+    const t = await wider([tool('create_note', { title: 'M53 proef', body: 'tekst' }), answer('Aangemaakt.')])
+    await t.run()
+    expect(t.mcp.calls.filter((c) => c.name === 'create_note').map((c) => c.args)).toEqual([{ title: 'M53 proef', body: 'tekst' }])
+  })
+
+  it('(k) the system prompt names the seven tools of the view', async () => {
+    const t = await wider([answer('ok')])
+    await t.run()
+    expect(t.model.requests[0].body.messages[0].content).toContain(
+      'Je tools: create_note, get_issue, get_product_doc, list_issues, list_product_docs, related_product_docs, search_product_docs.',
+    )
+  })
+
+  it('(l) the tool snapshot of the run carries create_note and get_issue', async () => {
+    const t = await wider([answer('ok')])
+    await t.run()
+    const names = (readTrace(firstRunDir(t)).find((e) => e.type === 'tool_snapshot') as unknown as { names: string[] }).names
+    expect(names).toEqual(expect.arrayContaining(['create_note', 'get_issue']))
   })
 })
 
@@ -1392,8 +1443,8 @@ describe('runWorker — IDEA_CHAT product scope (ISS-10)', () => {
     const t = await setup({ claims: [job()], script: [answer('nee')] })
     const inner = t.deps.registryView
     let closed = 0
-    t.deps.registryView = async (signal) => {
-      const view = await inner(signal)
+    t.deps.registryView = async (kind, signal) => {
+      const view = await inner(kind, signal)
       const entries = view.snapshot.entries.map((e) => (e.name === 'list_product_docs' ? { ...e, inputSchema: { type: 'object', properties: { folder: { type: 'string' } } } } : e))
       return { ...view, snapshot: { entries, hash: 'x' }, close: async () => { closed++ } } satisfies ToolRegistry
     }
@@ -1451,7 +1502,7 @@ describe('runWorker — AGENT_CHAT view and ownership (test g)', () => {
     const t = await chatSetup({ claims: [chatJob(), chatJob({ jobId: 'job2' })], script: [answer('twee')], once: false })
     const inner = t.deps.registryView
     let n = 0
-    t.deps.registryView = (signal) => (++n === 1 ? Promise.reject(new Error('MCP weigert')) : inner(signal))
+    t.deps.registryView = (kind, signal) => (++n === 1 ? Promise.reject(new Error('MCP weigert')) : inner(kind, signal))
     stopAfterDone(t, 1)
     const r = await t.run()
     expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'failed' }, { jobId: 'job2', outcome: 'done' }])
@@ -1465,7 +1516,7 @@ describe('runWorker — AGENT_CHAT view and ownership (test g)', () => {
     const t = await chatSetup({ claims: [chatJob(), chatJob({ jobId: 'job2' })], script: [answer('twee')], once: false, limits: { maxWallSeconds: 1 } })
     const inner = t.deps.registryView
     let n = 0
-    t.deps.registryView = (signal) => (++n === 1 ? new Promise<ToolRegistry>(() => undefined) : inner(signal))
+    t.deps.registryView = (kind, signal) => (++n === 1 ? new Promise<ToolRegistry>(() => undefined) : inner(kind, signal))
     stopAfterDone(t, 1)
     const started = Date.now()
     const r = await t.run()
@@ -1481,15 +1532,15 @@ describe('runWorker — AGENT_CHAT view and ownership (test g)', () => {
     const inner = t.deps.registryView
     let lateClosed = 0
     let n = 0
-    t.deps.registryView = (signal) =>
+    t.deps.registryView = (kind, signal) =>
       ++n === 1
         ? new Promise<ToolRegistry>((resolve) =>
             setTimeout(async () => {
-              const view = await inner()
+              const view = await inner(kind)
               resolve({ ...view, close: async () => { lateClosed++ } })
             }, 1400),
           )
-        : inner(signal)
+        : inner(kind, signal)
     stopAfterDone(t, 1)
     await t.run()
     for (let i = 0; i < 40 && lateClosed === 0; i++) await new Promise((r) => setTimeout(r, 50))
@@ -1506,5 +1557,28 @@ describe('runWorker — AGENT_CHAT view and ownership (test g)', () => {
     expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'abandoned' }])
     expect(controlCalls(t.mcp)).toEqual([])
     expect(t.model.requests).toHaveLength(0)
+  })
+})
+
+// ---- registry view per job kind (IDEA-262, plan M53 Taak 1 stap B) ----
+
+describe('runWorker — registry view per job kind (IDEA-262)', () => {
+  const WIDER_ALLOW = { AGENT_CHAT: [...DOC_TOOL_NAMES, 'list_issues'] }
+  const snapshotNames = (t: { out: string }) => (readTrace(firstRunDir(t)).find((e) => e.type === 'tool_snapshot') as unknown as { names: string[] }).names
+
+  it('(a) an AGENT_CHAT claim opens the AGENT_CHAT view, whose snapshot carries the extra tool of allow.AGENT_CHAT', async () => {
+    const t = await chatSetup({ claims: [chatJob()], script: [answer('Gelezen.')], allow: WIDER_ALLOW })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(t.viewKinds).toEqual(['AGENT_CHAT'])
+    expect(snapshotNames(t)).toContain('list_issues')
+  })
+
+  it('(b) an IDEA_CHAT claim opens the IDEA_CHAT view: the doc tools only, whatever AGENT_CHAT allows', async () => {
+    const t = await setup({ claims: [job()], script: [answer('Gelezen.')], allow: WIDER_ALLOW })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(t.viewKinds).toEqual(['IDEA_CHAT'])
+    expect(snapshotNames(t)).toEqual(DOC_TOOL_NAMES)
   })
 })

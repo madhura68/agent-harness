@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { DOC_TOOLS, findRecipe, loadWorkerConfig, normalizeRepoUrl, WorkerConfigSchema, workerMcpEnv } from '../src/worker/config.js'
+import { CONTROL_TOOLS, DOC_TOOLS, findRecipe, loadWorkerConfig, normalizeRepoUrl, WorkerConfigSchema, workerMcpEnv } from '../src/worker/config.js'
 import { ManifestError } from '../src/manifest.js'
 
 const base = {
@@ -24,9 +24,9 @@ function writeConfig(cfg: unknown): string {
 }
 
 describe('WorkerConfigSchema', () => {
-  it('fills defaults for allow, limits and waitSeconds', () => {
+  it('fills defaults for allow (both kinds the doc tools), limits and waitSeconds', () => {
     const cfg = WorkerConfigSchema.parse(base)
-    expect(cfg.allow).toEqual([...DOC_TOOLS])
+    expect(cfg.allow).toEqual({ IDEA_CHAT: [...DOC_TOOLS], AGENT_CHAT: [...DOC_TOOLS] })
     expect(cfg.limits).toEqual({ maxTurns: 6, maxOutputTokens: 2048, maxWallSeconds: 240, maxToolErrors: 2 })
     expect(cfg.waitSeconds).toBe(300)
   })
@@ -47,8 +47,54 @@ describe('WorkerConfigSchema', () => {
     expect(issuesOf({ ...base, limits: { ...limits, contextTokens: 32768 } })).toContain('limits')
   })
 
-  it('accepts a subset of the doc tools', () => {
-    expect(WorkerConfigSchema.parse({ ...base, allow: ['get_product_doc'] }).allow).toEqual(['get_product_doc'])
+  it('gives both kinds the list of the array form', () => {
+    expect(WorkerConfigSchema.parse({ ...base, allow: ['get_product_doc'] }).allow).toEqual({ IDEA_CHAT: ['get_product_doc'], AGENT_CHAT: ['get_product_doc'] })
+  })
+})
+
+// IDEA-262 (spec §3.1): allow is an array (both kinds, doc tools only) or an object { IDEA_CHAT?, AGENT_CHAT }. Paths are asserted
+// exactly: zod prefixes the property name itself, so a transform that added its own 'allow' would print allow.allow….
+describe('allow per kind', () => {
+  const allow = (value: unknown) => ({ ...base, allow: value })
+
+  it('(c) takes an object with only AGENT_CHAT and gives IDEA_CHAT the doc tools', () => {
+    const cfg = WorkerConfigSchema.parse(allow({ AGENT_CHAT: ['search_product_docs', 'list_issues'] }))
+    expect(cfg.allow).toEqual({ IDEA_CHAT: [...DOC_TOOLS], AGENT_CHAT: ['search_product_docs', 'list_issues'] })
+  })
+
+  it('(d) refuses a non-doc tool in IDEA_CHAT on the path allow.IDEA_CHAT, naming it', () => {
+    const issues = issuesOf(allow({ IDEA_CHAT: ['list_issues'], AGENT_CHAT: ['get_product_doc'] }))
+    expect(issues.startsWith('allow.IDEA_CHAT: ')).toBe(true)
+    expect(issues).toContain('list_issues')
+  })
+
+  describe.each([
+    ['the array form', (tool: string) => ['get_product_doc', tool], 'allow: '],
+    ['IDEA_CHAT', (tool: string) => ({ IDEA_CHAT: ['get_product_doc', tool], AGENT_CHAT: ['get_product_doc'] }), 'allow.IDEA_CHAT: '],
+    ['AGENT_CHAT', (tool: string) => ({ AGENT_CHAT: ['get_product_doc', tool] }), 'allow.AGENT_CHAT: '],
+  ])('(e) a control tool in %s', (_where, build, prefix) => {
+    it.each([...CONTROL_TOOLS])('refuses %s on that path, naming it', (tool) => {
+      const issues = issuesOf(allow(build(tool)))
+      expect(issues.startsWith(prefix)).toBe(true)
+      expect(issues).toContain(tool)
+    })
+  })
+
+  it('(f) refuses an unknown kind with its name on the path allow', () => {
+    expect(issuesOf(allow({ AGENT_CHATT: ['get_product_doc'], AGENT_CHAT: ['get_product_doc'] }))).toBe('allow: Unrecognized key: "AGENT_CHATT"')
+  })
+
+  it('(g) refuses a value that is neither an array nor an object on the path allow', () => {
+    expect(issuesOf(allow('x')).startsWith('allow: ')).toBe(true)
+  })
+
+  it('(h) refuses an empty AGENT_CHAT list on the path allow.AGENT_CHAT', () => {
+    expect(issuesOf(allow({ AGENT_CHAT: [] })).startsWith('allow.AGENT_CHAT: ')).toBe(true)
+  })
+
+  it('(i) lets AGENT_CHAT carry any MCP tool that is no control tool, write tools included', () => {
+    const cfg = WorkerConfigSchema.parse(allow({ AGENT_CHAT: ['list_issues', 'create_note', 'update_idea'] }))
+    expect(cfg.allow.AGENT_CHAT).toEqual(['list_issues', 'create_note', 'update_idea'])
   })
 })
 

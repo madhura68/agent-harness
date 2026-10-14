@@ -23,7 +23,8 @@ export const DEFAULT_RUNTIMES = ['CLAUDE', 'CODEX', 'HARNESS']
 /**
  * In-process stand-in for the scrum4me MCP: the control tools (wait_for_job, job_heartbeat,
  * update_job_status, update_task_status, verify_task_against_plan, log_implementation, log_commit,
- * log_test_result) plus the four doc tools. `calls` records every call the server received.
+ * log_test_result), the four doc tools and three tools of the chat-agent's wider toolset (list_issues, get_issue, create_note).
+ * `calls` records every call the server received.
  * Exhausted claim scripts answer with a timeout.
  */
 export async function startFakeScrum4meMcp(
@@ -201,6 +202,32 @@ export async function startFakeScrum4meMcp(
     async (args) => {
       calls.push({ name: 'related_product_docs', args })
       return toolText({ related: [] })
+    },
+  )
+  // Three tools of the chat-agent's wider toolset (IDEA-262, plan M53 bijlage A): product_id required (list_issues), optional and
+  // nullable (create_note), absent (get_issue). The schemas follow scrum4me-mcp @ 3e5f7a0 in the fields that matter to the product scope.
+  server.registerTool(
+    'list_issues',
+    { description: 'List issues', inputSchema: { product_id: z.string().min(1), status: z.string().optional(), limit: z.number().int().min(1).max(100).optional() } },
+    async (args) => {
+      calls.push({ name: 'list_issues', args })
+      return toolText({ issues: [{ id: 'iss1', code: 'ISS-1', title: 'Worker hangt', product_id: args.product_id }] })
+    },
+  )
+  server.registerTool(
+    'get_issue',
+    { description: 'Read one issue', inputSchema: { issue_id: z.string().min(1) } },
+    async (args) => {
+      calls.push({ name: 'get_issue', args })
+      return toolText({ id: args.issue_id, code: 'ISS-1', title: 'Worker hangt', status: 'open' })
+    },
+  )
+  server.registerTool(
+    'create_note',
+    { description: 'Create a note', inputSchema: { title: z.string().min(1), body: z.string().min(1), product_id: z.string().min(1).nullable().optional(), keywords: z.array(z.string()).optional() } },
+    async (args) => {
+      calls.push({ name: 'create_note', args })
+      return toolText({ id: 'note1', title: args.title, product_id: args.product_id ?? null })
     },
   )
 
