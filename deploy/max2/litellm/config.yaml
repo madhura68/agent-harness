@@ -22,6 +22,13 @@ model_list:
           data_collection: "deny"
           require_parameters: true
           allow_fallbacks: false
+    # ISS-5: LiteLLM 1.83.3 allows reasoning_effort for OpenRouter only when its model cost map marks the model as
+    # reasoning-capable. That map is fetched live from GitHub at every container start, and on 2026-10-09 LiteLLM removed
+    # every openrouter/* row from it (PRs #45665-#45669), so the harness's reasoningEffort got HTTP 400. This registers the
+    # capability for this deployment itself (router registers model_info under openrouter/qwen/qwen3.8-27b), independent
+    # of that map. The cost per answer still comes from OpenRouter's usage.cost in the body, not from the map.
+    model_info:
+      supports_reasoning: true
 
 litellm_settings:
   turn_off_message_logging: true
