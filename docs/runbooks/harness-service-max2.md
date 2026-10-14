@@ -1,7 +1,7 @@
 ---
 title: "agent-harness.service op max2 (HARNESS-runtime): indeling, installeren, bijwerken en terugzetten"
 status: active
-last_updated: 2026-10-08
+last_updated: 2026-10-15
 ---
 
 # agent-harness.service op max2
@@ -141,6 +141,7 @@ Voor mcp-stable gaat het in deze volgorde, nadat `stop-check.sh` is geslaagd (`a
 - Eerste start: `litellm_up`. Daarna draait de container met `restart: unless-stopped`, ook na een herstart van max2.
 - Upgrade (nieuw image, nieuwe modellen of config): de nieuwe bestanden komen eerst in `current`, dus via een release van agent-harness. Volgorde, na `stop-check.sh`: het commando `harness_release_update` (de dienst blijft gestopt), dan (voor 2e, stap 8.5) het commando `litellm_upgrade` en daarna `harness_probe`; de flow `upgrade_litellm` eindigt met `harness_start` en is pas daarna bruikbaar. `litellm_upgrade` controleert alle bronnen in `current`, kopieert `harness.json`, `config.yaml`, `compose.yml` en de brug-unit naar `/etc` (de vorige als `<bestand>.bak-<tijdstip>`), herstart de brug, haalt het image op en maakt de container opnieuw. **Na een mislukte `litellm_upgrade`** (exit 74 in `pull` of `up`): draai `litellm_upgrade` opnieuw vóór elke probe; de oude container kan nog de oude config draaien terwijl de nieuwe bestanden al staan (en dus de nieuwe hash hebben). Alleen `install` (als het bestand ontbreekt) en `litellm_upgrade` installeren deze bestanden; `release-update` doet dat niet. `litellm_upgrade` neemt `harness.json` dus uit `current` over: controleer daarna `allow` (een eigen toollijst, zie "Toollijst aanpassen", staat dan in `harness.json.bak-<tijdstip>`). Draai `litellm_up` eerst op een host die LiteLLM nog nooit draaide: de herstart van de brug wacht op het netwerk `br-litellm`.
 - De image-digest in `compose.yml` is vastgepind (LiteLLM houdt de providersleutels); eigen code (harness, MCP) wordt niet vastgepind.
+- **Live kostenkaart (ISS-5).** LiteLLM haalt bij elke containerstart zijn model-kostenkaart van GitHub (`main`), ook met een vastgepind image; alleen `LITELLM_LOCAL_MODEL_COST_MAP=True` zet dat uit. Voor OpenRouter staat 1.83.3 `reasoning_effort` alleen toe als die kaart het model als `supports_reasoning` kent, en sinds 2026-10-09 bevat de kaart geen `openrouter/*`-rijen meer (LiteLLM-PR's #45665–#45669). Daarom draagt `qwen3.8-or` in `config.yaml` `model_info: { supports_reasoning: true }`: de router registreert dat onder `openrouter/qwen/qwen3.8-27b`, onafhankelijk van de kaart. Een nieuwe OpenRouter-configuratie met `reasoningEffort` heeft hetzelfde blok nodig. Een herstart van de container (reboot, `litellm_upgrade`) kan dus gedrag veranderen zonder dat de hash verandert; een probe die ineens faalt met `UnsupportedParamsError` wijst hierop. De kosten per antwoord komen uit OpenRouter's `usage.cost` en hangen niet van de kaart af.
 
 ## Sleutels
 
