@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { loadWorkerConfig } from '../src/worker/config.js'
+import { DOC_TOOLS, loadWorkerConfig } from '../src/worker/config.js'
 
 const deploy = (naam: string): string => fileURLToPath(new URL(`../deploy/max2/${naam}`, import.meta.url))
 
@@ -44,5 +44,11 @@ describe('deploy/max2/harness.json', () => {
     for (const naam of ['SCRUM4ME_TOKEN', 'DATABASE_URL', 'DIRECT_URL', 'FORGEJO_PUSH_TOKEN']) expect(cfg.mcp.env?.[naam]).toBe('${' + naam + '}')
     expect(cfg.task?.limits).toEqual({ maxTurns: 40, maxOutputTokens: 80000, maxWallSeconds: 2400, maxToolErrors: 8 })
     expect(cfg.limits).toEqual({ maxTurns: 8, maxOutputTokens: 4096, maxWallSeconds: 240, maxToolErrors: 2 })
+  })
+
+  it('geeft de idee-chat de vier doc-tools en de chat-agent daarbij de issue- en notitietools, zonder update-tools (IDEA-262)', () => {
+    expect(cfg.allow.IDEA_CHAT).toEqual([...DOC_TOOLS])
+    expect(cfg.allow.AGENT_CHAT).toEqual(expect.arrayContaining([...DOC_TOOLS, 'create_issue', 'create_note']))
+    expect(cfg.allow.AGENT_CHAT.filter((tool) => tool.startsWith('update_'))).toEqual([])
   })
 })

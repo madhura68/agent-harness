@@ -37,12 +37,27 @@
       "FORGEJO_PUSH_TOKEN": "${FORGEJO_PUSH_TOKEN}"
     }
   },
-  "allow": [
-    "search_product_docs",
-    "get_product_doc",
-    "list_product_docs",
-    "related_product_docs"
-  ],
+  "allow": {
+    "IDEA_CHAT": [
+      "search_product_docs",
+      "get_product_doc",
+      "list_product_docs",
+      "related_product_docs"
+    ],
+    "AGENT_CHAT": [
+      "search_product_docs",
+      "get_product_doc",
+      "list_product_docs",
+      "related_product_docs",
+      "list_issues",
+      "get_issue",
+      "create_issue",
+      "search_notes",
+      "get_note",
+      "create_note",
+      "list_note_keywords"
+    ]
+  },
   "limits": {
     "maxTurns": 8,
     "maxOutputTokens": 4096,

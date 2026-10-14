@@ -5,7 +5,7 @@ import { runManifest, type AfterAnswerResult } from '../run.js'
 import { combineRegistries } from '../tools/registry.js'
 import { openTrace, type RunResult, type TraceWriter } from '../trace.js'
 import type { TaskConfig } from './config.js'
-import { findRecipe } from './config.js'
+import { DOC_TOOLS, findRecipe } from './config.js'
 import type { ClaimResult, LogArgs, StatusUpdate } from './control.js'
 import { buildScript, containerName, killLeftoverContainers, runInContainer } from './containers.js'
 import { costFailureText, costLogLine, sendFinalStatus, withMeasured } from './final-status.js'
@@ -380,7 +380,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
       system: TASK_SYSTEM_PROMPT,
       prompt: renderTaskPrompt(p),
       model: modelSpecFor(config, job),
-      tools: { server: { command: 'shared', args: [] }, allow: ['list_files', 'read_file', 'write_file', 'edit_file', 'search', 'run_tests', ...config.allow] },
+      tools: { server: { command: 'shared', args: [] }, allow: ['list_files', 'read_file', 'write_file', 'edit_file', 'search', 'run_tests', ...DOC_TOOLS] },
       limits: limitsFor(task.limits, job),
     }
     let result: RunResult
@@ -389,7 +389,7 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
         client: modelClientFor(deps.modelClients, job.name),
         trace,
         connectRegistry: async (signal) => {
-          const docs = await deps.registryView(signal)
+          const docs = await deps.registryView('TASK_IMPLEMENTATION', signal)
           try {
             return combineRegistries([createTaskTools({ root: worktree, runVerify: (s) => runVerify('run_tests', s) }), docs])
           } catch (err) {

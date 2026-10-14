@@ -1,4 +1,7 @@
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import { createRegistryView } from '../tools/registry.js'
 import type { ToolRegistry } from '../types.js'
+import { allowFor, type ViewKind, type WorkerConfig } from './config.js'
 
 /**
  * The largest max_chars the worker passes to get_product_doc. scrum4me-mcp accepts up to 40 000, but past about 15 400
@@ -22,4 +25,12 @@ export function capDocArgs(view: ToolRegistry): ToolRegistry {
     },
     close: () => view.close(),
   }
+}
+
+/**
+ * The registry view of a worker (IDEA-262): a view on the shared MCP connection with the tools `allow` holds for the kind of the job
+ * (allowFor), with get_product_doc's max_chars capped. The one production wiring, so the tests of the worker run it too.
+ */
+export function workerRegistryView(client: Client, config: WorkerConfig): (kind: ViewKind, signal?: AbortSignal) => Promise<ToolRegistry> {
+  return async (kind, signal) => capDocArgs(await createRegistryView(client, allowFor(config, kind), signal))
 }

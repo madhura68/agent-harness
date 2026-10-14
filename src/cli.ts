@@ -11,13 +11,13 @@ import { assertExtraBody, loadManifest, ManifestError, ModelSpecSchema, resolveS
 import { createModelClient, type ModelClient } from './model-client.js'
 import { probeDir, runProbe, type ProbeResult } from './probe.js'
 import { runManifest } from './run.js'
-import { connectStdioClient, connectStdioRegistry, createRegistryView } from './tools/registry.js'
+import { connectStdioClient, connectStdioRegistry } from './tools/registry.js'
 import { openTrace } from './trace.js'
 import type { ToolRegistry } from './types.js'
 import { checkRunLogs } from './worker/check-run-logs.js'
 import { loadWorkerConfig, TaskConfigSchema, workerMcpEnv, type WorkerConfig } from './worker/config.js'
 import { checkHarnessRuntime, createControlChannel } from './worker/control.js'
-import { capDocArgs } from './worker/doc-tools.js'
+import { workerRegistryView } from './worker/doc-tools.js'
 import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './worker/exit-codes.js'
 import { runLogConfiguration, shown } from './worker/job-configuration.js'
 import { configurationHash, litellmFileHashes, probeVerdict } from './worker/probe-gate.js'
@@ -459,7 +459,7 @@ async function cmdWorker(values: Values): Promise<number> {
     }
     const { exitCode, jobs } = await runWorker({
       control: createControlChannel(client),
-      registryView: async (signal) => capDocArgs(await createRegistryView(client, config.allow, signal)),
+      registryView: workerRegistryView(client, config),
       modelClients,
       config,
       out,

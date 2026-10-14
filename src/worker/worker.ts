@@ -6,7 +6,7 @@ import { RegistryError } from '../tools/registry.js'
 import { openTrace, type RunResult } from '../trace.js'
 import type { ToolRegistry } from '../types.js'
 import { AGENT_CHAT_BUDGET, AGENT_CHAT_HEARTBEAT_MS, AgentChatPayloadSchema, checkHistory, checkProductScope, fitHistory, productRule, scopeToProduct } from './agent-chat.js'
-import type { WorkerConfig } from './config.js'
+import { allowFor, type ViewKind, type WorkerConfig } from './config.js'
 import { killLeftoverContainers, type ContainerDeps } from './containers.js'
 import type { ClaimResult, ControlChannel, StatusUpdate } from './control.js'
 import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './exit-codes.js'
@@ -20,8 +20,8 @@ import { ContainerUncertainError, runTaskJob, type TaskJobContext } from './task
 
 export type WorkerDeps = {
   control: ControlChannel
-  /** Allowlist view on the shared MCP connection; closing it leaves the connection open. */
-  registryView: (signal?: AbortSignal) => Promise<ToolRegistry>
+  /** Allowlist view on the shared MCP connection for a job of `kind` (allowFor); closing it leaves the connection open. */
+  registryView: (kind: ViewKind, signal?: AbortSignal) => Promise<ToolRegistry>
   /** One model client per configuration of `config`, by name; each job runs through the client of the configuration its payload names. */
   modelClients: Record<string, ModelClient>
   config: WorkerConfig
@@ -157,8 +157,9 @@ function issueText(error: { issues: Array<{ path: PropertyKey[]; message: string
  * An AGENT_CHAT job (M50-1b, spec §6.1): the same order of checks as runIdeaChatJob, with one difference that matters. The kind is right, so a
  * broken payload or history costs this one job (failBeforeRunning) and never the worker (no ClaimFilterError, which stops it without restart).
  *
- * The registry view is opened here, before `running`, to check its snapshot for the product scope and to measure the tool definitions for the
- * history budget (decision 3). It is then handed to runManifest through connectRegistry, which closes it; until that moment the one `finally`
+ * The registry view is opened here, before `running`, to name its tools in the system prompt and to measure the tool definitions for the
+ * history budget (decision 3). Its tools are those of `allow.AGENT_CHAT`, held to the product of the chat per tool schema (scopeToProduct in
+ * schema mode, IDEA-262). It is then handed to runManifest through connectRegistry, which closes it; until that moment the one `finally`
  * below owns it.
  */
 async function runAgentChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | null): Promise<JobOutcome> {
@@ -203,23 +204,19 @@ async function runAgentChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | 
     const bounded = AbortSignal.any([deps.signal, AbortSignal.timeout(limits.maxWallSeconds * 1000)])
     try {
       view = await connectWithin(
-        Promise.resolve().then(() => deps.registryView(bounded)).then((v) => scopeToProduct(v, payload.chat.product)),
+        Promise.resolve().then(() => deps.registryView('AGENT_CHAT', bounded)).then((v) => scopeToProduct(v, payload.chat.product, { mode: 'schema' })),
         bounded,
       )
     } catch (err) {
       if (deps.signal.aborted) {
-        log(`job ${jobId}: worker gestopt tijdens het openen van de doc-tools; overgeslagen`)
-        runLog?.fail('ABANDONED', 'worker gestopt tijdens het openen van de doc-tools')
+        log(`job ${jobId}: worker gestopt tijdens het openen van de tools; overgeslagen`)
+        runLog?.fail('ABANDONED', 'worker gestopt tijdens het openen van de tools')
         return 'abandoned'
       }
       return await failJob('TOOL_NOT_AVAILABLE', err instanceof RegistryError ? err.message : `MCP server unavailable: ${err instanceof Error ? err.message : String(err)}`)
     }
-    const unenforceable = checkProductScope(view.snapshot)
-    if (unenforceable.length > 0) {
-      return await failJob('PRODUCT_SCOPE_UNENFORCEABLE', `tools zonder verplicht product_id: ${unenforceable.join(', ')}`)
-    }
 
-    const system = `${payload.system_prompt}\n\n${productRule(payload.chat.product)}`
+    const system = `${payload.system_prompt}\n\n${productRule(payload.chat.product, view.snapshot.entries.map((e) => e.name))}`
     const fit = fitHistory({
       system,
       pending: payload.pending.content,
@@ -266,7 +263,7 @@ async function runAgentChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | 
         prompt: payload.pending.content,
         ...(fit.history.length > 0 ? { history: fit.history } : {}),
         model: modelSpecFor(config, job),
-        tools: { server: { command: 'shared', args: [] }, allow: config.allow },
+        tools: { server: { command: 'shared', args: [] }, allow: allowFor(config, 'AGENT_CHAT') },
         limits,
       }
       const result = await runManifest(manifest, {
@@ -389,7 +386,7 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
       system: IDEA_CHAT_SYSTEM_PROMPT,
       prompt: renderIdeaChatUserMessage(payload),
       model: modelSpecFor(config, job),
-      tools: { server: { command: 'shared', args: [] }, allow: config.allow },
+      tools: { server: { command: 'shared', args: [] }, allow: allowFor(config, 'IDEA_CHAT') },
       limits: limitsFor(config.limits, job),
     }
     const result = await runManifest(manifest, {
@@ -397,7 +394,7 @@ async function runIdeaChatJob(deps: WorkerDeps, claim: Claim, runLog: RunLog | n
       trace: runLog ? runLog.follow(openTrace(deps.out, runId)) : openTrace(deps.out, runId),
       connectRegistry: async (signal) => {
         // ISS-10: the idea chat reads the docs of the product of its idea only, like the chat-agent. A throw here is a failed job before the first model call.
-        const view = await deps.registryView(signal)
+        const view = await deps.registryView('IDEA_CHAT', signal)
         const unenforceable = checkProductScope(view.snapshot)
         if (unenforceable.length > 0) {
           await view.close().catch(() => undefined)

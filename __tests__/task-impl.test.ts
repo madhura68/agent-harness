@@ -7,9 +7,10 @@ import { promisify } from 'node:util'
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { probeDir } from '../src/probe.js'
-import { createRegistryView } from '../src/tools/registry.js'
+import { DOC_TOOLS, type ViewKind } from '../src/worker/config.js'
 import type { SpawnFn } from '../src/worker/containers.js'
 import { createControlChannel } from '../src/worker/control.js'
+import { workerRegistryView } from '../src/worker/doc-tools.js'
 import { commitAll, snapshotGitAdmin } from '../src/worker/host-git.js'
 import { openRunLog } from '../src/worker/run-log.js'
 import { buildSummary, renderTaskPrompt, TaskPayloadSchema } from '../src/worker/task-impl.js'
@@ -191,6 +192,8 @@ type Setup = {
   configurations?: Record<string, unknown>
   /** The MCP refuses the cost of a final update (M45-2d T-2067). */
   refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
+  /** The raw `allow` of the worker config (array or object form, IDEA-262); the schema default without it. */
+  allow?: unknown
 }
 
 async function setup(s: Setup = {}) {
@@ -209,6 +212,7 @@ async function setup(s: Setup = {}) {
       limits: { maxTurns: 4, maxOutputTokens: 2048, maxWallSeconds: 30, maxToolErrors: 2 },
       waitSeconds: 1,
       ...(s.configurations ? { configurations: s.configurations } : {}),
+      ...(s.allow !== undefined ? { allow: s.allow } : {}),
       ...(s.noTask
         ? {}
         : {
@@ -237,9 +241,15 @@ async function setup(s: Setup = {}) {
   const runLogDir = tmp('runlog')
   const logs: string[] = []
   const client = mcp.client
+  // The production wiring (workerRegistryView: allow per kind + capDocArgs) behind a spy that records the kind of every view opened.
+  const viewKinds: ViewKind[] = []
+  const productionView = workerRegistryView(client, config)
   const deps: WorkerDeps = {
     control: createControlChannel(client),
-    registryView: (signal) => createRegistryView(client, config.allow, signal),
+    registryView: (kind, signal) => {
+      viewKinds.push(kind)
+      return productionView(kind, signal)
+    },
     modelClients: testModelClients(config),
     config,
     out,
@@ -254,7 +264,7 @@ async function setup(s: Setup = {}) {
     runLogFor: (claim) => openRunLog({ dir: runLogDir, pool: 'harness', instance: 'test' }, testRunLogInit(config, claim)),
   }
   const branchSha = () => git(cloneDir, ['rev-parse', 'feature1'])
-  return { deps, out, runLogDir, logs, mcp, model, docker, worktree, cloneDir, baseSha, branchSha, run: () => runWorker(deps) }
+  return { deps, out, runLogDir, logs, mcp, model, docker, worktree, cloneDir, baseSha, branchSha, viewKinds, run: () => runWorker(deps) }
 }
 
 const write = (path: string, content: string, id = 'w1'): FakeTurn => ({
@@ -328,6 +338,24 @@ describe('pure helpers', () => {
     for (const part of ['## Taak', 'feat: voeg greet() toe', '## Plan', 'Schrijf src/greet.ts', '## Story', 'Begroeting', 'Acceptatiecriteria', 'greet("x")', '## Product', '## Repository', 'feat/story-1']) {
       expect(prompt).toContain(part)
     }
+  })
+})
+
+describe('runTaskJob — registry view per job kind (IDEA-262, stap B test c)', () => {
+  const TASK_TOOL_NAMES = ['list_files', 'read_file', 'write_file', 'edit_file', 'search', 'run_tests']
+
+  it('a task claim opens the TASK_IMPLEMENTATION view: the doc tools next to the task tools, never the write tools of allow.AGENT_CHAT', async () => {
+    const t = await setup({
+      script: [write('src/greet.ts', 'export const greet = (n: string) => `hallo ${n}`\n'), answer('klaar')],
+      allow: { AGENT_CHAT: [...DOC_TOOLS, 'list_issues', 'create_note'] },
+    })
+    const r = await t.run()
+    expect(r.jobs).toEqual([{ jobId: 'job1', outcome: 'done' }])
+    expect(t.viewKinds).toEqual(['TASK_IMPLEMENTATION'])
+    const snapshot = traceOf(t.out).find((e) => e.type === 'tool_snapshot') as unknown as { names: string[] }
+    expect([...snapshot.names].sort()).toEqual([...TASK_TOOL_NAMES, ...DOC_TOOLS].sort())
+    const start = traceOf(t.out).find((e) => e.type === 'run_start') as unknown as { manifest: { tools: { allow: string[] } } }
+    expect(start.manifest.tools.allow).toEqual([...TASK_TOOL_NAMES, ...DOC_TOOLS])
   })
 })
 
