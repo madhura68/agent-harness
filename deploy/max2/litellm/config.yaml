@@ -46,6 +46,9 @@ model_list:
   # model has 8-16 FP8 endpoints with tools, so a fallback to the next endpoint is allowed here (the BF16 pin above has one
   # endpoint and no fallback). sort: price takes the cheapest endpoint that passes the filters; max_price (USD per million
   # tokens) keeps an expensive endpoint out. supports_reasoning: true for the same reason as ISS-5 above.
+  # Reasoning effort differs per model, because OpenRouter's model metadata (reasoning.supported_efforts, 2026-10-18) does:
+  # DeepSeek V4 takes xhigh/high/none and GLM-5.3 max/high/low (reasoning mandatory), so harness.json sets "high" for both,
+  # the nearest to qwen3.8-or's "medium" that they accept; MiniMax-M3 offers no effort choice, so harness.json sets none.
   - model_name: deepseek-v4-flash-or
     litellm_params:
       model: openrouter/deepseek/deepseek-v4-flash

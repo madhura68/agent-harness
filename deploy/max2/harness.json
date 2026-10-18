@@ -32,22 +32,21 @@
     "deepseek-v4-flash-or": {
       "costMode": "hosted",
       "contextTokens": 65536,
-      "reasoningEffort": "medium"
+      "reasoningEffort": "high"
     },
     "deepseek-v4-pro-or": {
       "costMode": "hosted",
       "contextTokens": 65536,
-      "reasoningEffort": "medium"
+      "reasoningEffort": "high"
     },
     "glm-5.3-or": {
       "costMode": "hosted",
       "contextTokens": 65536,
-      "reasoningEffort": "medium"
+      "reasoningEffort": "high"
     },
     "minimax-m3-or": {
       "costMode": "hosted",
-      "contextTokens": 65536,
-      "reasoningEffort": "medium"
+      "contextTokens": 65536
     }
   },
   "mcp": {

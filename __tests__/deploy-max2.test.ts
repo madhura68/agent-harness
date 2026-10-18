@@ -49,10 +49,12 @@ describe('deploy/max2/harness.json', () => {
     for (const [naam, venster] of [['qwen3.8-or-16k', 16384], ['qwen3.8-or-32k', 32768], ['qwen3.8-or-128k', 131072]] as const) {
       expect(cfg.configurations[naam]).toEqual({ costMode: 'hosted', contextTokens: venster, reasoningEffort: 'medium' })
     }
-    // Model comparison: the same window and effort as the qwen3.8-or baseline, so only the model differs.
-    for (const naam of ['deepseek-v4-flash-or', 'deepseek-v4-pro-or', 'glm-5.3-or', 'minimax-m3-or']) {
-      expect(cfg.configurations[naam]).toEqual({ costMode: 'hosted', contextTokens: 65536, reasoningEffort: 'medium' })
+    // Model comparison: the same window as the qwen3.8-or baseline. The effort is one each model accepts according to
+    // OpenRouter's reasoning.supported_efforts (DeepSeek V4: xhigh/high/none, GLM-5.3: max/high/low, MiniMax-M3: no choice).
+    for (const naam of ['deepseek-v4-flash-or', 'deepseek-v4-pro-or', 'glm-5.3-or']) {
+      expect(cfg.configurations[naam]).toEqual({ costMode: 'hosted', contextTokens: 65536, reasoningEffort: 'high' })
     }
+    expect(cfg.configurations['minimax-m3-or']).toEqual({ costMode: 'hosted', contextTokens: 65536 })
   })
 
   it('pint de vergelijkingsmodellen op FP8 zonder dataverzameling, en houdt qwen3.8-or op BF16', () => {
