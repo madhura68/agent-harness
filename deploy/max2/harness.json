@@ -13,6 +13,21 @@
       "costMode": "hosted",
       "contextTokens": 65536,
       "reasoningEffort": "medium"
+    },
+    "qwen3.8-or-16k": {
+      "costMode": "hosted",
+      "contextTokens": 16384,
+      "reasoningEffort": "medium"
+    },
+    "qwen3.8-or-32k": {
+      "costMode": "hosted",
+      "contextTokens": 32768,
+      "reasoningEffort": "medium"
+    },
+    "qwen3.8-or-128k": {
+      "costMode": "hosted",
+      "contextTokens": 131072,
+      "reasoningEffort": "medium"
     }
   },
   "mcp": {

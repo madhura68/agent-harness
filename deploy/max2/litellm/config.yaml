@@ -12,7 +12,7 @@ model_list:
   # Hosted: OpenRouter at BF16, no data collection, no silent fallback. extra_body is merged into every request
   # of this deployment. The trial of increment 1 measured that the provider block reaches OpenRouter (docs/runbooks/litellm-max2.md).
   - model_name: qwen3.8-or
-    litellm_params:
+    litellm_params: &qwen38or-params
       model: openrouter/qwen/qwen3.8-27b
       api_key: os.environ/OPENROUTER_API_KEY
       timeout: 600
@@ -27,8 +27,20 @@ model_list:
     # every openrouter/* row from it (PRs #45665-#45669), so the harness's reasoningEffort got HTTP 400. This registers the
     # capability for this deployment itself (router registers model_info under openrouter/qwen/qwen3.8-27b), independent
     # of that map. The cost per answer still comes from OpenRouter's usage.cost in the body, not from the map.
-    model_info:
+    model_info: &qwen38or-info
       supports_reasoning: true
+  # Context-window trial (2026-10-18): the same OpenRouter deployment under three more names, so harness.json can give each
+  # its own contextTokens (the model itself takes 1M). The harness, not the provider, enforces the window: it stubs the
+  # oldest tool results and stops with CONTEXT_EXHAUSTED when even that does not fit. Only the name differs per entry.
+  - model_name: qwen3.8-or-16k
+    litellm_params: *qwen38or-params
+    model_info: *qwen38or-info
+  - model_name: qwen3.8-or-32k
+    litellm_params: *qwen38or-params
+    model_info: *qwen38or-info
+  - model_name: qwen3.8-or-128k
+    litellm_params: *qwen38or-params
+    model_info: *qwen38or-info
 
 litellm_settings:
   turn_off_message_logging: true
