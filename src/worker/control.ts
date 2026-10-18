@@ -57,7 +57,7 @@ export interface ControlChannel {
   heartbeat(jobId: string): Promise<boolean>
   updateStatus(jobId: string, input: StatusUpdate): Promise<StatusOutcome>
   updateTaskStatus(taskId: string, status: 'in_progress' | 'review' | 'todo'): Promise<{ ok: boolean; message?: string }>
-  verifyTaskAgainstPlan(taskId: string, worktreePath: string): Promise<{ ok: boolean; unknown?: boolean; result?: 'aligned' | 'partial' | 'empty' | 'divergent'; message?: string }>
+  verifyTaskAgainstPlan(taskId: string, worktreePath: string): Promise<{ ok: boolean; unknown?: boolean; result?: 'aligned' | 'partial' | 'empty' | 'divergent'; reasoning?: string; message?: string }>
   /**
    * Best-effort: a tool error or a rejected call is never thrown; it comes back as `ok: false` so the caller
    * can report it through its own logger (the worker's `deps.log`).
@@ -179,10 +179,11 @@ export function createControlChannel(client: Client, opts: { requestTimeoutMs?: 
         } catch {
           return { ok: true }
         }
-        const p = parsed as { result?: unknown }
+        const p = parsed as { result?: unknown; reasoning?: unknown }
         const result = p?.result
         const valid = result === 'aligned' || result === 'partial' || result === 'empty' || result === 'divergent'
-        return { ok: true, result: valid ? result : undefined }
+        const reasoning = typeof p?.reasoning === 'string' ? p.reasoning : undefined
+        return { ok: true, result: valid ? result : undefined, ...(reasoning ? { reasoning } : {}) }
       } catch (err) {
         // Same UNKNOWN/REFUSED distinction as updateStatus, for consistency; task-impl.ts's failPath
         // currently treats both as an ordinary (single, non-terminal-conflicting) failed update either way.

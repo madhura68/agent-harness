@@ -504,6 +504,13 @@ describe('createControlChannel', () => {
     ])
   })
 
+  it('verifyTaskAgainstPlan passes the reasoning on when the MCP sends one (ISS-7)', async () => {
+    mcp = await startFakeScrum4meMcp({ verifyResult: 'partial', verifyReasoning: '1/2 plan-paden aanwezig in diff. Ontbrekend: b.ts.' })
+    const control = createControlChannel(mcp.client)
+    const r = await control.verifyTaskAgainstPlan('task-1', '/wt')
+    expect(r).toEqual({ ok: true, result: 'partial', reasoning: '1/2 plan-paden aanwezig in diff. Ontbrekend: b.ts.' })
+  })
+
   it('verifyTaskAgainstPlan reports a tool error as ok:false', async () => {
     mcp = await startFakeScrum4meMcp()
     const control = createControlChannel(mcp.client)

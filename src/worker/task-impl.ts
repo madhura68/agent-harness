@@ -446,7 +446,11 @@ export async function runTaskJob(deps: WorkerDeps, claim: Claim, ctx: TaskJobCon
     const plan = await control.verifyTaskAgainstPlan(p.task.id, worktree)
     if (lost) return abandon()
     if (!plan.ok) return await failPath(`verify_task_against_plan mislukt: ${plan.message ?? 'onbekend'}`, 'PLAN_CHECK_FAILED')
-    if (plan.result !== 'aligned' && plan.result !== 'partial') return await failPath(`verify_task_against_plan: ${plan.result ?? 'geen uitslag'}`, 'PLAN_CHECK_FAILED')
+    // Only aligned is done: partial means plan files are missing from the diff (ISS-7). failPath cuts the reason to the error limit.
+    if (plan.result !== 'aligned') {
+      const why = `verify_task_against_plan: ${plan.result ?? 'geen uitslag'}${plan.reasoning ? ` — ${plan.reasoning}` : ''}`
+      return await failPath(why, plan.result === 'partial' ? 'PLAN_CHECK_PARTIAL' : 'PLAN_CHECK_FAILED')
+    }
     runLog?.step(`plan_check ${plan.result}`)
 
     // Step 7.
