@@ -95,7 +95,7 @@ const TOOL_BUDGET_TEXT = 'de leesruimte is op; antwoord met wat je hebt'
 const TRUNCATION_NOTE = '\nafgekapt; vraag een sectie op met `heading`'
 const CLOSING_PROMPT = 'Je kunt geen tools meer gebruiken. Antwoord nu met wat je hebt.'
 // Window budget of a run without chatBudget (task runs): a result that does not fit the window is cut, or not fetched at all.
-const WINDOW_TRUNCATION_NOTE = '\nafgekapt om binnen het contextvenster te blijven; vraag een kleiner deel op (read_file: offset/limit)'
+const WINDOW_TRUNCATION_NOTE = '\nafgekapt om binnen het contextvenster te blijven; vraag een kleiner deel op (bij read_file: offset/limit)'
 const WINDOW_BUDGET_TEXT = 'niet opgehaald: het contextvenster is vol; vraag minder tegelijk op of lees een kleiner deel (read_file: offset/limit)'
 
 /** The tool message as the model gets it: the serialised result. */
