@@ -101,7 +101,7 @@
   "waitSeconds": 300,
   "task": {
     "limits": {
-      "maxTurns": 40,
+      "maxTurns": 80,
       "maxOutputTokens": 80000,
       "maxWallSeconds": 2400,
       "maxToolErrors": 8
