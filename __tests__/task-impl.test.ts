@@ -177,6 +177,7 @@ type Setup = {
   script?: FakeTurn[]
   docker?: DockerOpts
   verifyResult?: 'aligned' | 'partial' | 'empty' | 'divergent'
+  verifyReasoning?: string
   doneOutcome?: UpdateOutcomeOverride
   failUpdate?: Array<'running' | 'done' | 'failed'>
   signal?: AbortSignal
@@ -204,6 +205,7 @@ async function setup(s: Setup = {}) {
     claims: s.claims ? s.claims(worktree) : [{ job: taskPayload({ worktree }) }],
     failUpdate: s.failUpdate,
     verifyResult: s.verifyResult,
+    verifyReasoning: s.verifyReasoning,
     updateOutcome: { done: s.doneOutcome ?? PUSHED },
     refuseCost: s.refuseCost,
   })
@@ -851,11 +853,21 @@ describe('runTaskJob — run-log (M4 Taak 6, spec §5.6)', () => {
     expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR COMMIT_FAILED: commit mislukt: commit kapot/))
   })
 
-  it('plan check divergent ⇒ ERROR PLAN_CHECK_FAILED, outcome failed', async () => {
-    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], verifyResult: 'divergent' })
+  it('plan check divergent ⇒ ERROR PLAN_CHECK_FAILED with the reasoning, outcome failed', async () => {
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], verifyResult: 'divergent', verifyReasoning: 'Extra: b.ts.' })
     const r = await t.run()
     expect(r.jobs[0].outcome).toBe('failed')
-    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PLAN_CHECK_FAILED: verify_task_against_plan: divergent/))
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PLAN_CHECK_FAILED: verify_task_against_plan: divergent — Extra: b\.ts\./))
+  })
+
+  it('plan check partial ⇒ ERROR PLAN_CHECK_PARTIAL with the reasoning, outcome failed, no done (ISS-7)', async () => {
+    const reasoning = '3/9 plan-paden aanwezig in diff. Ontbrekend: a.ts.'
+    const t = await setup({ script: [write('a.txt', 'a\n'), answer('klaar')], verifyResult: 'partial', verifyReasoning: reasoning })
+    const r = await t.run()
+    expect(r.jobs[0].outcome).toBe('failed')
+    expect(jobUpdates(t.mcp).map((u) => u.status)).toEqual(['running', 'failed'])
+    expect(String(lastJobUpdate(t.mcp)?.error)).toContain('Ontbrekend: a.ts')
+    expect(runLogLines(t.runLogDir)).toContainEqual(expect.stringMatching(/^\S+ \[harness\] ERROR PLAN_CHECK_PARTIAL: verify_task_against_plan: partial — 3\/9 plan-paden/))
   })
 
   it('done refused ⇒ ERROR DONE_REFUSED, outcome failed', async () => {

@@ -33,6 +33,8 @@ export async function startFakeScrum4meMcp(
     failUpdate?: Array<'running' | 'done' | 'failed'>
     updateOutcome?: Partial<Record<'running' | 'done' | 'failed' | 'skipped', UpdateOutcomeOverride>>
     verifyResult?: 'aligned' | 'partial' | 'empty' | 'divergent'
+    /** The classifier's explanation, sent along with the result as the MCP does. */
+    verifyReasoning?: string
     health?: HealthSetup
     /** The MCP refuses the cost of every final update, as it does for a cost report it does not allow or does not accept (scrum4me-mcp harness-cost.ts). */
     refuseCost?: 'COST_REPORT_INVALID' | 'COST_REPORT_NOT_ALLOWED'
@@ -40,7 +42,7 @@ export async function startFakeScrum4meMcp(
 ) {
   const calls: ToolCallRecord[] = []
   const claims = [...(opts.claims ?? [])]
-  const state = { heartbeatOk: true, failUpdate: new Set(opts.failUpdate ?? []), updateOutcome: opts.updateOutcome ?? {}, verifyResult: opts.verifyResult ?? 'aligned', health: opts.health ?? {} }
+  const state = { heartbeatOk: true, failUpdate: new Set(opts.failUpdate ?? []), updateOutcome: opts.updateOutcome ?? {}, verifyResult: opts.verifyResult ?? 'aligned', verifyReasoning: opts.verifyReasoning, health: opts.health ?? {} }
   const server = new McpServer({ name: 'fake-scrum4me', version: '0.0.0' })
 
   if (!state.health.noTool) {
@@ -114,7 +116,7 @@ export async function startFakeScrum4meMcp(
   })
   server.registerTool('verify_task_against_plan', { inputSchema: { task_id: z.string(), worktree_path: z.string() } }, async (args) => {
     calls.push({ name: 'verify_task_against_plan', args })
-    return toolText({ result: state.verifyResult, task_id: args.task_id })
+    return toolText({ result: state.verifyResult, reasoning: state.verifyReasoning, task_id: args.task_id })
   })
   server.registerTool(
     'log_implementation',
