@@ -28,6 +28,26 @@
       "costMode": "hosted",
       "contextTokens": 131072,
       "reasoningEffort": "medium"
+    },
+    "deepseek-v4-flash-or": {
+      "costMode": "hosted",
+      "contextTokens": 65536,
+      "reasoningEffort": "medium"
+    },
+    "deepseek-v4-pro-or": {
+      "costMode": "hosted",
+      "contextTokens": 65536,
+      "reasoningEffort": "medium"
+    },
+    "glm-5.3-or": {
+      "costMode": "hosted",
+      "contextTokens": 65536,
+      "reasoningEffort": "medium"
+    },
+    "minimax-m3-or": {
+      "costMode": "hosted",
+      "contextTokens": 65536,
+      "reasoningEffort": "medium"
     }
   },
   "mcp": {

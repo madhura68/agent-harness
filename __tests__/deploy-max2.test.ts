@@ -22,7 +22,17 @@ describe('deploy/max2/harness.json', () => {
   const yaml = readFileSync(deploy('litellm/config.yaml'), 'utf8')
 
   it('voldoet aan het strikte workerschema en noemt precies de configuraties uit litellm/config.yaml', () => {
-    expect(Object.keys(cfg.configurations).sort()).toEqual(['gsq-lokaal', 'qwen3.8-or', 'qwen3.8-or-128k', 'qwen3.8-or-16k', 'qwen3.8-or-32k'])
+    expect(Object.keys(cfg.configurations).sort()).toEqual([
+      'deepseek-v4-flash-or',
+      'deepseek-v4-pro-or',
+      'glm-5.3-or',
+      'gsq-lokaal',
+      'minimax-m3-or',
+      'qwen3.8-or',
+      'qwen3.8-or-128k',
+      'qwen3.8-or-16k',
+      'qwen3.8-or-32k',
+    ])
     expect(Object.keys(cfg.configurations).sort()).toEqual(modelNames(yaml).sort())
     expect(modelNames(yaml)).not.toContain('qwen3.8-or-neg')
   })
@@ -39,6 +49,16 @@ describe('deploy/max2/harness.json', () => {
     for (const [naam, venster] of [['qwen3.8-or-16k', 16384], ['qwen3.8-or-32k', 32768], ['qwen3.8-or-128k', 131072]] as const) {
       expect(cfg.configurations[naam]).toEqual({ costMode: 'hosted', contextTokens: venster, reasoningEffort: 'medium' })
     }
+    // Model comparison: the same window and effort as the qwen3.8-or baseline, so only the model differs.
+    for (const naam of ['deepseek-v4-flash-or', 'deepseek-v4-pro-or', 'glm-5.3-or', 'minimax-m3-or']) {
+      expect(cfg.configurations[naam]).toEqual({ costMode: 'hosted', contextTokens: 65536, reasoningEffort: 'medium' })
+    }
+  })
+
+  it('pint de vergelijkingsmodellen op FP8 zonder dataverzameling, en houdt qwen3.8-or op BF16', () => {
+    expect(yaml).toMatch(/extra_body: &or-fp8-extra\n\s+provider:\n\s+quantizations: \["fp8"\]\n\s+data_collection: "deny"/)
+    expect(yaml.match(/extra_body: \*or-fp8-extra/g)).toHaveLength(3)
+    expect(yaml).toMatch(/quantizations: \["bf16"\]/)
   })
 
   it('geeft een taak met repo_url de repo-sleutel voor agent-harness en bevat geen geheime waarde', () => {
