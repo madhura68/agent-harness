@@ -21,8 +21,8 @@ describe('deploy/max2/harness.json', () => {
   const cfg = loadWorkerConfig(deploy('harness.json'))
   const yaml = readFileSync(deploy('litellm/config.yaml'), 'utf8')
 
-  it('voldoet aan het strikte workerschema en noemt precies de twee configuraties uit litellm/config.yaml', () => {
-    expect(Object.keys(cfg.configurations).sort()).toEqual(['gsq-lokaal', 'qwen3.8-or'])
+  it('voldoet aan het strikte workerschema en noemt precies de configuraties uit litellm/config.yaml', () => {
+    expect(Object.keys(cfg.configurations).sort()).toEqual(['gsq-lokaal', 'qwen3.8-or', 'qwen3.8-or-128k', 'qwen3.8-or-16k', 'qwen3.8-or-32k'])
     expect(Object.keys(cfg.configurations).sort()).toEqual(modelNames(yaml).sort())
     expect(modelNames(yaml)).not.toContain('qwen3.8-or-neg')
   })
@@ -35,6 +35,10 @@ describe('deploy/max2/harness.json', () => {
     })
     expect(cfg.configurations['gsq-lokaal']).toEqual({ costMode: 'local', contextTokens: 65536 })
     expect(cfg.configurations['qwen3.8-or']).toEqual({ costMode: 'hosted', contextTokens: 65536, reasoningEffort: 'medium' })
+    // Context-window trial: the same model and settings, only the window differs.
+    for (const [naam, venster] of [['qwen3.8-or-16k', 16384], ['qwen3.8-or-32k', 32768], ['qwen3.8-or-128k', 131072]] as const) {
+      expect(cfg.configurations[naam]).toEqual({ costMode: 'hosted', contextTokens: venster, reasoningEffort: 'medium' })
+    }
   })
 
   it('geeft een taak met repo_url de repo-sleutel voor agent-harness en bevat geen geheime waarde', () => {
