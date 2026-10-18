@@ -94,6 +94,9 @@ const MIN_TOOL_ROOM = 360
 const TOOL_BUDGET_TEXT = 'de leesruimte is op; antwoord met wat je hebt'
 const TRUNCATION_NOTE = '\nafgekapt; vraag een sectie op met `heading`'
 const CLOSING_PROMPT = 'Je kunt geen tools meer gebruiken. Antwoord nu met wat je hebt.'
+// Window budget of a run without chatBudget (task runs): a result that does not fit the window is cut, or not fetched at all.
+const WINDOW_TRUNCATION_NOTE = '\nafgekapt om binnen het contextvenster te blijven; vraag een kleiner deel op (read_file: offset/limit)'
+const WINDOW_BUDGET_TEXT = 'niet opgehaald: het contextvenster is vol; vraag minder tegelijk op of lees een kleiner deel (read_file: offset/limit)'
 
 /** The tool message as the model gets it: the serialised result. */
 const toolMessageContent = (r: Pick<ToolExecResult, 'ok' | 'errorCode' | 'content' | 'truncated'>) =>
@@ -103,15 +106,20 @@ const toolMessageContent = (r: Pick<ToolExecResult, 'ok' | 'errorCode' | 'conten
  * The tool message of `r` within `room` characters of serialised message. A result that does not fit is cut off (truncated: true, with a
  * note); the cut is found by binary search on the length of the serialised message, so escapes count. `room` must hold the note.
  */
-function fitToolMessage(r: ToolExecResult, room: number): { message: string; cut: boolean } {
+function fitToolMessage(
+  r: ToolExecResult,
+  room: number,
+  note = TRUNCATION_NOTE,
+  size: (message: string) => number = (message) => message.length,
+): { message: string; cut: boolean } {
   const whole = toolMessageContent(r)
-  if (whole.length <= room) return { message: whole, cut: false }
-  const messageFor = (n: number) => toolMessageContent({ ...r, content: r.content.slice(0, n) + TRUNCATION_NOTE, truncated: true })
+  if (size(whole) <= room) return { message: whole, cut: false }
+  const messageFor = (n: number) => toolMessageContent({ ...r, content: r.content.slice(0, n) + note, truncated: true })
   let lo = 0
   let hi = r.content.length
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2)
-    if (messageFor(mid).length <= room) lo = mid
+    if (size(messageFor(mid)) <= room) lo = mid
     else hi = mid - 1
   }
   // No guard against a cut inside a surrogate pair is needed: JSON.stringify writes a lone half as a 6-character escape, so the message
@@ -289,6 +297,31 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
 
     // chatBudget: characters of tool messages in the transcript, and the reason of the closing call that must come next.
     const chat = deps.chatBudget
+
+    /**
+     * Window budget for a run without chatBudget: the characters of serialised transcript that the remaining results of the current
+     * batch may still take, so that the next request passes fitContext. fitContext may stub every tool result before the current
+     * assistant message (seen), never one of this batch (unseen): those must fit now. The arithmetic is fitContext's own: the estimate
+     * minus the credit it gives for stubbing (REMOVED_CHARS_PER_TOKEN), plus the output reserve, within the window. Undefined without
+     * a window or with chatBudget (that has its own budget).
+     */
+    const windowed = !chat && limits.contextTokens !== undefined
+    const windowRoom = (assistantIndex: number): number => {
+      const window = limits.contextTokens as number
+      let removable = 0
+      for (let i = 0; i < assistantIndex; i++) {
+        const m = messages[i]
+        if (m.role !== 'tool' || isCompacted(m.content)) continue
+        removable += charsOf(m) - charsOf({ ...m, content: compactedStub(m.content) })
+      }
+      const reserve = Math.max(MIN_TURN_TOKENS, Math.min(limits.maxOutputTokens - outputTokens, Math.floor(window / 4)))
+      // One token of slack for the rounding of the estimate.
+      const tokens = window - reserve - (estimate() - Math.floor(removable / REMOVED_CHARS_PER_TOKEN)) - 1
+      return Math.floor(tokens * ADDED_CHARS_PER_TOKEN)
+    }
+    /** What a tool message adds to charsOf(messages): the message itself, escaped, plus its comma. */
+    const toolMessageChars = (callId: string, content: string) => charsOf({ role: 'tool', tool_call_id: callId, content }) + 1
+    const budgetStub: ToolExecResult = { ok: false, errorCode: 'TOOL_BUDGET', content: WINDOW_BUDGET_TEXT, truncated: false }
     let toolSpent = 0
     let closing: ClosingReason | undefined
 
@@ -424,6 +457,7 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
         continue
       }
       messages.push({ role: 'assistant', content: res.message.content, tool_calls: calls })
+      const assistantIndex = messages.length - 1
 
       for (const [index, call] of calls.entries()) {
         if (aborted()) return ABORTED
@@ -441,6 +475,19 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
           closing = 'tool_budget'
           continue // not a tool error: it does not count towards maxToolErrors
         }
+        // Window budget: what this result may take, keeping room for a budget stub for every later call of the batch.
+        let resultRoom = Infinity
+        if (windowed) {
+          const later = calls.slice(index + 1).reduce((n, c) => n + toolMessageChars(c.id, toolMessageContent(budgetStub)), 0)
+          resultRoom = windowRoom(assistantIndex) - later
+          if (resultRoom < toolMessageChars(call.id, toolMessageContent(budgetStub)) + MIN_TOOL_ROOM) {
+            // Not fetched: no room for even a short result. Not a tool error, and the model keeps its tools.
+            recordToolResult(call.id, budgetStub, false)
+            trace.event({ type: 'tool_window', callId: call.id, action: 'skipped', roomChars: resultRoom })
+            messages.push({ role: 'tool', tool_call_id: call.id, content: toolMessageContent(budgetStub) })
+            continue
+          }
+        }
         const toolSignal = within(deadline - now())
         const r = await executeCall(call, toolSignal)
         if (r.errorCode === 'TOOL_TIMEOUT' && aborted()) {
@@ -451,9 +498,14 @@ export async function runManifest(manifest: Manifest, deps: RunDeps): Promise<Ru
           recordToolResult(call.id, r)
           return { status: 'timed_out' }
         }
-        const fitted = chat ? fitToolMessage(r, toolRoom) : { message: toolMessageContent(r), cut: false }
+        const fitted = chat
+          ? fitToolMessage(r, toolRoom)
+          : windowed
+            ? fitToolMessage(r, resultRoom, WINDOW_TRUNCATION_NOTE, (message) => toolMessageChars(call.id, message))
+            : { message: toolMessageContent(r), cut: false }
         const toolMessage = fitted.message
         recordToolResult(call.id, r, fitted.cut)
+        if (windowed && fitted.cut) trace.event({ type: 'tool_window', callId: call.id, action: 'cut', roomChars: resultRoom })
         toolSpent += toolMessage.length
         messages.push({ role: 'tool', tool_call_id: call.id, content: toolMessage })
         if (!r.ok) {

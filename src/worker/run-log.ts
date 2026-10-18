@@ -301,6 +301,9 @@ export function openRunLog(cfg: WorkerLogConfig | undefined, init: RunLogInit): 
       case 'closing_call':
         appendMetaLine(`closing_call reason=${e.reason}`) // chatBudget (M50-1b): the one closing call without tools
         break
+      case 'tool_window':
+        appendMetaLine(`tool_window ${e.action} roomChars=${e.roomChars}`) // window budget of a task run (run.ts windowRoom)
+        break
       case 'after_answer': {
         const fields = { turn: e.turn, outcome: e.outcome }
         appendJsonLine('harness.gate', redactDeep(fields, secrets))
