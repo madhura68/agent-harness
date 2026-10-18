@@ -244,11 +244,68 @@ describe('context budget (limits.contextTokens)', () => {
     })
   }
 
-  it('stops with CONTEXT_EXHAUSTED when even a compacted history leaves no room, without another request', async () => {
-    const r = await run([big('b1', 100), answer('never')], { allow: ['big'], limits: { contextTokens: 6000 } })
+  it('stops with CONTEXT_EXHAUSTED when the prompt alone leaves no room, without a request', async () => {
+    const r = await run([answer('never')], { allow: ['big'], limits: { contextTokens: 1100 } })
     expect(r.result.status).toBe('budget_exceeded')
     expect(r.result.error?.code).toBe('CONTEXT_EXHAUSTED')
-    expect(r.requests).toHaveLength(1)
+    expect(r.requests).toHaveLength(0)
+  })
+
+  // Window budget (contextvenster-proef 2026-10-18): results of the current batch are unseen, so fitContext may not stub them.
+  // They are fitted while they are added: cut with a note, or not fetched at all, so the next request always goes out.
+  const window = 6000
+  const reserve = (maxTokens: number) => Math.max(1024, Math.min(maxTokens, Math.floor(window / 4)))
+  const isWindowCut = (m: { content: string }) => {
+    const c = JSON.parse(m.content) as { truncated?: boolean; content?: string; errorCode?: string }
+    return c.truncated === true && /offset\/limit/.test(c.content ?? '')
+  }
+  const isSkipped = (m: { content: string }) => (JSON.parse(m.content) as { errorCode?: string }).errorCode === 'TOOL_BUDGET'
+
+  it('cuts a result that alone does not fit the window, and the next request goes out', async () => {
+    const r = await run([big('b1', 100), answer('klaar')], { allow: ['big'], limits: { contextTokens: window } })
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'klaar' })
+    const [tm] = lastToolMessages(r.requests[1])
+    expect(isWindowCut(tm)).toBe(true)
+    expect(r.events.find((e) => e.type === 'tool_window')).toMatchObject({ callId: 'b1', action: 'cut' })
+    // The full result stays on disk.
+    expect(readFileSync(join(r.trace.dir, 'tools', 'b1.txt'), 'utf8')).toHaveLength(40_000)
+  })
+
+  it('fits a batch of four large reads: the first is cut, the rest are not fetched, and the run goes on with its tools', async () => {
+    const four = { body: completion({ toolCalls: ['r1', 'r2', 'r3', 'r4'].map((id) => ({ id, name: 'big', arguments: '{}' })), usage: { prompt_tokens: 100, completion_tokens: 5 } }) }
+    const r = await run([four, answer('klaar')], { allow: ['big'], limits: { contextTokens: window } })
+    expect(r.result).toMatchObject({ status: 'completed', answer: 'klaar' })
+    expect(r.result.error).toBeUndefined()
+    const tm = lastToolMessages(r.requests[1])
+    expect(tm.map((m) => m.tool_call_id)).toEqual(['r1', 'r2', 'r3', 'r4'])
+    expect(isWindowCut(tm[0])).toBe(true)
+    expect(tm.slice(1).every(isSkipped)).toBe(true)
+    expect(JSON.parse(tm[1].content).content).toMatch(/offset\/limit/)
+    // A skipped call is not executed and is no tool error; the second request still offers the tools.
+    expect(r.mcpCalls).toEqual(['big'])
+    expect(r.result.usage.toolErrors).toBe(0)
+    expect(r.requests[1].body.tools.length).toBeGreaterThan(0)
+    // The second request fits: estimate plus the output reserve stays within the window, without compaction.
+    const second = r.events.filter((e) => e.type === 'model_request')[1] as { promptEstimate: number }
+    expect(second.promptEstimate + reserve(2048 - 5)).toBeLessThanOrEqual(window)
+    expect(r.events.some((e) => e.type === 'context_compacted')).toBe(false)
+    expect(r.events.filter((e) => e.type === 'tool_window').map((e) => e.action)).toEqual(['cut', 'skipped', 'skipped', 'skipped'])
+  })
+
+  it('counts on stubbing seen results: an older result makes room for the new one instead of a cut', async () => {
+    const r = await run([big('b1', 100), big('b2', 5700), answer('ok')], { allow: ['big'], limits: { contextTokens: 14_000 } })
+    expect(r.result.status).toBe('completed')
+    // b2 is fitted against a window in which b1 can still be stubbed: it is not cut, and b1 is stubbed for request 3.
+    expect(lastToolMessages(r.requests[2]).map(isCompacted)).toEqual([true, false])
+    expect(r.events.some((e) => e.type === 'tool_window')).toBe(false)
+  })
+
+  it('leaves a run without contextTokens alone', async () => {
+    const four = { body: completion({ toolCalls: ['r1', 'r2'].map((id) => ({ id, name: 'big', arguments: '{}' })) }) }
+    const r = await run([four, answer('ok')], { allow: ['big'] })
+    expect(r.result.status).toBe('completed')
+    expect(lastToolMessages(r.requests[1]).some(isWindowCut)).toBe(false)
+    expect(r.events.some((e) => e.type === 'tool_window')).toBe(false)
   })
 })
 

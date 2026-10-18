@@ -9,6 +9,8 @@ export type TraceEvent =
   // chatBudget (M50-1b): the one closing call without tools is about to be made; `reason` says why (run.ts ClosingReason).
   | { type: 'closing_call'; reason: 'tool_budget' | 'batch_dropped' | 'max_turns' | 'output_budget' | 'length' }
   | { type: 'context_compacted'; turn: number; messages: number; bytes: number; estimateBefore: number; estimateAfter: number }
+  // Window budget of a run without chatBudget: a result cut to fit the context window, or not fetched at all (run.ts windowRoom).
+  | { type: 'tool_window'; callId: string; action: 'cut' | 'skipped'; roomChars: number }
   | { type: 'model_response'; turn: number; content: string | null; toolCalls: ToolCall[]; finishReason: string; usage: Usage; reasoning?: string; durationMs: number; systemFingerprint?: string; provider?: string }
   | { type: 'tool_call'; callId: string; name: string; arguments: string; argumentsWasObject: boolean }
   | { type: 'tool_result'; callId: string; ok: boolean; errorCode?: ErrorCode; truncated: boolean; sha256: string; bytes: number }
