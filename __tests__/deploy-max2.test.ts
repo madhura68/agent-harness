@@ -68,7 +68,8 @@ describe('deploy/max2/harness.json', () => {
     expect(cfg.mcp.env?.SCRUM4ME_TOKEN).toBe('${SCRUM4ME_TOKEN}')
     expect(cfg.mcp.env?.FORGEJO_PUSH_TOKEN).toBe('${FORGEJO_PUSH_TOKEN}')
     for (const naam of ['SCRUM4ME_TOKEN', 'DATABASE_URL', 'DIRECT_URL', 'FORGEJO_PUSH_TOKEN']) expect(cfg.mcp.env?.[naam]).toBe('${' + naam + '}')
-    expect(cfg.task?.limits).toEqual({ maxTurns: 40, maxOutputTokens: 80000, maxWallSeconds: 2400, maxToolErrors: 8 })
+    // maxTurns 80 (2026-10-18): models that make about one tool call per turn need ~45-70 turns for a 9-file task.
+    expect(cfg.task?.limits).toEqual({ maxTurns: 80, maxOutputTokens: 80000, maxWallSeconds: 2400, maxToolErrors: 8 })
     expect(cfg.limits).toEqual({ maxTurns: 8, maxOutputTokens: 4096, maxWallSeconds: 240, maxToolErrors: 2 })
   })
 
