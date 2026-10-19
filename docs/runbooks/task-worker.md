@@ -31,7 +31,7 @@ Een sessie dispatchte (M3) zoals een gewone `TASK_IMPLEMENTATION`-job; sinds M45
 3. `prepare`-commando's in een wegwerpcontainer (netwerk aan, npm-cache gemount).
 4. Modelloop met de verify-gate: elk eindantwoord van het model draait `recept.verify` in een netwerkloze container; groen → klaar, rood → een nieuwe poging tot `maxVerifyRepairs` keer.
 5. Na een groene verify: de git-administratie opnieuw scannen en vergelijken met de snapshot uit stap 1 (ook `node_modules`); pas dan `git add -A` + `git commit --no-verify` met veilige host-git-vlaggen (auteur `agent-harness`).
-6. `verify_task_against_plan`; `ALIGNED`/`PARTIAL` gaat door, `EMPTY`/`DIVERGENT` faalt.
+6. `verify_task_against_plan`; alleen `ALIGNED` gaat door; `PARTIAL` faalt als `PLAN_CHECK_PARTIAL` (planbestanden ontbreken in de diff), `EMPTY`/`DIVERGENT` faalt als `PLAN_CHECK_FAILED`.
 7. `log_commit`, `log_test_result PASSED`, `update_job_status done` met de samenvatting en de verify-uitslag.
 8. Alleen bij een bevestigde `done` mét `pushed_at`: `update_task_status review`. Wijst de MCP `done` af, of eindigt de job toch als `FAILED` (pushfout), dan stuurt de harness geen tweede terminale update; de taak blijft `in_progress`.
 
@@ -46,7 +46,8 @@ Een sessie dispatchte (M3) zoals een gewone `TASK_IMPLEMENTATION`-job; sinds M45
 | `verify <n>× rood: <uitvoer>` (code `VERIFY_FAILED`) | Na `maxVerifyRepairs` rode gate-runs; de laatste 6000 tekens output gaan mee. |
 | `git-administratie gewijzigd: <items>` | De scan na een groene verify vond een gewijzigd, nieuw of verdwenen `.git`-item (ook onder `node_modules`). Geen commit, geen verdere git-operatie. |
 | `model produceerde geen wijzigingen` | `git commit` had niets gestaged. |
-| `verify_task_against_plan: <empty\|divergent>` | De plan-check zag geen of tegenstrijdige voortgang. |
+| `verify_task_against_plan: <empty\|divergent>` (code `PLAN_CHECK_FAILED`) | De plan-check zag geen of tegenstrijdige voortgang. |
+| `verify_task_against_plan: partial` (code `PLAN_CHECK_PARTIAL`) | De plan-check zag een deel van de planbestanden; de reden van de check gaat mee. |
 | `commit mislukt: <fout>` / `verify_task_against_plan mislukt: <fout>` / `done geweigerd: <fout>` | De bijbehorende MCP-aanroep zelf faalde. |
 | `worker gestopt` | SIGINT (systemd-stop) terwijl een stap liep; zie hieronder. |
 | `container <naam> niet aantoonbaar gestopt; worker gestopt, systemd herstart hem en de start ruimt achtergebleven containers op` | Zie "Opruimen". |
