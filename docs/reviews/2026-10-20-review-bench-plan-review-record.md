@@ -50,3 +50,36 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
 - Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
 - Om binnen de 64k te blijven: de MINOR-tabel van spec-ronde 2 is één alinea geworden, en Architecture, de PBI-tekst en enkele lijsten zijn ingekort.
 - Plan: 56 756 → 62 945 tekens. De grootste `implementation_plan` is S2-2, met 6 337 tekens.
+
+## Ronde 2: revisie 4 (`931208539e881b34d37866dbb600965d90ec10b8`)
+
+**Pin:** `plan` @`93120853`, sha256 `a27a22d64286e2a6c93fce09b12ac32b87e9b898ea03ed3c2a4b2e3225be2f99`. Repository: `agent-harness@93120853`. De body had een nieuwe excerpt E3 (max2 `task_bench/run.py` @`a55ec379`, r. 530-552) en legde drie afwijkingen van een voorgestelde remedie (C-m3, C-m8, C-m5) aan beide reviewers voor.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `c94e5fc5-2054-4ff7-a274-80af391444ae` | `80b58724-9e71-4596-9976-7e2e043b4928` | `efc6fb47-1701-4e1f-9f26-4e588306dbe8` | linked | **NO-GO** 0/1/1 |
+| CLAUDE | `274c42fb-385c-4d85-baf9-99d00cd26da2` | `d5dba36d-ff09-473a-bdf5-809bcf848e6d` | `69bfb83d-2506-42af-a778-5bba4c0ec2a1` | linked | **GO** 0/0/6 (job `fdff3268-fc63-434d-8e68-9d136ac37f6f`) |
+
+**Fixes van ronde 1.** Beide reviewers vonden dat ze houden, tegen de tree gecontroleerd. Het pad van X-M1 is apart nagelopen: de throw uit `onRetry` (`retry-client.ts:84-92`, `:119-124`), MODEL_ERROR in `run.ts:374-379`, en de volgorde `afterResponse` dan `beforeRequest`. Beide aanvaardden de drie afwijkingen (C-m3, C-m8, C-m5). Alle tien MINORs van spec-ronde 2 landen nog.
+
+**Triage ronde 2.** Elke bevinding is tegen de tree of de spec gecontroleerd.
+
+| # | Bevinding | Besluit en remedie |
+|---|---|---|
+| X2-M1 | `score.py smoke` geeft "door" als qwen ontbreekt, bijvoorbeeld na een afgewezen preflight | Geaccepteerd. Gecontroleerd: spec §4.8 stap 6 (r. 372-378) eist beide rookruns. Fix in S2-3 en P2: van beide configuraties moet een resultaat bestaan, en een ontbrekend resultaat betekent stop. Er zijn vier fixtures: beide aanwezig, qwen ontbreekt, sonnet ontbreekt, en een benchfout. |
+| X2-m1 | Het rapport noemt een run met `limiet` of `resultaat_ongeldig` "niet gestart" | Geaccepteerd. Reden 3 is nu de status van het bench-result (benchfout, limiet of resultaat_ongeldig), met de foutcode. |
+| C2-m1 | De driver kent geen run-identiteit: E3 sleutelt op `(label, case)`, en M8 heeft 3 runs per label. Oude CONFIGURATION_NOT_PROBED-resultaten tellen bij het hervatten als benchfout | Geaccepteerd. Gecontroleerd tegen E3 r. 533-539. Fix in S2-2: run n gaat naar `<out>/<label>/r<n>`. Hervatten, de teller en `skipped.json` werken per `(label, n)`, en NOT_PROBED telt net als `afgebroken` niet in `seen`. Er is een hervattest. S2-3 leest `<out>/<label>/r<n>/*/bench-result.json` en neemt per `(label, n)` het resultaat met een modelstatus. |
+| C2-m2 | Een antwoord dat definitief wegvalt (`UnusableAnswerError`) bereikt de guard niet. De zin "elk antwoord telt één keer" is dan onwaar | Geaccepteerd, met de betere remedie. Gecontroleerd: `retry-client.ts:112-114`. In de catch gaat het ook als `dropped` naar de guard, met dezelfde stopregel, en de fout gaat ongewijzigd door. Er is een test: vier keer `other` à 0.30 geeft COST_LIMIT_EXCEEDED in `costStop()`. |
+| C2-m3 | Bij de spawn-test in S1-7 ontbreken de probe-fixture en de `main()`-tak | Geaccepteerd. Gecontroleerd: de switch staat op `src/cli.ts:625-636`, niet op ~498-512 zoals de reviewer schreef. Fix: `case 'review-bench'`, een gedeelde helper `__tests__/fixtures/review-bench/probe.ts` uit S1-6, en een server die precies 1 verzoek telt. |
+| C2-m4 | S1-6 mist de herkomst van `ModelSpec` en `NO_USAGE`, en `adaptReviewPrompt` draait pas na de run-map | Geaccepteerd. Gecontroleerd: `ModelSpec` staat op `task-bench.ts:20`, `NO_USAGE` is privé (`:188`), en spec §4.5 zegt "de bench draait niet". Fix: `adaptReviewPrompt` draait in stap 1, vóór de map. Er is een eigen `NO_USAGE`, en `run?.usage ?? NO_USAGE`. |
+| C2-m5 | De volgordetabel laat S2-3 wachten op S2-1 in plaats van op S2-2 | Geaccepteerd. De rij is gesplitst. |
+| C2-m6 | Een gedropt hosted antwoord zonder bedrag geeft meteen COST_UNKNOWN en dus een benchfout | Geaccepteerd als notitie, zoals de reviewer voorstelde; geen codewijziging. P3 stap 2 noemt het een provider-uitval, en JP kan het label overslaan. |
+
+**Scope-delta r4→r5.**
+- Erbij: een run-map per run (`r<n>`), en de guard ook voor het laatste weggevallen antwoord. De rest zijn verduidelijkingen en testgevallen.
+- Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
+- Om onder de 64k te blijven:
+  - Global Constraints, Review Focus, Vorm, Ceremonie en Risico's zijn ingekort tot proza;
+  - de story-AC's verwijzen nu naar de codes;
+  - korte geneste lijsten zijn op één regel gezet.
+- Plan: 63 017 → 63 210 tekens. De grootste `implementation_plan` is S2-2, met 6 708 tekens.
