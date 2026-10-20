@@ -282,6 +282,61 @@ Letterlijke fragmenten met regelnummers uit repo's buiten de `/work`-checkout (S
    40  }
 ```
 
+## shared test harness-config: imports — `__tests__/harness-config.test.ts` r. 1-20
+
+`scrum4me-shared@8df7f2c:__tests__/harness-config.test.ts`
+
+```ts
+    1  import { describe, expect, it } from 'vitest'
+    2  import { CLAUDE_JOB_KINDS, isClaudeJobKind } from '../lib/claude-job-kind'
+    3  import {
+    4    AGENT_CHAT_DEFAULT_PROMPT,
+    5    AGENT_CHAT_MAX_COST_USD,
+    6    DEFAULT_HARNESS_MAX_COST_USD,
+    7    HARNESS_CONFIGURATION_NAME,
+    8    HARNESS_COST_SOURCES,
+    9    HARNESS_JOB_KINDS,
+   10    HARNESS_LOCAL_CONFIGURATIONS,
+   11    isHarnessConfigurationName,
+   12    isHarnessJobKind,
+   13    isHostedHarnessConfiguration,
+   14    parseMaxCostUsd,
+   15  } from '../lib/harness-config'
+   16  
+   17  describe('HARNESS-jobsoorten (spec §5.1)', () => {
+   18    it('ondersteunt exact IDEA_CHAT en TASK_IMPLEMENTATION', () => {
+   19      expect([...HARNESS_JOB_KINDS]).toEqual(['IDEA_CHAT', 'TASK_IMPLEMENTATION'])
+   20    })
+```
+
+## shared test harness-config: pin op de lokale lijst — `__tests__/harness-config.test.ts` r. 215-235
+
+`scrum4me-shared@8df7f2c:__tests__/harness-config.test.ts`
+
+```ts
+  215      expect(Object.keys(DEFAULT_HARNESS_MAX_COST_USD).sort()).toEqual(['IDEA_CHAT', 'TASK_IMPLEMENTATION'])
+  216    })
+  217  
+  218    it('AGENT_CHAT_MAX_COST_USD is 0.05 en een geldig, genormaliseerd plafond', () => {
+  219      expect(AGENT_CHAT_MAX_COST_USD).toBe('0.05')
+  220      expect(parseMaxCostUsd(AGENT_CHAT_MAX_COST_USD)).toBe(AGENT_CHAT_MAX_COST_USD)
+  221    })
+  222  
+  223    it('HARNESS_LOCAL_CONFIGURATIONS is exact gsq-lokaal, met geldige configuratienamen', () => {
+  224      expect([...HARNESS_LOCAL_CONFIGURATIONS]).toEqual(['gsq-lokaal'])
+  225      for (const name of HARNESS_LOCAL_CONFIGURATIONS) expect(isHarnessConfigurationName(name)).toBe(true)
+  226    })
+  227  
+  228    it('isHostedHarnessConfiguration: alleen de lokale lijst is niet gehost (fail-safe voor nieuwe namen)', () => {
+  229      expect(isHostedHarnessConfiguration('gsq-lokaal')).toBe(false)
+  230      expect(isHostedHarnessConfiguration('qwen3.8-or')).toBe(true)
+  231      expect(isHostedHarnessConfiguration('nieuw-lokaal')).toBe(true)
+  232    })
+  233  
+  234    it('AGENT_CHAT_DEFAULT_PROMPT: kort, Nederlands, zonder product-id of toolnamen', () => {
+  235      expect(AGENT_CHAT_DEFAULT_PROMPT.trim().length).toBeGreaterThan(0)
+```
+
 ## workers actions/model-registry.ts (volledig) — `actions/model-registry.ts` r. 1-265
 
 `scrum4me-workers@198eb59:actions/model-registry.ts`
@@ -1222,6 +1277,54 @@ Letterlijke fragmenten met regelnummers uit repo's buiten de `/work`-checkout (S
   413      ((j.cache_write_tokens ?? 0) * Number(p.cache_write_price_per_1m.toString())) / 1_000_000
   414    )
   415  }
+```
+
+## workers test model-registry: HARNESS zonder prijs — `__tests__/lib/model-registry.test.ts` r. 105-130
+
+`scrum4me-workers@198eb59:__tests__/lib/model-registry.test.ts`
+
+```ts
+  105      mockAgentFindMany.mockResolvedValue([
+  106        { id: 'b', runtime: 'CLAUDE', model_id: 'claude-opus-6', display_name: 'Claude Opus 6', active: true, sort_order: 5, notes: null },
+  107      ])
+  108      mockPriceFindMany.mockResolvedValue([])
+  109      const rows = await listModelsWithPrices()
+  110      expect(rows[0].input_price_per_1m).toBeNull()
+  111      expect(rows[0].output_price_per_1m).toBeNull()
+  112      expect(rows[0].cache_read_price_per_1m).toBeNull()
+  113      expect(rows[0].cache_write_price_per_1m).toBeNull()
+  114    })
+  115  
+  116    it('HARNESS heeft nooit een prijs', async () => {
+  117      mockAgentFindMany.mockResolvedValue([
+  118        { id: 'h', runtime: 'HARNESS', model_id: 'gsq-lokaal', display_name: 'GSQ', active: true, sort_order: 1, notes: null },
+  119      ])
+  120      mockPriceFindMany.mockResolvedValue([card('HARNESS', 'anthropic', 'gsq-lokaal')])
+  121      const rows = await listModelsWithPrices()
+  122      expect(rows[0].input_price_per_1m).toBeNull()
+  123      expect(rows[0].cache_write_price_per_1m).toBeNull()
+  124    })
+  125  })
+```
+
+## workers usage-detail: bestaand woord modelherkomst — `components/usage/usage-detail.tsx` r. 240-252
+
+`scrum4me-workers@198eb59:components/usage/usage-detail.tsx`
+
+```tsx
+  240          {row.endedAt
+  241            ? ` · Einde: ${formatUsageDateTime(row.endedAt)}`
+  242            : " · Nog open"}
+  243        </p>
+  244        {row.source === "jobs" && (
+  245          <p className="text-sm">
+  246            Jobstatus: {row.jobStatus} · {row.terminal ? "definitief" : "voorlopig"}
+  247            {row.captureStatus ? ` · capture ${row.captureStatus}` : " · capture-status onbekend"}
+  248            {row.model ? ` · ${row.model[0] ?? "runtime onbekend"}/${row.model[1] ?? "model onbekend"}` : ""}
+  249            {row.pricingModelSource ? ` · modelherkomst ${pricingSourceLabel(row.pricingModelSource)}` : " · modelherkomst onbekend"}
+  250          </p>
+  251        )}
+  252        {tokenQuality.status !== "known" && (
 ```
 
 ## workers package.json — `package.json` r. 1-65
