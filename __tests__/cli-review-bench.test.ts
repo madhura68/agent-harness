@@ -413,6 +413,40 @@ describe('harness review-bench — runs (AC7)', () => {
     expect(leakedFragments(stderr), 'stderr').toEqual([])
   })
 
+  it('masks the key in the usage error of a rejected label: a label that holds the key and a "/" stays out of stderr', async () => {
+    fake = await startFakeModelServer([])
+    const f = setup(fake.baseUrl)
+    const { code, stdout, stderr } = await runMain(args(f, { label: `${DUMMY_KEY}/x` }))
+    expect(code).toBe(1)
+    expect(firstLine(stderr)).toBe(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): "***/x"`)
+    expect(stderr).toContain('Usage:')
+    expect(leakedFragments(stderr), 'stderr').toEqual([])
+    expect(stdout).toBe('')
+    expect(fake.requests).toHaveLength(0)
+    expect(existsSync(f.out)).toBe(false)
+  })
+
+  it('masks the key in an error that main rethrows: an out dir named like the key that cannot be made stays out of its message', async () => {
+    fake = await startFakeModelServer([])
+    const f = setup(fake.baseUrl)
+    // A file where the out dir has to be made: the run dir cannot be created, and the error of the file system names the path.
+    const blocker = join(f.dir, 'blocker')
+    writeFileSync(blocker, 'x')
+    const argv = args(f)
+    argv[argv.indexOf(f.out)] = join(blocker, DUMMY_KEY)
+    const failure = await runMain(argv).then(
+      () => undefined,
+      (err: unknown) => err,
+    )
+    // The premises: main did not turn it into an exit code, and the error is the file system's, with the path in it.
+    expect(failure).toBeInstanceOf(Error)
+    const message = (failure as Error).message
+    expect(message).toMatch(/^[A-Z]+: .*\*\*\*/)
+    expect(message).toContain(blocker)
+    expect(leakedFragments(message), 'the message that the entrypoint prints').toEqual([])
+    expect(fake.requests).toHaveLength(0)
+  })
+
   it('masks the key in the message it prints on stderr: the name of a file that the case names stays out of CASE_INVALID', async () => {
     fake = await startFakeModelServer([])
     const f = setup(fake.baseUrl)

@@ -168,7 +168,7 @@ harness review-bench --case <dir> --config <harness.json> --configuration <name>
 - `--label`: één pad-onderdeel (letters, cijfers, `.`, `_` en `-`), met dezelfde regel als bij task-bench. Het wordt een deel van de naam van de run-map.
 - `--api-key-env`: de naam van de omgevingsvariabele met de masterkey van LiteLLM, onder dezelfde regels als `harness worker`. De waarde komt nooit in argv, uitvoer, trace of resultaat.
 
-**Uitvoer.** Op stdout staat één regel, `<status> <run-dir>`. In `<out>/<case-id>-<label>-<hex8>/` staan `root/` (de werkmap van het model: `payload.json` en `sources/`), `trace.jsonl` en `bench-result.json` (status, het aanvaarde resultaat of `null`, de validatiepogingen, tokens en kosten, `peakInputTokens`, providers en herhalingen). De regel op stdout en de melding op stderr worden, net als de trace en het resultaat, gemaskeerd met de sleutel.
+**Uitvoer.** Op stdout staat één regel, `<status> <run-dir>`. In `<out>/<case-id>-<label>-<hex8>/` staan `root/` (de werkmap van het model: `payload.json` en `sources/`), `trace.jsonl` en `bench-result.json` (status, het aanvaarde resultaat of `null`, de validatiepogingen, tokens en kosten, `peakInputTokens`, providers en herhalingen). Zodra de sleutel gelezen is, wordt elke regel die review-bench op stdout of stderr schrijft ermee gemaskeerd, net als de trace en het resultaat: ook de melding bij een ongeldig label en die van een fout die het schrijven van het resultaat verhindert.
 
 **De vier statussen.**
 - `beoordeeld`: de run eindigde en de validator aanvaardde een `DispatchResult`, ongeacht het verdict. Of de run voldoet, beslist de scorer.

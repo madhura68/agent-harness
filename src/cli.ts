@@ -561,9 +561,14 @@ const REVIEW_BENCH_FLAGS = ['case', 'config', 'configuration', 'probe-dir', 'lab
 // --check-case has no model and no key: it needs the case, the task config (the recipe and the container settings) and a place to write.
 const CHECK_CASE_FLAGS = ['case', 'task-config', 'out'] as const
 
-/** The label of a bench run becomes a part of its run dir name, so it has to be one plain path segment; both bench commands hold it to this. */
-function checkBenchLabel(label: string): void {
-  if (!BENCH_LABEL.test(label)) throw new UsageError(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): ${JSON.stringify(label)}`)
+/**
+ * The label of a bench run becomes a part of its run dir name, so it has to be one plain path segment; both bench commands hold it to
+ * this. The message repeats the label, so a command that has a key masks it with `secrets`; with none the text is the plain one.
+ */
+function checkBenchLabel(label: string, secrets: readonly string[] = []): void {
+  if (!BENCH_LABEL.test(label)) {
+    throw new UsageError(redactText(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): ${JSON.stringify(label)}`, secrets))
+  }
 }
 
 /**
@@ -633,8 +638,9 @@ async function cmdCheckCase(values: Values): Promise<number> {
  * M8: one review-bench run (src/bench/review-bench.ts). The exit code says whether `bench-result.json` was written: 0 for every status,
  * the benchfout one included, and the line `<status> <run-dir>` names where. A case that cannot be used (CASE_INVALID) throws before any
  * run dir exists: its message goes to stderr and the exit code is 1. Any other failure is no result either, and main lets it through, as
- * it does for task-bench. The master key comes from `--api-key-env` under the rules of the worker, and every line printed here is masked
- * with it, because the run dir and the message of a case carry names that a caller chose. The bench is imported only here, like
+ * it does for task-bench, with its message masked. The master key comes from `--api-key-env` under the rules of the worker, and every
+ * line printed from the moment it is read is masked with it (the run dir, the message of a case, the label error and a rethrown
+ * error), because they carry names that a caller chose. The bench is imported only here, like
  * task-bench's: `harness worker` must never depend on it.
  */
 async function cmdReviewBench(values: Values): Promise<number> {
@@ -644,9 +650,9 @@ async function cmdReviewBench(values: Values): Promise<number> {
   const apiKeyEnv = values['api-key-env']
   if (apiKeyEnv === undefined) throw new UsageError('review-bench needs --api-key-env')
   const apiKey = resolveWorkerApiKey(apiKeyEnv, process.env)
-  checkBenchLabel(label)
   // The key as the bench masks it: as it is, and without surrounding whitespace, the form a server echoes.
   const secrets = apiKey ? collectSecretValues({ MODEL_API_KEY: apiKey }, { MODEL_API_KEY: apiKey.trim() }) : []
+  checkBenchLabel(label, secrets)
 
   return withStopSignals(async (signal) => {
     // Imported together, so that the error class is the one the bench throws.
@@ -656,9 +662,14 @@ async function cmdReviewBench(values: Values): Promise<number> {
       process.stdout.write(redactText(`${result.status} ${join(out, result.runId)}\n`, secrets))
       return 0
     } catch (err) {
-      if (!(err instanceof CaseInvalidError)) throw err
-      process.stderr.write(redactText(`${err.message}\n`, secrets))
-      return 1
+      if (err instanceof CaseInvalidError) {
+        process.stderr.write(redactText(`${err.message}\n`, secrets))
+        return 1
+      }
+      // Rethrown, and main or the entrypoint prints its message: a name the caller chose (the out dir in a file system error) may hold the
+      // key. The same error goes on, with its class and identity, so only the text changes.
+      if (err instanceof Error) err.message = redactText(err.message, secrets)
+      throw err
     }
   }, REVIEW_BENCH_STOP_MESSAGE)
 }
