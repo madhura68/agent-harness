@@ -92,7 +92,7 @@ stories:
           - `stop = guard.afterResponse(dropped) ?? guard.beforeRequest()`;
           - `dropped` is het weggevallen antwoord als CompleteResult: `message: { content: null, toolCalls: [] }`, `usage.costUsd = r.costUsd`, `provider = r.provider`, de rest nul of leeg;
           - bij een stop: bewaar hem voor `costStop()` en gooi `new CostStopError(stop)`. Dat is vóór de wachttijd en vóór de herhaalaanvraag.
-          Zo telt de guard elk antwoord één keer: een weggevallen antwoord hier, het teruggegeven antwoord in runManifest. Een `UnusableAnswerError` gaat niet naar de guard: hij komt na de laatste herhaling (de run eindigt dan) of na een onderbroken wachttijd, en dan is dat antwoord al via `onRetry` geteld (retry-client.ts:119-123). Het bedrag staat via `droppedLast` in usage. Een weggevallen hosted antwoord zonder bedrag geeft COST_UNKNOWN, net als elk ander hosted antwoord.
+          Zo telt de guard elk antwoord één keer: een weggevallen antwoord hier, het teruggegeven antwoord in runManifest. Een `UnusableAnswerError` gaat niet naar de guard. Na een onderbroken wachttijd is het antwoord al via `onRetry` geteld (retry-client.ts:119-123). Na de laatste herhaling niet: de run eindigt als benchfout (MODEL_ERROR), ook als dit antwoord het plafond passeert; het bedrag staat via `droppedLast` in usage en het grootboek. Een weggevallen hosted antwoord zonder bedrag geeft COST_UNKNOWN, net als elk ander hosted antwoord.
 
           Tests (eerst rood):
           - Eerst een antwoord met finishReason `other` en `costUsd` 0.01, daarna succes: `retries` heeft 1 record, en `withDroppedCost({..., costUsd: 0.05}, droppedCosts())` geeft 0.06 (`toBeCloseTo`).
@@ -260,7 +260,7 @@ stories:
 
           Bestanden:
           - Nieuw: src/bench/review-bench.ts.
-          - Nieuw: __tests__/bench-review-bench.test.ts. Gebruikt make-case.ts uit taak 5, een nepclient via `deps.createClient`, en een probe-map met een aanvaarde probe zoals in __tests__/probe-gate.test.ts. Zet die probe-opbouw in een helper `__tests__/fixtures/review-bench/probe.ts`; taak 7 gebruikt hem ook.
+          - Nieuw: __tests__/bench-review-bench.test.ts. Gebruikt make-case.ts uit taak 5, een nepclient via `deps.createClient`, `testWorkerConfig` (__tests__/fakes/worker-config.ts) en `seedProbe` (__tests__/fakes/probe-seed.ts) voor een aanvaarde probe; taak 7 gebruikt dezelfde fakes.
 
           Interfaces:
           - Gebruikt:
@@ -312,7 +312,7 @@ stories:
             - tool-respons, totaal boven `maxCostUsd`: limiet met COST_LIMIT_EXCEEDED.
           - Weggevallen antwoorden (plan-r1 X-M1 en C-m3), hosted, `maxCostUsd` "1", met een directe `deps.sleep`:
             - twee keer finishReason `other` à 0.40, daarna een antwoord met een toolcall à 0.25: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, geen `tool_result` in de trace, en `usage.costUsd` 1.05 (`toBeCloseTo`);
-            - drie keer `other` à 0.40: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, `usage.costUsd` 1.20; met de deadline al verstreken (`deps.now`) blijft het timed_out;
+            - drie keer `other` à 0.40: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, `usage.costUsd` 1.20; met `deps.now` die pas na de derde drop voorbij de deadline springt (de nep-sleep zet de klok door): `timed_out`, niet limiet en niet benchfout;
             - één keer `other` à 0.02, daarna een geldig antwoord à 0.05: beoordeeld, en `usage.costUsd` 0.07 in bench-result.json.
           - AC4-aanvulling: een CaseInvalidError laat `out` leeg.
           - AC7, met `DUMMY_KEY` uit __tests__/helpers.ts. Na elk geval geeft `leakedFragments(inhoud)` een lege lijst voor elk bestand onder `out`; dat vangt ook een afgekapt prefix:
@@ -361,7 +361,7 @@ stories:
             - task-bench zonder --case geeft exact `task-bench needs --case`;
             - `TASK_BENCH_STOP_MESSAGE` is exact gelijk aan de tekst hierboven;
             - de bestaande cli-tests van task-bench blijven ongewijzigd groen.
-          - AC7 via spawn, met `DUMMY_KEY`. `main()` krijgt `case 'review-bench'` (src/cli.ts:625-636). Hergebruik make-case.ts en de probe-helper uit taak 6: een harness.json met bestaande configPath/composePath en een aanvaarde probe.json met de juiste configurationHash. Een lokale http-server antwoordt met 400 (niet transient) en een body `bodyWithKeyAt(190)`; hij telt precies 1 verzoek. Daarna geeft `leakedFragments` een lege lijst voor stdout, stderr, trace.jsonl en bench-result.json.
+          - AC7 via `runMain` (zoals __tests__/cli.test.ts:201), met `DUMMY_KEY` in `process.env`. `main()` krijgt `case 'review-bench'` (src/cli.ts:625-636). Hergebruik make-case.ts, schrijf `workerConfigInput()` (__tests__/fakes/worker-config.ts) als harness.json, en zaai de probe met `seedProbesForConfigFile` (__tests__/fakes/probe-seed.ts). Een lokale http-server antwoordt met 400 (niet transient) en een body `bodyWithKeyAt(190)`; hij telt precies 1 verzoek. Daarna geeft `leakedFragments` een lege lijst voor stdout, stderr, trace.jsonl en bench-result.json.
           - Een label met een punt (`claude-sonnet-5.5-or`) wordt aanvaard. Een label met `/` geeft de UsageError van `BENCH_LABEL`.
 
           Verificatie: `npx vitest run __tests__/cli-review-bench.test.ts __tests__/cli.test.ts`, daarna `npm run verify`.
@@ -578,7 +578,7 @@ stories:
 
 # M8 — review-bench: implementatieplan
 
-_Status: draft (2026-10-20), revisie 6. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: draft (2026-10-20), revisie 7. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 

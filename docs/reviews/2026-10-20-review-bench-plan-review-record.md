@@ -144,3 +144,7 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
 **Scope-delta r4.** Geen. Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
 
 **Kosten van de loop.** 8 jobs in 4 rondes, plus een mislukte eerste dispatch zonder job. Het verbruik staat niet in de MCP-antwoorden.
+
+## JP-gate na de GO (2026-10-20)
+
+JP koos "Eerst delta-ronde": de drie MINORs van ronde 4 gaan alsnog in het plan (revisie 7), met één delta-review door Codex vóór de ceremonie. De claude-sessie schreef de wijziging, dus reviewt de andere modelfamilie. De tabel "Landt bij de ceremonie in" hierboven is daarmee vervangen door revisie 7.
