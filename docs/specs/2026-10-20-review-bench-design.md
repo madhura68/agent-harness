@@ -1,6 +1,6 @@
 ---
 title: "Agent-harness M8 — remote modellen op een echte review (review-bench)"
-status: draft
+status: reviewed
 last_updated: 2026-10-20
 revision: 2
 ---

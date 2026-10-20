@@ -16,8 +16,8 @@ The `repository` field is `agent-harness@cb26599c`.
 
 | Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
 |---|---|---|---|---|---|
-| CODEX | `8ed76988-b1eb-4c97-8591-4fd0f00dc267` | `4df111a6-512a-4e17-bbdb-82c214f13dc5` | `9d0836b4-6ff6-4922-9c0b-e370362c08cb` | linked | pending |
-| CLAUDE | `279c4458-bb55-4eb6-a477-ac4c60690338` | `ac5c2860-9833-4fa9-a1da-daa7b0a355dd` | `d376722d-8178-4156-bf45-9d311bc37590` | linked | pending |
+| CODEX | `8ed76988-b1eb-4c97-8591-4fd0f00dc267` | `4df111a6-512a-4e17-bbdb-82c214f13dc5` | `9d0836b4-6ff6-4922-9c0b-e370362c08cb` | linked | **GO** 0/0/4 |
+| CLAUDE | `279c4458-bb55-4eb6-a477-ac4c60690338` | `ac5c2860-9833-4fa9-a1da-daa7b0a355dd` | `d376722d-8178-4156-bf45-9d311bc37590` | linked | **NO-GO** 0/1/9 (job `cd2e6bf7-413b-45a9-8123-c504b0cd81d2`) |
 
 **Uitslag ronde 1.**
 - CODEX: **GO**, 0 BLOCKER / 0 MAJOR / 4 MINOR.
@@ -51,3 +51,40 @@ The `repository` field is `agent-harness@cb26599c`.
   - finding-keys.
 - Het eerste bruikbare resultaat en de rookproef zijn ongewijzigd. De rookproef is wel strenger: sonnet moet NO-GO geven met F1 ≥ MAJOR.
 - Spec: 415 → 442 regels.
+
+## Ronde 2: revisie 2 (`86628ea3496994f5a8b99d05c49db875b73bdc0a`)
+
+**Pins.**
+- `spec`: `86628ea3`, sha256 `d7037994…d033`.
+- `prompt` en `record`: ongewijzigd ten opzichte van ronde 1.
+- Repository: `agent-harness@86628ea3`.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `a7df8640-51e2-4089-96ad-df98fc49c904` | `a4e12304-eea7-4e50-857a-ea555d5337ac` | `78673902-8a72-4fb5-9295-2edd9e73d809` | linked | **GO** 0/0/3 |
+| CLAUDE | `e1831589-ffe1-4c86-8a07-d3a0c97cf47c` | `1990cf27-342c-4b9f-b3d0-d137c42fbdf7` | `7d24a284-35a2-46fc-b900-71ff0fbf4e66` | linked | **GO** 0/0/7 |
+
+**Fixes van ronde 1.**
+- Codex: alle 13 hielden.
+- Claude: 12 hielden. Nummer 5 hield deels, omdat `dispatch-child.ts:78-80` buiten de excerpts valt en daardoor niet te verifiëren is. Daaraan verandert niets.
+
+**Dubbel GO: de spec-fase is klaar** (revisie 2, `86628ea3`).
+- De MINORs van ronde 2 worden niet in de spec verwerkt. Elke wijziging na de GO zou een delta-ronde vragen.
+- Ze gaan als vaste punten naar het plan (M8), dat ze per taak uitwerkt. Het plan noemt per punt waar het geland is.
+
+| # | Bevinding | Naar het plan |
+|---|---|---|
+| X-m1 | AC10 noemt de preflight niet als reden voor een ontbrekende run | Het rapport en AC10/11 krijgen "preflight afgewezen" als reden, met een fixture. |
+| X-m2 | "Bestaande deployments op 65536" klopt niet: de qwen-varianten staan op 16k, 32k en 128k | Erratum: de case overschrijft het venster van elke configuratie. De vier FP8-configuraties staan nu op 65536. |
+| X-m3 | De belofte "de scorer telt `checks` apart" is niet gedefinieerd | SCHRAP in het plan: geen `checks`-diagnose in M8. |
+| C-m1 | `withDroppedCost` en de tracking van dropped answers zijn niet geëxporteerd (`task-bench.ts:194`, `:326-362`) | Het plan extraheert ze naar een gedeelde helper, met een test dat de kosten van een dropped answer in `usage.costUsd` belanden. |
+| C-m2 | De motivering van het grootboek klopt niet: ook het grootboek telt afgebroken aanvragen niet | Erratum: het grootboek begrenst de som over runs; afgebroken aanvragen dekken de marge en een dashboardcontrole na het venster. |
+| C-m3 | "Actuele aanvaarde probe" is niet te controleren, en een mislukte `litellm_upgrade` is niet afgehandeld | Het plan definieert "actueel" als: `probe.json` is geschreven na de `litellm_upgrade` van dit venster (mtime). Bij exit ≠ 0 van `litellm_upgrade`: opnieuw draaien, niet proben. De nieuwe configuraties staan achteraan in `harness.json`. |
+| C-m4 | De grens van 20 000 tekens in `read_file` betekent dat de bron van 30 KB in stukken gelezen moet worden | Het rapport krijgt per run het aantal `read_file`-aanroepen met `offset`/`limit` op `sources/doc`, uit de trace. |
+| C-m5 | De rookproef-gate heeft een F1-score nodig vóór stap 8 | Het plan laat `score.py` voor de rookproef een blad maken, waarop Claude alleen `f1` invult. |
+| C-m6 | AC1, AC4 en de CLI-generalisatie kunnen slagen terwijl het defect er is | AC1: de bestaande `task-tools`-tests slagen ongewijzigd. AC4: ook `sources/__dispatch_input`. Gate van stap 1: de gebruiksfout en de stopmelding van task-bench blijven byte-gelijk. |
+| C-m7 | Verwijzingen buiten de tree zijn niet te verifiëren | Geen actie. `case-check` controleert de hashes op max2. |
+
+**Scope-delta r2.** Geen. Het eerste bruikbare resultaat en de praktijkproef zijn ongewijzigd.
+
+**Kosten van de loop.** 4 jobs, 2 rondes. Het verbruik staat niet in de MCP-antwoorden.
