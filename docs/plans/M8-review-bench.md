@@ -552,7 +552,7 @@ stories:
           - De volgorde: ronde 1 over alle labels, dan ronde 2, dan ronde 3.
           - Vóór elke run eerst de stopvlag, dan hervatten, dan `check_budget`.
           - Het grootboek telt `usage.costUsd` uit elk bench-result.json, ook van een benchfout.
-          - Aan het eind van elke aanroep, ook bij exit 3 of 4, schrijft de driver `<out>/skipped.json` opnieuw. Dat is een lijst `{label, run, reason}` met een regel voor elke verwachte run (`--models` × `--runs`) zonder bench-result.json. De reden is `preflight afgewezen: <reden>`, `niet geprobed: <detail>`, `budget bereikt`, `gestopt (stopvlag)` of `gestopt na tweede benchfout op <label>`.
+          - Aan het eind van elke aanroep, ook bij exit 3 of 4, schrijft de driver `<out>/skipped.json` opnieuw. Dat is een lijst `{label, run, reason}` met een regel voor elke verwachte run (`--models` × `--runs`) zonder bench-result.json. De reden is de eerste die past: `preflight afgewezen: <reden>`, `niet geprobed: <detail>`, `budget bereikt`, `gestopt (stopvlag)` of `gestopt na tweede benchfout op <label>`.
 
           Tests (unittest, eerst rood):
           - Het grootboek telt runs en preflight op.
@@ -633,11 +633,12 @@ stories:
           - Contextrijen voor `1a78c1b8` (Claude Code, $0,39) en `7146cbe9` (Codex CLI, ≈ $0,10).
           - De preflight uit `--preflight`: per configuratie ok of de reden, met het bedrag uit het grootboek.
           - De rookproef uit `--smoke-dir` en `--smoke-scores`: per run de status, outcome, verdict en f1.
-          - Elke verwachte run die niet beoordeeld is, met de reden:
-            - `benchfout`, uit bench-result.json;
-            - `niet geprobed`, uit een benchError CONFIGURATION_NOT_PROBED of uit skipped.json;
-            - de reden uit skipped.json: `preflight afgewezen` (X-m1), `budget bereikt` of `gestopt …`;
-            - `niet gestart` als er niets is vastgelegd.
+          - Elke verwachte run die niet beoordeeld is, met de eerste reden die past, in deze volgorde:
+            1. `preflight afgewezen` (X-m1), uit `--preflight` of skipped.json;
+            2. `niet geprobed`, uit een benchError CONFIGURATION_NOT_PROBED of uit skipped.json;
+            3. `benchfout`, uit bench-result.json;
+            4. `budget bereikt` of `gestopt …`, uit skipped.json;
+            5. `niet gestart`.
           - Het grootboek.
 
           Tests (AC11, eerst rood):

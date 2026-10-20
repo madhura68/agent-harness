@@ -18,8 +18,8 @@ Document: `docs/plans/M8-review-bench.md`. Phase: plan. Idea: IDEA-270 (`cmvgl07
 
 | Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
 |---|---|---|---|---|---|
-| CODEX | `aad74bfc-cbb0-46c6-8f60-d14100c02bbf` | `67d722a6-ed32-4293-a004-11de47ac7129` | `61791f24-142f-45e2-a397-2312e010210f` | linked | **NO-GO** 0/2/0 |
-| CLAUDE | `1145085d-80b2-4aec-8359-b2c115bf4c16` | `c3247036-d862-4d25-983c-32876e6e87ad` | `59d90fd1-2691-4241-b082-ff0268ecf545` | linked | **NO-GO** 0/1/8 |
+| CODEX | `aad74bfc-cbb0-46c6-8f60-d14100c02bbf` | `67d722a6-ed32-4293-a004-11de47ac7129` | `61791f24-142f-45e2-a397-2312e010210f` | linked | **NO-GO** 0/2/0 (job `1ecc5289-a530-47c9-baff-d2c769470ea1`) |
+| CLAUDE | `1145085d-80b2-4aec-8359-b2c115bf4c16` | `c3247036-d862-4d25-983c-32876e6e87ad` | `59d90fd1-2691-4241-b082-ff0268ecf545` | linked | **NO-GO** 0/1/8 (job `dffc3630-b96b-4013-9c54-330c44155c3d`) |
 
 Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree hielden, en de MINORs van spec-ronde 2 landen zoals het plan zegt.
 
@@ -46,6 +46,7 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
   - `score.py smoke`, en de extra invoer van `score.py report`;
   - een end-to-end-test.
 - Eruit: de handmatige voorfiltering in P3, en `report --smoke`.
+- Eigen aanvulling, niet door een reviewer gevraagd: de redenen voor een ontbrekende run hebben een vaste volgorde (S2-2 en S2-3). Een run met CONFIGURATION_NOT_PROBED heeft een bench-result met status benchfout, en telt toch als "niet geprobed".
 - Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
 - Om binnen de 64k te blijven: de MINOR-tabel van spec-ronde 2 is één alinea geworden, en Architecture, de PBI-tekst en enkele lijsten zijn ingekort.
 - Plan: 56 756 → 62 945 tekens. De grootste `implementation_plan` is S2-2, met 6 337 tekens.
