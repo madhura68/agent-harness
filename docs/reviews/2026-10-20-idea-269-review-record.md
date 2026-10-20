@@ -134,3 +134,46 @@ Het plan staat als repobestand `docs/plans/2026-10-20-idea-269-plan.md`, met de 
 **Eigen vondst bij de verificatie.** S4-T2 noemde "het recept voor het toevoegen of wijzigen van een configuratie" in `harness-service-max2.md`. Zo'n recept bestaat niet. De taak wijst nu de bullet "Upgrade (nieuw image, nieuwe modellen of config)" in `## LiteLLM` aan.
 
 **Scope-delta:** geen werk toegevoegd aan de code-taken. De uitrol staat nu expliciet als JP-stappen in S4-T3; dat werk was er al impliciet. Workers krijgt één extra verificatiecommando (`build`). Eerste resultaat en praktijkproef blijven gelijk. De proef valt nu bewust na een gecontroleerde uitrol.
+
+### Plan-ronde 2 (plan rev 2, commit `8aa748f`)
+
+**Reviewers**
+
+| | CODEX | CLAUDE |
+|---|---|---|
+| request | `e7cdf861-747d-4111-bce7-57a3c04235d9` | `24ae0af7-1779-4f71-a3e2-f66d02ab92c6` |
+| root | `b50cf23c-d4aa-4b03-b4e9-cfceac970670` | `2db79bc5-08b6-46e4-a5a8-85a436292446` |
+| key | `b9f876dc-09b2-4de7-954a-4161cbde89b9` | `fa865822-870b-417e-abc7-f343239df84e` |
+| idea_link | linked (PLAN) | linked (PLAN) |
+| uitslag | 0 / 0 / 2 MINOR, **GO** | 0 / 0 / 9 MINOR, **GO** |
+
+**Pins:**
+- `plan`: sha256 `1514d6d1…`;
+- `plan_prev`: sha256 `5abe44e3…` (rev 1);
+- `spec`: sha256 `820e2f41…`;
+- `evidence`: sha256 `d0c16d94…`;
+- `/work` = Scrum4Me `178811a3`.
+
+**Fixes van ronde 1.**
+- Codex: 11 van 12 hielden; #11 (externe bestanden) hield deels.
+- Claude: 11 van 12 hielden; #6 hield deels (de SHA-opzoeking in een verse worktree).
+
+**MINORs van ronde 2.** Alle geverifieerd. Na de GO verwerkt in plan rev 3.
+
+| Bevinding | Bron | Verwerking (rev 3) |
+|---|---|---|
+| Geen test voor een inactieve LOCAL-rij in `getAgentChatView` (spec §4.4/§5.4) | Codex | S2-T2: case toegevoegd |
+| Achtergrondbronnen en de workers-deploy zijn niet te verifiëren | Codex | S4-T3: Ops-flow `update_scrum4me_workers` genoemd (Ops-dashboard `deploy/ops-agent/baseline/flows/update_scrum4me_workers.yml`), en uitdrukkelijk niet `redeploy_all`. Het review-record en het grill-doc blijven verwijzingen. |
+| F1: de list-price-pin bestaat al en kan niet rood zijn | Claude | S1-T2/S1: de bestaande tests dekken §5.7 (geverifieerd: `__tests__/list-price.test.ts` "covers exactly the priced runtimes" en `listPriceKey('HARNESS','gpt-5.5')`). Alleen een `qwen3.8-or`-case erbij; "eerst rood" geldt alleen voor de schema- en helpertests. S1-T1 noemt het precedent `access-checklist-schema.test.ts`; geen test pint de veldregels van AgentModel. |
+| F2: de CI van S2-T1 heeft een PR nodig; dummy-env voor build | Claude | S2-T1 opent een draft-PR als test:dispatch lokaal niet kan; de stop-voorwaarde geldt voor die CI. Build-env uit `ci.yml` (Build-stap) overgenomen. |
+| F3: de SHA-opzoeking faalt in een verse worktree | Claude | S2-T1 en S3-T1: eerst `git submodule update --init`; een lege uitkomst geeft een stop. S2-T1 stopt bij een onverwachte schema-diff. |
+| F4: de backfill-CASE wordt alleen als string getest | Claude | Kleinste remedie: de PR vermeldt de handcontrole tegen §4.3, en S4-T3 stap 3 is de productiecontrole vóór de workers-uitrol. Geen nieuwe chain-test: de faalrichting is veilig ("gehost"). |
+| F5: de rollback-test kan niet falen | Claude | S3-T2: de facts-rij wordt eerst gelezen en vóór elke schrijfactie geweigerd; de test asserteert dat upsert en create niet zijn aangeroepen. Het blok staat vóór `if (HARNESS) return` (r. ~135, geverifieerd); een lege upstream wordt null. |
+| F6: bestaande editor-tests en fixtures | Claude | S3-T1: fixtures en `ids()` per sectie; een lege sectie heeft geen tabel; "herkomst niet vastgelegd" en de `actief`-toggle worden getest |
+| F7: build-env voor workers | Claude | S3-T3: `lib/env.ts` slaat de validatie over bij NEXT_PHASE (geverifieerd); een dummy DATABASE_URL voor `prisma.config.ts`; wat te doen bij een env-fout |
+| F8: een vergeten `facts`-select valt stil terug op "gehost" | Claude | S2-T2: `facts` is in het rijtype verplicht (`\| null`, niet optioneel), zodat tsc faalt |
+| F9: exit 4, de herkomst-mismatch-fixture, het eerste echte INSERT | Claude | S4-T3: exit 4 geeft een rerun; S3-T3: een fixture met omgezette herkomst geeft exit 1 en (c); de eerste echte "Model toevoegen" bewijst het INSERT-recht later |
+
+**Scope-delta:** geen. Alleen verduidelijkingen en testscherpte, plus één kleinere actie in S3-T2: weigeren vóór het schrijven in plaats van een rollback. Dat past binnen spec §4.5.
+
+**Plan-fase afgerond met dubbel GO** (ronde 2, rev 2). Rev 3 bevat alleen de MINORs hierboven.
