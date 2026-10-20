@@ -290,8 +290,7 @@ stories:
           Verloop:
           1. `loadReviewCase(caseDir)`. Een CaseInvalidError gaat ongewijzigd naar de aanroeper, en er ontstaat geen map.
           2. Run-id en map:
-             - `runId = ${case.id}-${label}-${hex8}`, met label `^[a-z0-9][a-z0-9-]{0,29}$`;
-             - Manifest.id eist `^[a-z0-9][a-z0-9-]{0,79}$`, dus geen punt;
+             - `runId = ${case.id}-${label}-${hex8}`. Het label is de configuratienaam (punten mogen, zoals bij task-bench: `BENCH_LABEL` in src/cli.ts:550). runManifest valideert `Manifest.id` niet tegen ManifestSchema; alleen loadManifest doet dat;
              - de trace komt in `openTrace(out, runId)`, omhuld door een redigerende TraceWriter: redactText/redactDeep uit src/worker/redact.ts, met `[apiKey]` als die ≥ 8 tekens is.
           3. `checkProbeForJob(config, probeDir, configuration)`. Bij een fout:
              - `benchError: CONFIGURATION_NOT_PROBED: <detail>`;
@@ -369,7 +368,7 @@ stories:
           Het commando:
           1. `loadWorkerConfig(--config)`.
           2. De sleutel via `resolveWorkerApiKey(values['api-key-env'], process.env)`, met de regels van de worker. Zonder de vlag: UsageError `review-bench needs --api-key-env`.
-          3. Een label buiten `^[a-z0-9][a-z0-9-]{0,29}$` geeft een UsageError.
+          3. Het label wordt gecontroleerd met de bestaande `BENCH_LABEL` (src/cli.ts:550), met dezelfde melding als bij task-bench.
           4. `withStopSignals` met de import van runReviewBench.
 
           Exitcode en uitvoer:
@@ -384,7 +383,7 @@ stories:
             - `TASK_BENCH_STOP_MESSAGE` is exact gelijk aan de tekst hierboven;
             - de bestaande cli-tests van task-bench blijven ongewijzigd groen.
           - AC7 via spawn. Een lokale http-server antwoordt met 400 (niet transient, dus geen backoff) en een body die de key bevat. Daarna staat de waarde niet in stdout, stderr, trace.jsonl of bench-result.json.
-          - Een label met een punt (`claude-sonnet-5.5-or`) geeft een UsageError.
+          - Een label met een punt (`claude-sonnet-5.5-or`) wordt aanvaard. Een label met `/` geeft de UsageError van `BENCH_LABEL`.
 
           Verificatie: `npx vitest run __tests__/cli-review-bench.test.ts __tests__/cli.test.ts`, daarna `npm run verify`.
 
@@ -507,28 +506,21 @@ stories:
           Bestanden (llm-bench/review_bench/):
           - Nieuw: `run.py`. Overgenomen uit task_bench/run.py:
             - read_ledger, ledger_total, append_ledger;
-            - StopFlag, Harness.call en check_budget, met dezelfde vooruitschatting;
+            - StopFlag en Harness.call;
+            - check_budget, met één wijziging. M7 stopt pas als het totaal de grens bereikt (run.py:451-454) en kent geen vooruitschatting. Erratum op spec §4.7: daar staat "met dezelfde vooruitschatting als M7". M8 stopt vóór een run als `totaal + maxCostUsd van de case > --budget`. Het plafond van $1 per run is zacht; de marge van $2 dekt de overschrijding;
             - existing_results en hervatten;
             - de regel "één herhaling bij een benchfout, bij een tweede stoppen";
             - de exitcodes;
             - mask_secrets.
             Niet overgenomen: on_openrouter, fetch_endpoints en PINNED_QUANTIZATIONS.
-          - Nieuw: `models.json`, met per label `{configuration}`. De labels hebben geen punt, omdat de harness dat eist:
-            - `qwen38-128k` → `qwen3.8-or-128k`
-            - `dsv4-flash` → `deepseek-v4-flash-or`
-            - `dsv4-pro` → `deepseek-v4-pro-or`
-            - `glm53` → `glm-5.3-or`
-            - `minimax-m3` → `minimax-m3-or`
-            - `gpt6-luna` → `gpt-6-luna-or`
-            - `sonnet55` → `claude-sonnet-5.5-or`
-            - `gpt61-sol` → `gpt-6.1-sol-or`
+          - Geen models.json: het model is de configuratie in harness.json. `--models` neemt configuratienamen, en het label is de configuratienaam. De driver weigert met exit 2 een naam die niet in `configurations` van `--config` staat. De acht namen zijn `qwen3.8-or-128k`, `deepseek-v4-flash-or`, `deepseek-v4-pro-or`, `glm-5.3-or`, `minimax-m3-or`, `gpt-6-luna-or`, `claude-sonnet-5.5-or` en `gpt-6.1-sol-or`.
           - Nieuw: `fake_review_bench.py`, een nep-harness zoals fake_task_bench.py. Het logt zijn argv en schrijft een bench-result.json met de gevraagde status en het gevraagde bedrag.
           - Wijzig `test_review_bench.py`.
 
           CLI:
           ```
           ./run.py --harness "<cmd>" --config <harness.json> --probe-dir <dir> --case <case-dir>
-                   --models <labels…> --runs 3 --out <dir> --ledger <file> --budget <USD>
+                   --models <configuraties…> --runs 3 --out <dir> --ledger <file> --budget <USD>
                    --key-file <file> [--preflight]
           ```
           - `--key-file` wordt één keer gelezen, en de witruimte wordt gestript (Review Focus 5). In drie gevallen volgt een fout: de waarde is korter dan 8 tekens, ze begint met `LITELLM_MASTER_KEY=`, of ze bevat een aanhalingsteken.
@@ -555,7 +547,8 @@ stories:
 
           Tests (unittest, eerst rood):
           - Het grootboek telt runs en preflight op.
-          - Het budget stopt vóór een run die het plafond zou overschrijden.
+          - Het budget stopt vóór een run als totaal + maxCostUsd boven `--budget` komt. Bijvoorbeeld bij budget 10: met totaal 9,10 en maxCostUsd 1 start er geen run meer, met totaal 8,90 nog wel.
+          - Een naam die niet in harness.json staat, geeft exit 2.
           - De volgorde wisselt per ronde.
           - Hervatten slaat afgemaakte runs over.
           - Een benchfout wordt één keer herhaald, en bij een tweede stopt de driver met de exitcode van M7.
@@ -613,7 +606,7 @@ stories:
             - 3/3 geeft `kandidaat`;
             - 2/3 geeft `twijfel`;
             - anders `valt af`.
-          - Is geen van `sonnet55` en `gpt61-sol` kandidaat, dan geeft `oordelen()` voor alle modellen `onbeslist: runtime`.
+          - Is geen van `claude-sonnet-5.5-or` en `gpt-6.1-sol-or` kandidaat, dan geeft `oordelen()` voor alle modellen `onbeslist: runtime`.
 
           Rapport (spec §4.9):
           - Per model:
@@ -634,7 +627,7 @@ stories:
           - Een extra met een `key` die `ongeldig` is beslist, laat elke run met die key niet voldoen.
           - Een extra zonder beslissing geeft `open`.
           - Zijn beide controles geen kandidaat, dan krijgen alle modellen `onbeslist: runtime`.
-          - Een blind blad bevat geen configuratienaam, geen label en geen modelnaam. Controleer dat tegen alle namen in models.json.
+          - Een blind blad bevat geen configuratienaam, geen label en geen modelnaam. Controleer dat tegen de acht configuratienamen en hun OpenRouter-modellen, zoals `anthropic/claude-sonnet-5.5`.
           - `--only-f1` vraagt alleen f1.
           - Een fixture met `skipped.json` geeft in het rapport "preflight afgewezen" (X-m1).
           - Een trace-fixture met 3 `read_file`-aanroepen op `sources/doc`, waarvan 2 met offset, geeft 3 en 2 (C-m4).
@@ -770,12 +763,12 @@ Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en J
    - `--config /etc/agent-harness/harness.json`
    - `--probe-dir /var/lib/agent-harness/runs`
    - de case;
-   - alle acht labels;
+   - alle acht configuratienamen;
    - `--out ~/m8-runs/review-bench-<datum>`
    - `--ledger`
    - `--budget`
    - `--key-file /run/user/1000/m8-litellm.key`
-4. Rookproef: `--models qwen38-128k sonnet55 --runs 1 --out …/rook` (≈ $0,50). Deze runs tellen niet mee in de 24.
+4. Rookproef: `--models qwen3.8-or-128k claude-sonnet-5.5-or --runs 1 --out …/rook` (≈ $0,50). Deze runs tellen niet mee in de 24.
 5. Maak het blad met `score.py sheets …/rook --only-f1`. Claude vult alleen f1 in.
 6. Doorgaan mag alleen als:
    - geen van beide runs `benchfout` is;
@@ -784,11 +777,11 @@ Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en J
 
 **P3 — De 24 runs** (spec §4.8, stap 7; C-m2).
 1. Draai run.py met:
-   - de labels die ok zijn in `preflight.json` en een actuele aanvaarde probe hebben;
+   - de configuraties die ok zijn in `preflight.json` en een actuele aanvaarde probe hebben;
    - `--runs 3`;
    - `--out …/runs`;
    - hetzelfde grootboek en hetzelfde budget.
-2. Bij een tweede benchfout op hetzelfde label: stop, en JP beslist.
+2. Bij een tweede benchfout op dezelfde configuratie: stop, en JP beslist.
 3. Na het venster:
    - JP verwijdert het key-bestand;
    - JP vergelijkt het verbruik op het dashboard met het grootboek. Een verschil komt in het rapport. Afgebroken aanvragen worden betaald maar niet geteld, en vallen binnen de marge van $2.
