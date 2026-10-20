@@ -21,7 +21,7 @@ import { workerRegistryView } from './worker/doc-tools.js'
 import { EXIT_NO_RESTART, EXIT_RESTART, EXIT_STOPPED, type ExitCode } from './worker/exit-codes.js'
 import { runLogConfiguration, shown } from './worker/job-configuration.js'
 import { configurationHash, litellmFileHashes, probeVerdict } from './worker/probe-gate.js'
-import { collectSecretEntries, collectSecretValues, workerSecretSources } from './worker/redact.js'
+import { collectSecretEntries, collectSecretValues, redactText, workerSecretSources } from './worker/redact.js'
 import { openRunLog } from './worker/run-log.js'
 import { runWorker } from './worker/worker.js'
 
@@ -36,6 +36,7 @@ Usage:
   harness doc-server --dir <docset-dir> --product-id <id>
   harness task-bench --case <json> --model-config <json> --task-config <json> --label <label> --out <dir> [--api-key-env <VAR>] [--retry-transient]
   harness task-bench --check-case --case <json> --task-config <json> --out <dir>
+  harness review-bench --case <dir> --config <harness.json> --configuration <name> --probe-dir <dir> --label <label> --out <dir> --api-key-env <VAR>
 `
 
 // allowPositionals is required: without it Node throws ERR_PARSE_ARGS_UNEXPECTED_POSITIONAL on the subcommand.
@@ -63,6 +64,7 @@ export const cliArgsConfig = {
     label: { type: 'string' },
     'retry-transient': { type: 'boolean' },
     'check-case': { type: 'boolean' },
+    'probe-dir': { type: 'string' },
   },
 } satisfies ParseArgsConfig
 
@@ -78,16 +80,17 @@ function readApiKey(varName: string | undefined): string | undefined {
 }
 
 /**
- * --extra-body-file is a probe option. run and worker take extraBody from the model block, and task-bench from its
- * --model-config file; ignoring the flag in silence would send every request without the fields it was meant to carry,
- * such as the provider block.
+ * --extra-body-file is a probe option. run and worker take extraBody from the model block, task-bench from its
+ * --model-config file and review-bench from the configuration it names in --config; ignoring the flag in silence would send
+ * every request without the fields it was meant to carry, such as the provider block.
  */
-function rejectExtraBodyFile(values: Values, command: 'run' | 'worker' | 'task-bench'): void {
+function rejectExtraBodyFile(values: Values, command: 'run' | 'worker' | 'task-bench' | 'review-bench'): void {
   if (values['extra-body-file'] === undefined) return
   const where = {
     run: 'the model block of the manifest (model.extraBody)',
     worker: 'a configuration of the worker config (configurations.<name>.extraBody)',
     'task-bench': 'the --model-config file (extraBody)',
+    'review-bench': 'the configuration in --config (extraBody)',
   }[command]
   throw new UsageError(`--extra-body-file only applies to harness probe; for harness ${command} put extraBody in ${where}`)
 }
@@ -509,15 +512,20 @@ async function cmdDocServer(values: Values): Promise<number> {
   return 0
 }
 
+/** What task-bench says when it is stopped. Exported so that a test can hold it to its exact text. */
+export const TASK_BENCH_STOP_MESSAGE = 'task-bench stopt: containers worden opgeruimd (nogmaals Ctrl-C = direct afbreken)\n'
+const REVIEW_BENCH_STOP_MESSAGE = 'review-bench stopt: de run wordt afgebroken (nogmaals Ctrl-C = direct afbreken)\n'
+
 /**
  * Runs `work` with a signal that SIGINT and SIGTERM trip (task-bench spec §4.1, "Stoppen"), and waits for it to finish. The signal only
  * says "stop": `work` aborts what it is doing, cleans up after itself (the containers!) and ends, and nothing here kills it. The
- * handlers are `once`: a second Ctrl-C finds none and ends the process at once.
+ * handlers are `once`: a second Ctrl-C finds none and ends the process at once. `stopMessage` is what the first signal writes to stderr;
+ * it is task-bench's unless a command says otherwise.
  */
-async function withStopSignals<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+async function withStopSignals<T>(work: (signal: AbortSignal) => Promise<T>, stopMessage = TASK_BENCH_STOP_MESSAGE): Promise<T> {
   const stop = new AbortController()
   const onSignal = () => {
-    process.stderr.write('task-bench stopt: containers worden opgeruimd (nogmaals Ctrl-C = direct afbreken)\n')
+    process.stderr.write(stopMessage)
     stop.abort()
   }
   process.once('SIGINT', onSignal)
@@ -549,14 +557,27 @@ function readJsonConfig<T>(path: string, schema: ZodType<T>, what: string): T {
 // The label becomes a part of the run dir name (`<case>-<label>-<hex>`), so it has to be one plain path segment.
 const BENCH_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const TASK_BENCH_FLAGS = ['case', 'model-config', 'task-config', 'label', 'out'] as const
+const REVIEW_BENCH_FLAGS = ['case', 'config', 'configuration', 'probe-dir', 'label', 'out'] as const
 // --check-case has no model and no key: it needs the case, the task config (the recipe and the container settings) and a place to write.
 const CHECK_CASE_FLAGS = ['case', 'task-config', 'out'] as const
 
-/** The value of every one of these flags; the first that is missing is a usage error, before anything else is read or started. */
-function requiredValues(values: Values, flags: readonly (typeof TASK_BENCH_FLAGS)[number][]): string[] {
+/** The label of a bench run becomes a part of its run dir name, so it has to be one plain path segment; both bench commands hold it to this. */
+function checkBenchLabel(label: string): void {
+  if (!BENCH_LABEL.test(label)) throw new UsageError(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): ${JSON.stringify(label)}`)
+}
+
+/**
+ * The value of every one of these flags; the first that is missing is a usage error, before anything else is read or started. The
+ * flags are the string options of the two bench commands, not `keyof Values`: that would let a boolean option in, whose value is no string.
+ */
+function requiredValues(
+  values: Values,
+  flags: readonly ((typeof TASK_BENCH_FLAGS)[number] | (typeof REVIEW_BENCH_FLAGS)[number])[],
+  command: 'task-bench' | 'review-bench' = 'task-bench',
+): string[] {
   return flags.map((flag) => {
     const value = values[flag]
-    if (!value) throw new UsageError(`task-bench needs --${flag}`)
+    if (!value) throw new UsageError(`${command} needs --${flag}`)
     return value
   })
 }
@@ -571,7 +592,7 @@ async function cmdTaskBench(values: Values): Promise<number> {
   if (values['check-case'] === true) return cmdCheckCase(values)
   rejectExtraBodyFile(values, 'task-bench')
   const [casePath, modelPath, taskPath, label, out] = requiredValues(values, TASK_BENCH_FLAGS)
-  if (!BENCH_LABEL.test(label)) throw new UsageError(`--label must be one plain path segment (letters, digits, '.', '_' and '-'): ${JSON.stringify(label)}`)
+  checkBenchLabel(label)
   const benchCase = readJsonConfig(casePath, BenchCaseSchema, 'case')
   // Strict, unlike run and worker: the schema strips a key it does not know, and a typo such as `extra_body` would send every request
   // without the provider block (no 16-bit pin, no data_collection: deny). `.strict()` makes a copy; the shared schema stays as it is.
@@ -608,6 +629,40 @@ async function cmdCheckCase(values: Values): Promise<number> {
   })
 }
 
+/**
+ * M8: one review-bench run (src/bench/review-bench.ts). The exit code says whether `bench-result.json` was written: 0 for every status,
+ * the benchfout one included, and the line `<status> <run-dir>` names where. A case that cannot be used (CASE_INVALID) throws before any
+ * run dir exists: its message goes to stderr and the exit code is 1. Any other failure is no result either, and main lets it through, as
+ * it does for task-bench. The master key comes from `--api-key-env` under the rules of the worker, and every line printed here is masked
+ * with it, because the run dir and the message of a case carry names that a caller chose. The bench is imported only here, like
+ * task-bench's: `harness worker` must never depend on it.
+ */
+async function cmdReviewBench(values: Values): Promise<number> {
+  rejectExtraBodyFile(values, 'review-bench')
+  const [caseDir, configPath, configuration, probes, label, out] = requiredValues(values, REVIEW_BENCH_FLAGS, 'review-bench')
+  const config = loadWorkerConfig(configPath)
+  const apiKeyEnv = values['api-key-env']
+  if (apiKeyEnv === undefined) throw new UsageError('review-bench needs --api-key-env')
+  const apiKey = resolveWorkerApiKey(apiKeyEnv, process.env)
+  checkBenchLabel(label)
+  // The key as the bench masks it: as it is, and without surrounding whitespace, the form a server echoes.
+  const secrets = apiKey ? collectSecretValues({ MODEL_API_KEY: apiKey }, { MODEL_API_KEY: apiKey.trim() }) : []
+
+  return withStopSignals(async (signal) => {
+    // Imported together, so that the error class is the one the bench throws.
+    const [{ runReviewBench }, { CaseInvalidError }] = await Promise.all([import('./bench/review-bench.js'), import('./bench/review-case.js')])
+    try {
+      const result = await runReviewBench({ caseDir, config, configuration, probeDir: probes, label, out, apiKey, signal })
+      process.stdout.write(redactText(`${result.status} ${join(out, result.runId)}\n`, secrets))
+      return 0
+    } catch (err) {
+      if (!(err instanceof CaseInvalidError)) throw err
+      process.stderr.write(redactText(`${err.message}\n`, secrets))
+      return 1
+    }
+  }, REVIEW_BENCH_STOP_MESSAGE)
+}
+
 export async function main(argv: string[]): Promise<number> {
   let parsed
   try {
@@ -635,6 +690,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdDocServer(values)
       case 'task-bench':
         return await cmdTaskBench(values)
+      case 'review-bench':
+        return await cmdReviewBench(values)
       default:
         process.stderr.write(`${positionals[0]}: not implemented\n`)
         return 1

@@ -152,3 +152,30 @@ Ontwerp en plan: [docs/specs/2026-10-01-local-precision-refiner-design.md](docs/
 Volgt op M5 en M6. Test of Qwen 3.8 (`qwen/qwen3.8-27b` op 16-bit via OpenRouter, naast `gsq-lokaal` op max2) echt werk aankan, ter ondersteuning van een aankoopbesluit voor een 96 GB-machine. Het subcommando `harness task-bench` voert 12 oude, afgeronde Scrum4Me-taken uit zoals de productieworker en toetst de uitkomst met de verborgen tests van de echte oplossing. Met `harness task-bench --check-case` bewijs je per case dat de verborgen toets op `base_commit` faalt en op `ref_commit` slaagt. Status: increment 1 (Taak 1–5, het subcommando en `--check-case`) is gebouwd en gemerged (PR #31); de build en de runs op max2 volgen apart.
 
 Ontwerp en plan: [docs/specs/2026-10-02-task-bench-design.md](docs/specs/2026-10-02-task-bench-design.md), [docs/plans/M7-task-bench.md](docs/plans/M7-task-bench.md).
+
+## Review-bench (M8)
+
+Volgt op M7. Test of een remote model (via LiteLLM) een echte reviewronde aankan: het subcommando `harness review-bench` laat één configuratie van de worker-config dezelfde review doen als de productie-reviewers, met alleen `list_files`, `read_file` en `search` op een kopie van de bronnen, en controleert of het eindantwoord een geldig `DispatchResult` is. De bench beoordeelt het model niet zelf: hij legt de run vast, en een aparte scorer weegt het resultaat.
+
+```
+harness review-bench --case <dir> --config <harness.json> --configuration <name> --probe-dir <dir> --label <label> --out <dir> --api-key-env <VAR>
+```
+
+**Invoer.**
+- `--case`: een case-map met `case.json`, de productieprompt `review.md`, `payload.json` van de productiejob en `sources/<key>` voor elke bron die die job zag. `case.json` legt van elk ander bestand de sha256 vast en bevat de limieten (`limits`, `contextTokens`, `maxCostUsd`). Wijkt één byte af, dan stopt de bench met `CASE_INVALID` vóór er een run-map is. De case van de echte review staat alleen in de private max2-repo; in deze repo staan synthetische fixtures (`__tests__/fixtures/review-bench/`).
+- `--config` en `--configuration`: de worker-config en de naam van de configuratie die draait. `litellm.baseUrl`, de configuratienaam als modelnaam, `reasoningEffort`, `extraBody` en `costMode` komen daaruit, zoals bij `harness worker`. `--extra-body-file` hoort bij `harness probe` en wordt geweigerd.
+- `--probe-dir`: de map waar `harness probe --config` de probe-uitslagen schreef. De bench schrijft zelf geen probes en weigert een configuratie zonder aanvaarde probe (`CONFIGURATION_NOT_PROBED`), zonder modelaanroep en zonder kosten.
+- `--label`: één pad-onderdeel (letters, cijfers, `.`, `_` en `-`), met dezelfde regel als bij task-bench. Het wordt een deel van de naam van de run-map.
+- `--api-key-env`: de naam van de omgevingsvariabele met de masterkey van LiteLLM, onder dezelfde regels als `harness worker`. De waarde komt nooit in argv, uitvoer, trace of resultaat.
+
+**Uitvoer.** Op stdout staat één regel, `<status> <run-dir>`. In `<out>/<case-id>-<label>-<hex8>/` staan `root/` (de werkmap van het model: `payload.json` en `sources/`), `trace.jsonl` en `bench-result.json` (status, het aanvaarde resultaat of `null`, de validatiepogingen, tokens en kosten, `peakInputTokens`, providers en herhalingen). De regel op stdout en de melding op stderr worden, net als de trace en het resultaat, gemaskeerd met de sleutel.
+
+**De vier statussen.**
+- `beoordeeld`: de run eindigde en de validator aanvaardde een `DispatchResult`, ongeacht het verdict. Of de run voldoet, beslist de scorer.
+- `resultaat_ongeldig`: het model gaf geen geldig resultaat, ook niet na de ene herhaalvraag met de reden.
+- `limiet`: een grens van de case raakte op (beurten, tijd, uitvoertokens, toolfouten, het contextvenster of `maxCostUsd`).
+- `benchfout`: de bench zelf faalde, nooit een oordeel over het model: de gate weigerde, de modelaanroep faalde, een tool ontbrak (`TOOL_NOT_AVAILABLE`) of de harness zelf faalde, de kosten waren onbekend bij een gehoste configuratie, of de run is met Ctrl-C afgebroken (`benchError: "afgebroken"`).
+
+**Exitcode.** 0 zodra `bench-result.json` geschreven is, welke status ook; `benchfout` en `afgebroken` tellen mee. 1 bij een gebruiksfout, een ongeldige case (`CASE_INVALID`, op stderr) of een fout die het schrijven van het resultaat verhindert.
+
+Ontwerp en plan: [docs/specs/2026-10-20-review-bench-design.md](docs/specs/2026-10-20-review-bench-design.md), [docs/plans/M8-review-bench.md](docs/plans/M8-review-bench.md).
