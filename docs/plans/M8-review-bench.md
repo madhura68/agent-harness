@@ -7,12 +7,10 @@ sprint:
 pbi:
   title: "M8 review-bench: remote modellen op een echte QUEUE_REVIEW (IDEA-270)"
   description: >-
-    Een offline bench die vergelijkt of een remote model met minstens 128k context een echte Scrum4Me-review net zo goed doet als de
-    huidige reviewers. In agent-harness komt het subcommando `harness review-bench`, met read-only tools, een JSON-validator volgens
-    `finalizeChildResult` en de echte `review.md`, minimaal aangepast. Er komen drie configuraties bij in deploy/max2. In de max2-repo
-    komen de bevroren case, de rubric, een driver met preflight en een scorer. Daarna volgen de praktijkstappen op max2, steeds op JP's
-    go: release en herprobe, preflight en rookproef, 24 runs en het scoren. Spec: docs/specs/2026-10-20-review-bench-design.md
-    revisie 2, dubbel GO (86628ea3). Plan: docs/plans/M8-review-bench.md.
+    Een offline bench: doet een remote model met ≥ 128k context een echte Scrum4Me-review net zo goed als de huidige reviewers?
+    agent-harness krijgt `harness review-bench` en drie configuraties in deploy/max2; de max2-repo de case, rubric, driver en scorer.
+    Daarna de praktijkstappen op max2, steeds op JP's go. Spec: docs/specs/2026-10-20-review-bench-design.md revisie 2, dubbel GO
+    (86628ea3). Plan: docs/plans/M8-review-bench.md.
   priority: 2
 stories:
   - title: "S1 — harness review-bench (agent-harness)"
@@ -29,7 +27,7 @@ stories:
       - title: "createReadOnlyTools: list_files, read_file en search zonder schrijfpad"
         priority: 2
         implementation_plan: |
-          Repo: agent-harness. Branch: feat/m8-review-bench, vanaf origin/main.
+          Repo: agent-harness. Branch: feat/m8-review-bench, vanaf `origin/claude/remote-models-review-9a05f5`. Op die branch staan spec, plan en review-records; origin/main heeft ze nog niet. De PR naar main neemt ze mee.
           Spec: docs/specs/2026-10-20-review-bench-design.md §4.3 en AC1. Plan: docs/plans/M8-review-bench.md.
 
           Doel: een registry met precies drie read-only tools. Ze hebben dezelfde definities, limieten en padregels als in createTaskTools.
@@ -82,28 +80,34 @@ stories:
           - Wijzig src/bench/task-bench.ts:
             - verwijder de lokale `withDroppedCost`;
             - vervang de wrapper uit r. 326-351 door de helper;
-            - de regel `usage: withDroppedCost(...)` gebruikt `tracked.droppedCosts()`.
+            - `retries`, `providers` en `droppedLastUsd` (r. 259-262) vervallen. Declareer `let tracked: TrackedClient | undefined` vóór de try. Het resultaat (r. 465-467) gebruikt `tracked?.providers ?? []`, `tracked?.retries ?? []` en `withDroppedCost(run?.usage ?? NO_USAGE, tracked?.droppedCosts() ?? [])`, ook op de paden die eindigen vóór de client bestaat.
           - Nieuw: __tests__/bench-tracked-client.test.ts.
 
           Interfaces (levert, voor taak 6):
           - `export function withDroppedCost(usage: RunResult['usage'], costs: Array<number | undefined>): RunResult['usage']`. De body wordt letterlijk verplaatst.
-          - `export type TrackedClient = { client: ModelClient; retries: RetryRecord[]; providers: string[]; droppedCosts(): Array<number | undefined> }`
-          - `export function createTrackedClient(base: ModelClient, o: { retryTransient: boolean; trace: TraceWriter; sleep?: (ms: number, signal: AbortSignal) => Promise<void> }): TrackedClient`
+          - `export class CostStopError extends ModelError { constructor(readonly stop: CostStop) }`, met `super(stop.error.message, { kind: 'invalid' })`. Kind `invalid` is definitief voor de retrying client, en runManifest maakt er MODEL_ERROR van in plaats van te crashen (src/run.ts:374-379).
+          - `export type TrackedClient = { client: ModelClient; retries: RetryRecord[]; providers: string[]; droppedCosts(): Array<number | undefined>; costStop(): CostStop | undefined }`
+          - `export function createTrackedClient(base: ModelClient, o: { retryTransient: boolean; trace: TraceWriter; sleep?: (ms: number, signal: AbortSignal) => Promise<void>; guard?: CostGuard }): TrackedClient`
 
-          Gedrag (gelijk aan nu):
-          - Met `retryTransient` komt er `createRetryingClient(base, { sleep, onRetry })` omheen. `onRetry` doet drie dingen:
-            - het record gaat naar `retries`;
-            - de provider van het record gaat naar `providers`;
-            - er komt een trace-event `{ type: 'model_retry', ...r }`.
-          - Een `UnusableAnswerError` telt zijn `costUsd` bij `droppedLast` op, en zijn provider gaat naar `providers`. Daarna gooit hij opnieuw.
-          - Een geslaagde respons met `provider` gaat ook naar `providers`.
+          Gedrag zonder `guard` is precies de huidige wrapper (task-bench geeft geen guard mee):
+          - met `retryTransient` komt er `createRetryingClient(base, { sleep, onRetry })` omheen; `onRetry` zet het record in `retries`, de provider in `providers`, en schrijft een trace-event `{ type: 'model_retry', ...r }`;
+          - een `UnusableAnswerError` telt zijn `costUsd` bij `droppedLast` en zijn provider in `providers`, en gooit opnieuw; een geslaagde respons met `provider` gaat naar `providers`;
           - `droppedCosts()` geeft `[...retries.map(r => r.costUsd), droppedLast]`.
 
+          Met `guard` (review-bench, plan-r1 X-M1). De live guard van runManifest ziet alleen het antwoord dat `complete()` teruggeeft (src/run.ts:330, :404; src/cost.ts:94-109). Een antwoord met finishReason `other` is betaald, maar valt weg in de retry-lus (src/bench/retry-client.ts:112-124). Daarom, in `onRetry`, ná de drie stappen hierboven, alleen voor een record met kind `finish_other`:
+          - `stop = guard.afterResponse(dropped) ?? guard.beforeRequest()`;
+          - `dropped` is het weggevallen antwoord als CompleteResult: `toolCalls: []`, `usage.costUsd = r.costUsd`, `provider = r.provider`, de rest nul of leeg;
+          - bij een stop: bewaar hem voor `costStop()` en gooi `new CostStopError(stop)`. Dat is vóór de wachttijd en vóór de herhaalaanvraag.
+          Zo telt elk antwoord één keer in de guard: een weggevallen antwoord hier, het teruggegeven antwoord in runManifest. Een weggevallen hosted antwoord zonder bedrag geeft COST_UNKNOWN, net als elk ander hosted antwoord.
+
           Tests (eerst rood):
-          - Eerst een tijdelijke fout met `costUsd` 0.01, daarna succes: `retries` heeft 1 record, en `withDroppedCost({..., costUsd: 0.05}, droppedCosts())` geeft 0.06.
+          - Eerst een antwoord met finishReason `other` en `costUsd` 0.01, daarna succes: `retries` heeft 1 record, en `withDroppedCost({..., costUsd: 0.05}, droppedCosts())` geeft 0.06 (`toBeCloseTo`).
           - Een `UnusableAnswerError` met `costUsd` 0.02 en provider `P` geeft `droppedCosts()` met 0.02, en `providers` bevat `P`.
           - Zonder bedragen blijft `usage` ongewijzigd, en `costUsd` blijft afwezig.
           - Zonder `retryTransient` gaat er geen herhaling om de base heen.
+          - Hosted guard met plafond "1", drie keer `other` à 0.40. Na de derde komt een CostStopError met COST_LIMIT_EXCEEDED. `base.complete` is 3× aangeroepen, `costStop()` is gezet en `droppedCosts()` telt op tot 1.20.
+          - Hosted guard, één keer `other` zonder bedrag: CostStopError met COST_UNKNOWN, en `base.complete` 1×.
+          - Zonder guard en vier keer `other`: na 3 herhalingen een UnusableAnswerError, en `base.complete` 4×, zoals nu.
 
           Acceptatie:
           - `git diff origin/main --stat -- __tests__/bench-task-bench.test.ts __tests__/bench-retry-client.test.ts` is leeg, en beide zijn groen.
@@ -127,6 +131,7 @@ stories:
               - de deelschema's waar die van afhangen.
             - Daarbij `export function canonicalJson(value: unknown): string`, gelijk aan de canonical die finalizeChildResult gebruikt (scrum4me-docker lib/dispatch-child.ts:197-222 @78e7347d): sleutels gesorteerd, undefined weggelaten, arrays in volgorde.
             - Een kopregel noemt per stuk de bronrepo, het pad en de commit.
+            - Bronnen: Forgejo `git.jp-visser.nl/janpeter/scrum4me-shared` en `…/janpeter/scrum4me-docker`, lokaal `~/Development/scrum4me-shared` en `~/Development/scrum4me-docker`. Lees met `git -C <clone> fetch origin` en `git -C <clone> show <sha>:<pad>`, nooit een nieuwere versie.
           - Nieuw: src/bench/review-validator.ts.
           - Wijzig src/run.ts r. 13: de `fail`-union wordt `code: 'VERIFY_FAILED' | 'REVIEW_RESULT_INVALID'`.
           - Wijzig src/types.ts: `ErrorCode` krijgt `| 'REVIEW_RESULT_INVALID'`.
@@ -182,7 +187,7 @@ stories:
           Doel: van de productieprompt `review.md` een harness-prompt maken met een vaste lijst exacte vervangingen. Klopt een telling niet, dan gooit de functie een fout.
 
           Bestanden:
-          - Nieuw: __tests__/fixtures/queue-review.md. Dit is de echte prompt: `git -C ~/Development/scrum4me-mcp-stable show e89c0961:src/prompts/queue/review.md`. Hij heeft sha256 f56fe0a641ddb007e5216a2063b02460e60b9836c08cbc2229d8f8661fee4ead en 48 regels. Bevat geen private inhoud.
+          - Nieuw: __tests__/fixtures/queue-review.md. Dit is de echte prompt: `git -C ~/Development/scrum4me-mcp-stable show e89c0961:src/prompts/queue/review.md` (Forgejo `janpeter/scrum4me-mcp`). Hij heeft sha256 f56fe0a641ddb007e5216a2063b02460e60b9836c08cbc2229d8f8661fee4ead en 48 regels. Bevat geen private inhoud.
           - Nieuw: __tests__/fixtures/queue-review.adapted.md. Maak het één keer met de functie, en controleer het met de hand tegen de tabel.
           - Nieuw: src/bench/review-prompt.ts.
           - Nieuw: __tests__/bench-review-prompt.test.ts.
@@ -217,6 +222,7 @@ stories:
         priority: 2
         implementation_plan: |
           Repo: agent-harness. Branch: feat/m8-review-bench.
+          Vereist: taak 4 (make-case.ts kopieert de prompt-fixture).
           Spec: §4.1 ("De case", "Werkmap", "Limieten"), §4.2 en AC4. Plan: docs/plans/M8-review-bench.md (C-m6).
 
           Doel: een case-map laden en elke byte controleren, vóórdat er een run-map bestaat. Daarna de werkmap `<run>/root/` vullen.
@@ -297,8 +303,9 @@ stories:
              - runStatus `not_run`;
              - geen client.
           4. `stageReviewCase`. Daarna:
+             - `guard = createCostGuard({ mode: costMode, ceilingNanos: parseCeilingNanos(case.maxCostUsd), configuration })`. Eén guard-object voor de client en voor runManifest;
              - de ModelSpec is `{ baseUrl: config.litellm.baseUrl, name: configuration, reasoningEffort, extraBody }` van de configuratie;
-             - `createTrackedClient(base, { retryTransient: costMode === 'hosted', trace })`;
+             - `createTrackedClient(base, { retryTransient: costMode === 'hosted', trace, sleep: deps.sleep, guard })`;
              - een wrapper houdt `peakInputTokens` bij: het maximum van `res.usage.inputTokens` per respons.
           5. Het manifest:
              - profiel `tools`;
@@ -307,9 +314,9 @@ stories:
              - RunDeps:
                - `connectRegistry`: `createReadOnlyTools({ root })`;
                - `afterAnswer`: de validator;
-               - `costGuard`: `createCostGuard({ mode: costMode, ceilingNanos: parseCeilingNanos(case.maxCostUsd), configuration })`;
+               - `costGuard`: `guard`;
                - `signal`.
-          6. Een stop door het signaal geeft `benchError: 'afgebroken'`, zoals bij M7.
+          6. Een stop door het signaal geeft `benchError: 'afgebroken'`, zoals bij M7. Heeft `tracked.costStop()` een stop, dan wordt de run `{ ...run, status: 'failed', error: stop.error }` vóór mapReviewStatus (plan-r1 X-M1). COST_LIMIT_EXCEEDED wordt zo limiet, COST_UNKNOWN benchfout.
           7. Schrijf `<out>/<runId>/bench-result.json` via redactDeep, met `usage: withDroppedCost(run.usage, tracked.droppedCosts())`.
 
           mapReviewStatus. De volgorde is de betekenis:
@@ -331,10 +338,14 @@ stories:
             - zonder probe-uitslag: benchfout met CONFIGURATION_NOT_PROBED, en `complete()` wordt 0× aangeroepen;
             - hosted, een respons zonder bedrag: benchfout met COST_UNKNOWN;
             - tool-respons, totaal boven `maxCostUsd`: limiet met COST_LIMIT_EXCEEDED.
+          - Weggevallen antwoorden (plan-r1 X-M1 en C-m3), hosted, `maxCostUsd` "1", met een directe `deps.sleep`:
+            - twee keer finishReason `other` à 0.40, daarna een antwoord met een toolcall à 0.25: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, geen `tool_result` in de trace, en `usage.costUsd` 1.05 (`toBeCloseTo`);
+            - drie keer `other` à 0.40: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, `usage.costUsd` 1.20;
+            - één keer `other` à 0.02, daarna een geldig antwoord à 0.05: beoordeeld, en `usage.costUsd` 0.07 in bench-result.json.
           - AC4-aanvulling: een CaseInvalidError laat `out` leeg.
-          - AC7, met key `sk-test-SECRET-0123456789`. Na elk geval staat de waarde in geen enkel bestand onder `out`:
+          - AC7, met `DUMMY_KEY` uit __tests__/helpers.ts. Na elk geval geeft `leakedFragments(inhoud)` een lege lijst voor elk bestand onder `out`; dat vangt ook een afgekapt prefix:
             - een nepclient gooit een ModelError met de key in de melding;
-            - een antwoordbody bevat de key.
+            - een antwoordbody van `bodyWithKeyAt(190)` bevat de key.
 
           Verificatie: `npx vitest run __tests__/bench-review-bench.test.ts`, daarna `npm run verify`.
 
@@ -361,7 +372,7 @@ stories:
           - Usage-regel: `harness review-bench --case <dir> --config <harness.json> --configuration <name> --probe-dir <dir> --label <label> --out <dir> --api-key-env <VAR>`.
           - `cliArgsConfig.options` krijgt `'probe-dir': { type: 'string' }`.
           - `REVIEW_BENCH_FLAGS = ['case', 'config', 'configuration', 'probe-dir', 'label', 'out'] as const`.
-          - Generaliseer `requiredValues(values, flags, command = 'task-bench')`. De melding blijft `${command} needs --${flag}`.
+          - Generaliseer `requiredValues(values, flags, command = 'task-bench')`. De melding blijft `${command} needs --${flag}`. `flags` krijgt het type `readonly ((typeof TASK_BENCH_FLAGS)[number] | (typeof REVIEW_BENCH_FLAGS)[number])[]`: `probe-dir` zit niet in de huidige union (src/cli.ts:556). Niet `keyof Values`, want dan valt een boolean-optie erin en is de waarde geen string meer.
           - Generaliseer `withStopSignals(work, stopMessage = TASK_BENCH_STOP_MESSAGE)`. Exporteer `TASK_BENCH_STOP_MESSAGE` met de huidige tekst, byte-gelijk: `task-bench stopt: containers worden opgeruimd (nogmaals Ctrl-C = direct afbreken)\n`. review-bench geeft `review-bench stopt: de run wordt afgebroken (nogmaals Ctrl-C = direct afbreken)\n`.
           - `rejectExtraBodyFile` kent 'review-bench'. De verwijzing is `the configuration in --config (extraBody)`.
 
@@ -382,7 +393,7 @@ stories:
             - task-bench zonder --case geeft exact `task-bench needs --case`;
             - `TASK_BENCH_STOP_MESSAGE` is exact gelijk aan de tekst hierboven;
             - de bestaande cli-tests van task-bench blijven ongewijzigd groen.
-          - AC7 via spawn. Een lokale http-server antwoordt met 400 (niet transient, dus geen backoff) en een body die de key bevat. Daarna staat de waarde niet in stdout, stderr, trace.jsonl of bench-result.json.
+          - AC7 via spawn, met `DUMMY_KEY`. Een lokale http-server antwoordt met 400 (niet transient, dus geen backoff) en een body `bodyWithKeyAt(190)`. Daarna geeft `leakedFragments` een lege lijst voor stdout, stderr, trace.jsonl en bench-result.json.
           - Een label met een punt (`claude-sonnet-5.5-or`) wordt aanvaard. Een label met `/` geeft de UsageError van `BENCH_LABEL`.
 
           Verificatie: `npx vitest run __tests__/cli-review-bench.test.ts __tests__/cli.test.ts`, daarna `npm run verify`.
@@ -392,6 +403,7 @@ stories:
         priority: 2
         implementation_plan: |
           Repo: agent-harness. Branch: feat/m8-review-bench.
+          Vereist: taken 1–7. Deze taak pusht de branch, dus ze komt als laatste.
           Spec: §4.6 ("Nieuwe configuraties in deploy/max2") en AC8. Review-record ronde 2, C-m3 (volgorde). Plan: docs/plans/M8-review-bench.md.
 
           Doel: de drie propriëtaire configuraties aanmaken. Bestaande configuraties en de productieworker veranderen niet.
@@ -435,7 +447,7 @@ stories:
       (privé), branch feat/m8-review-bench, gewerkt in een worktree ~/Development/max2-m8 op de Mac.
     acceptance_criteria: >-
       Spec AC9 en AC11, plus X-m1 (preflight afgewezen als reden voor een ontbrekende run), C-m4 (read_file-tellingen uit de trace)
-      en C-m5 (het rookproefblad vraagt alleen f1). Het controlescript bevestigt alle hashes. `python3 -m unittest` is groen voor
+      en C-m5 (het rookproefblad vraagt alleen f1). Een end-to-end-test volgt de indeling van P2 en P3 met één gedeelde preflight. Het controlescript bevestigt alle hashes. `python3 -m unittest` is groen voor
       review_bench, en task_bench blijft groen. De branch is gepusht; de PR wacht op JP.
     priority: 2
     tasks:
@@ -514,36 +526,33 @@ stories:
             - mask_secrets.
             Niet overgenomen: on_openrouter, fetch_endpoints en PINNED_QUANTIZATIONS.
           - Geen models.json: het model is de configuratie in harness.json. `--models` neemt configuratienamen, en het label is de configuratienaam. De driver weigert met exit 2 een naam die niet in `configurations` van `--config` staat. De acht namen zijn `qwen3.8-or-128k`, `deepseek-v4-flash-or`, `deepseek-v4-pro-or`, `glm-5.3-or`, `minimax-m3-or`, `gpt-6-luna-or`, `claude-sonnet-5.5-or` en `gpt-6.1-sol-or`.
-          - Nieuw: `fake_review_bench.py`, een nep-harness zoals fake_task_bench.py. Het logt zijn argv en schrijft een bench-result.json met de gevraagde status en het gevraagde bedrag.
+          - Nieuw: `fake_review_bench.py`, een nep-harness zoals fake_task_bench.py. Het logt zijn argv en schrijft een bench-result.json met de status, het bedrag en eventueel de benchError die per label is ingesteld.
           - Wijzig `test_review_bench.py`.
 
           CLI:
           ```
           ./run.py --harness "<cmd>" --config <harness.json> --probe-dir <dir> --case <case-dir>
                    --models <configuraties…> --runs 3 --out <dir> --ledger <file> --budget <USD>
-                   --key-file <file> [--preflight]
+                   --key-file <file> [--preflight] [--preflight-file <file>]
           ```
+          - `--preflight-file` is standaard `<out>/preflight.json`. De preflight schrijft dat bestand, en runs lezen het. Zo kunnen rookproef en hoofdruns elk een eigen `--out` hebben (hervatten telt de rookproef dan niet mee), met één gedeelde preflight (plan-r1 X-M2/C-M1).
           - `--key-file` wordt één keer gelezen, en de witruimte wordt gestript (Review Focus 5). In drie gevallen volgt een fout: de waarde is korter dan 8 tekens, ze begint met `LITELLM_MASTER_KEY=`, of ze bevat een aanhalingsteken.
           - De waarde gaat alleen als `LITELLM_MASTER_KEY` in de env van het kind. Naar de harness gaat `--api-key-env LITELLM_MASTER_KEY`, nooit de waarde.
 
           Preflight (`--preflight`):
-          - Per configuratie één POST naar `<litellm.baseUrl uit --config>/chat/completions`, met:
-            - `model` = de configuratie;
-            - `max_tokens` 64000;
-            - `reasoning_effort` uit harness.json, als die gezet is;
-            - één dummy-tool `noop` zonder parameters;
-            - het bericht "Antwoord alleen: OK".
+          - Per configuratie één POST naar `<litellm.baseUrl uit --config>/chat/completions` met `model` = de configuratie, `max_tokens` 64000, `reasoning_effort` uit harness.json als die gezet is, één dummy-tool `noop` zonder parameters en het bericht "Antwoord alleen: OK".
           - Het bedrag komt als `preflight-<label>-<ts>` in het grootboek, null als het onbekend is.
-          - Een configuratie is `ok` bij HTTP 200 én een eindig getal in `usage.cost` van de responsbody. Dat is hetzelfde veld dat `parseUsage` leest (agent-harness src/model-client.ts:98). Een hosted antwoord zonder dat bedrag faalt, want de bench zou dan COST_UNKNOWN geven (Review Focus 4).
-          - De uitkomst gaat naar `<out>/preflight.json`: `{label: {ok, reason}}`.
+          - Een configuratie is `ok` bij HTTP 200 én een eindig getal in `usage.cost` van de responsbody. Dat is hetzelfde veld dat `parseUsage` leest (agent-harness src/model-client.ts:98). De probe eist dat al (agent-harness src/worker/probe-gate.ts:93-97); de preflight herhaalt het bij `max_tokens` 64000 (Review Focus 4).
+          - De uitkomst gaat naar `--preflight-file`: `{label: {ok, reason}}`. `reason` gaat door mask_secrets.
 
           Runs (zonder `--preflight`):
-          - Lees `<out>/preflight.json`.
-          - Een label dat ontbreekt geeft exit 2 ("geen preflight").
-          - Een label met `ok: false` wordt overgeslagen en komt in `<out>/skipped.json` als `{label, reason: "preflight afgewezen: <reden>"}` (X-m1).
+          - Lees `--preflight-file`. Een label dat ontbreekt geeft exit 2 ("geen preflight").
+          - Een label met `ok: false` draait niet (X-m1).
+          - Een bench-result met een benchError die begint met `CONFIGURATION_NOT_PROBED` telt niet als benchfout: geen herhaling, geen exit 3. Het label draait daarna niet meer.
           - De volgorde: ronde 1 over alle labels, dan ronde 2, dan ronde 3.
           - Vóór elke run eerst de stopvlag, dan hervatten, dan `check_budget`.
           - Het grootboek telt `usage.costUsd` uit elk bench-result.json, ook van een benchfout.
+          - Aan het eind van elke aanroep, ook bij exit 3 of 4, schrijft de driver `<out>/skipped.json` opnieuw. Dat is een lijst `{label, run, reason}` met een regel voor elke verwachte run (`--models` × `--runs`) zonder bench-result.json. De reden is `preflight afgewezen: <reden>`, `niet geprobed: <detail>`, `budget bereikt`, `gestopt (stopvlag)` of `gestopt na tweede benchfout op <label>`.
 
           Tests (unittest, eerst rood):
           - Het grootboek telt runs en preflight op.
@@ -555,10 +564,13 @@ stories:
           - De stopvlag werkt.
           - Preflight met een nep-LiteLLM (`http.server` in een thread):
             - ok;
-            - HTTP 400 geeft afgewezen, en `skipped.json` noemt "preflight afgewezen";
+            - HTTP 400 geeft afgewezen, en `skipped.json` heeft voor dat label 3 regels "preflight afgewezen";
             - 200 zonder `usage.cost` geeft afgewezen;
             - het bedrag staat in het grootboek.
-          - De keywaarde staat niet in de argv-log van de nep-harness en niet onder `--out`.
+          - Preflight met `--out A`, daarna runs met `--out A/rook --preflight-file A/preflight.json`: geen exit 2. Zonder `--preflight-file` in `A/rook`: exit 2.
+          - De nep-harness geeft voor één label CONFIGURATION_NOT_PROBED: 1 aanroep voor dat label, geen herhaling, exit 0, en `skipped.json` heeft runs 2 en 3 als "niet geprobed".
+          - Een budgetstop (exit 4) geeft "budget bereikt" voor elke run die niet gestart is.
+          - Lekken: een helper `leaked_fragments(text, key, min=6)` geeft elke stretch van 6 tekens van de key die nog in de tekst staat. Leeg voor de argv-log van de nep-harness en voor elk bestand onder `--out`, ook als de nep-LiteLLM een 400 geeft met de key in de body.
           - Een key-file met een afsluitende newline wordt gestript. `LITELLM_MASTER_KEY=…` en een waarde tussen aanhalingstekens worden geweigerd.
 
           Verificatie: `python3 -m unittest discover -s llm-bench/review_bench -v` en `python3 -m unittest discover -s llm-bench/task_bench -v`, beide groen.
@@ -588,10 +600,11 @@ stories:
             - de koppeling id → run-map staat apart in `<out>/sheets-key.json`;
             - met `--only-f1` vraagt het blad alleen `f1` (C-m5, voor de rookproef);
             - zonder die vlag vraagt het blad `f1`, `f2`, `minors` en `extra`.
-          - `score.py report <out> --scores <scores.jsonl> --decisions <decisions.json> --ledger <file> --date <YYYY-MM-DD> [--smoke]`. Dit schrijft `llm-bench/results/review-bench-<datum>.md` (met `--smoke` het rookproefrapport).
+          - `score.py smoke <dir> --scores <scores.jsonl>`: per run de status, outcome, verdict en f1, en daarna `rookproef: door` (exit 0) of `rookproef: stop` (exit 1). Door betekent: geen run is benchfout, en `claude-sonnet-5.5-or` is beoordeeld met `outcome: succeeded`, NO-GO en f1 `major`.
+          - `score.py report <out> --scores <scores.jsonl> --decisions <decisions.json> --ledger <file> --date <YYYY-MM-DD> --preflight <file> --models <configuraties…> --runs <n> [--smoke-dir <dir> --smoke-scores <file>]`. Dit schrijft `llm-bench/results/review-bench-<datum>.md`. `--models` en `--runs` geven de verwachte runs, ook van een configuratie die nooit gedraaid heeft (plan-r1 X-M2/C-M1).
 
           Formaten:
-          - Een regel in `scores.jsonl`: `{sheet, f1: major|minor|nee, f2: major|minor|nee, minors: [M1..M6], extra: [{key, voorstel: geldig|ongeldig, reden}]}`. Bij `--smoke` alleen `{sheet, f1}`.
+          - Een regel in `scores.jsonl`: `{sheet, f1: major|minor|nee, f2: major|minor|nee, minors: [M1..M6], extra: [{key, voorstel: geldig|ongeldig, reden}]}`. Voor de rookproef (`--only-f1`) alleen `{sheet, f1}`.
           - `decisions.json`: `{key: geldig|ongeldig}`.
 
           Beslisregel, als pure functies:
@@ -616,9 +629,15 @@ stories:
             - de extra's, geldig of ongeldig;
             - gemiddelde en maximale kosten;
             - tokens, `peakInputTokens` naast 131072, wandtijd, turns, toolfouten en outcome.
-          - Per run, uit trace.jsonl (C-m4): het aantal `read_file`-aanroepen op `sources/doc`, totaal en met offset/limit.
+          - Per run, uit trace.jsonl (C-m4): het aantal `read_file`-aanroepen op `sources/doc`, totaal en met offset/limit. Het pad wordt eerst genormaliseerd: een absoluut pad met `/<runId>/root/` erin wordt het deel daarna, en dan `posixpath.normpath`. Zo telt `./sources/doc` ook mee.
           - Contextrijen voor `1a78c1b8` (Claude Code, $0,39) en `7146cbe9` (Codex CLI, ≈ $0,10).
-          - Ontbrekende runs, met per run de reden: `benchfout`, `niet geprobed` (CONFIGURATION_NOT_PROBED) of `preflight afgewezen` (uit skipped.json, X-m1).
+          - De preflight uit `--preflight`: per configuratie ok of de reden, met het bedrag uit het grootboek.
+          - De rookproef uit `--smoke-dir` en `--smoke-scores`: per run de status, outcome, verdict en f1.
+          - Elke verwachte run die niet beoordeeld is, met de reden:
+            - `benchfout`, uit bench-result.json;
+            - `niet geprobed`, uit een benchError CONFIGURATION_NOT_PROBED of uit skipped.json;
+            - de reden uit skipped.json: `preflight afgewezen` (X-m1), `budget bereikt` of `gestopt …`;
+            - `niet gestart` als er niets is vastgelegd.
           - Het grootboek.
 
           Tests (AC11, eerst rood):
@@ -629,8 +648,9 @@ stories:
           - Zijn beide controles geen kandidaat, dan krijgen alle modellen `onbeslist: runtime`.
           - Een blind blad bevat geen configuratienaam, geen label en geen modelnaam. Controleer dat tegen de acht configuratienamen en hun OpenRouter-modellen, zoals `anthropic/claude-sonnet-5.5`.
           - `--only-f1` vraagt alleen f1.
-          - Een fixture met `skipped.json` geeft in het rapport "preflight afgewezen" (X-m1).
-          - Een trace-fixture met 3 `read_file`-aanroepen op `sources/doc`, waarvan 2 met offset, geeft 3 en 2 (C-m4).
+          - `smoke`: door en stop, elk met een fixture.
+          - Een trace-fixture met 3 `read_file`-aanroepen op `sources/doc`, waarvan 2 met offset, geeft 3 en 2 (C-m4). Met `./sources/doc` en met een absoluut pad binnen de root telt het ook.
+          - End-to-end, met de nep-LiteLLM en de nep-harness van de driver-taak, in de indeling van P2 en P3: preflight in `R`, rookproef in `R/rook`, hoofdruns in `R/runs`, steeds met `--preflight-file R/preflight.json`. Vier configuraties met `--runs 3`: één wijst de preflight af, één geeft CONFIGURATION_NOT_PROBED. `score.py report R/runs …` geeft voor de eerste 3× "preflight afgewezen" en voor de tweede 3× "niet geprobed". Het rapport heeft ook een preflight- en een rookproefsectie.
 
           Verificatie: `python3 -m unittest discover -s llm-bench/review_bench -v` is groen. Daarna `git push -u origin feat/m8-review-bench`.
 
@@ -643,29 +663,15 @@ stories:
 
 # M8 — review-bench: implementatieplan
 
-_Status: draft (2026-10-20). Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: draft (2026-10-20), revisie 4. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** het rapport `llm-bench/results/review-bench-<datum>.md` in de max2-repo. Het geeft een oordeel per model over acht remote modellen met ≥ 128k context, elk 3× gedraaid op de spec-r5-review van MacSearch IDEA-263, volgens de beslisregel van spec §1.
 
-**Architecture:**
-- **agent-harness** krijgt het subcommando `harness review-bench`. Dat bestaat uit:
-  - drie read-only tools;
-  - de echte `review.md` met getelde vervangingen;
-  - een validator die `finalizeChildResult` naspeelt;
-  - de probe-gate en de kostenbewaking van de worker;
-  - een eigen statusmapping.
-- **De max2-repo** krijgt:
-  - de bevroren case;
-  - een driver met preflight en grootboek;
-  - een scorer met blinde bladen.
-- Alles draait op max2 via LiteLLM, tegen de productie-release.
+**Architecture:** agent-harness krijgt `harness review-bench`: drie read-only tools, de echte `review.md` met getelde vervangingen, een validator die `finalizeChildResult` naspeelt, de probe-gate en kostenbewaking van de worker, en een eigen statusmapping. De max2-repo krijgt de bevroren case, een driver met preflight en grootboek, en een scorer met blinde bladen. Alles draait op max2 via LiteLLM, tegen de productie-release.
 
-**Tech Stack:**
-- TypeScript (Node 24), vitest, `npm run verify`;
-- Python 3 met alleen de standaardbibliotheek, `unittest`;
-- LiteLLM met OpenRouter.
+**Tech Stack:** TypeScript (Node 24), vitest, `npm run verify`; Python 3 met alleen de standaardbibliotheek, `unittest`; LiteLLM met OpenRouter.
 
 **Spec:** `docs/specs/2026-10-20-review-bench-design.md` revisie 2, dubbel GO (`86628ea3`). Het review-record staat in `docs/reviews/2026-10-20-review-bench-spec-review-record.md`. De spec is bindend. Dit plan detailleert het hele increment (besluit 8).
 
@@ -698,31 +704,19 @@ Elke taak kopieert de grenzen die voor haar gelden. Hier staan alleen de grenzen
 1. **Witruimte of BOM rond het JSON-object.** Dit moet aanvaard worden. Test in S1-3.
 2. **Absolute paden uit gewoonte**, zoals `/sources/doc` of het `/tmp/` uit de objective. Die worden geweigerd zonder iets van de host te lezen, en tellen als toolfout. Test in S1-1.
 3. **Een leeg eindantwoord**, zoals alleen reasoning. Dat geeft een herhaalvraag, geen crash. Test in S1-3.
-4. **Een hosted configuratie zonder `usage.cost`.** Daarmee zou elke run COST_UNKNOWN geven. De preflight wijst zo'n configuratie af. Test in S2-2.
+4. **Een hosted configuratie zonder `usage.cost`.** Daarmee zou elke run COST_UNKNOWN geven. De probe wijst die al af (`probe-gate.ts:93-97`); de preflight herhaalt de controle bij `max_tokens` 64000. Test in S2-2.
 5. **Een key-file met een newline, of in `NAAM=waarde`-vorm.** Een newline wordt gestript; de `NAAM=waarde`-vorm wordt geweigerd. Test in S2-2.
 
 ## Waar de MINORs van ronde 2 landen
 
-| # | Landt in | Wat |
-|---|---|---|
-| X-m1 | S2-2, S2-3, P4 | `skipped.json` met "preflight afgewezen", een fixture en een rapportregel |
-| X-m2 | S1-8 (erratum) | De case overschrijft het venster. De vier FP8-configuraties staan nu op 65536, `qwen3.8-or-128k` staat op 131072 |
-| X-m3 | S1-3, S1-6, S2-3 | SCHRAP. Er komt geen `checks`-diagnose, en de zin "De scorer telt het wel apart" in spec §4.4 vervalt |
-| C-m1 | S1-2 | `tracked-client.ts`. De tests van task-bench blijven ongewijzigd en groen |
-| C-m2 | P3 (erratum) | Het grootboek begrenst de som over de runs. Afgebroken aanvragen vallen binnen de marge en de dashboardcontrole |
-| C-m3 | S1-8, P1 | De nieuwe configuraties komen achteraan. "Actueel" betekent een mtime na `litellm_upgrade`. Bij exit ≠ 0: opnieuw draaien, niet proben |
-| C-m4 | S2-3 | Het aantal `read_file`-aanroepen op `sources/doc`, totaal en met offset/limit, gelezen uit trace.jsonl |
-| C-m5 | S2-3, P2 | `score.py sheets --only-f1` |
-| C-m6 | S1-1, S1-5, S1-7 | AC1 via de diff. AC4 ook voor `__dispatch_input`. De teksten van task-bench blijven byte-gelijk |
-| C-m7 | — | Geen actie |
-| AC10/11 | P4 | De zin "Het rapport heeft 24 runs…" hoort bij AC10. Hij krijgt "preflight afgewezen" erbij. De spec blijft na de GO ongewijzigd |
+Elke MINOR van spec-ronde 2 (X-m1 … C-m7, zie het spec-review-record) landt bij de taak of stap die zijn code noemt. C-m7 vraagt geen actie. De spec blijft na de GO ongewijzigd; een erratum staat in het plan.
 
 ## Volgorde
 
 | Stap | Waar | Wat | Wacht op |
 |---|---|---|---|
-| S1-1 … S1-7 | agent-harness | bench-code; 6 en 7 hangen af van 1–5 | — |
-| S1-8 | agent-harness | configuraties, deploy-test, push | — |
+| S1-1 … S1-7 | agent-harness | bench-code | S1-5 op S1-4; S1-6 op 1–5; S1-7 op S1-6 |
+| S1-8 | agent-harness | configuraties, deploy-test, push | S1-1 … S1-7 |
 | S2-1 | max2, **alleen een Mac-sessie** | case (de bron staat alleen op de Mac) | — |
 | S2-2, S2-3 | max2 | driver, scorer, push | S2-1 |
 | P1–P4 | Forgejo, max2, Mac | praktijkstappen (hieronder) | S1 en S2 klaar; **elke stap op JP's go** |
@@ -744,13 +738,7 @@ Elke stap start alleen op JP's expliciete go, in een venster dat JP noemt. Het b
 6. Lees elke `runs/probe-<naam>/probe.json`, ook bij een exit ≠ 0. "Actueel" betekent een mtime na het eindtijdstip van stap 4. Leg per configuratie `accepted` en de mtime vast.
 7. `harness_start`, alleen als alle negen bestaande configuraties actueel en aanvaard zijn. Een afgewezen nieuwe configuratie valt uit de bench.
 
-Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en JP beslist. Dan in deze volgorde:
-1. `harness_release_rollback`;
-2. `litellm_upgrade`;
-3. `allow` controleren;
-4. `harness_probe`;
-5. elke probe.json lezen;
-6. `harness_start`.
+Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en JP beslist. Dan in deze volgorde: `harness_release_rollback`, `litellm_upgrade`, `allow` controleren, `harness_probe`, elke probe.json lezen, `harness_start`.
 
 **P2 — Preflight en rookproef** (spec §4.7 en §4.8, stap 6; C-m5).
 1. JP leest het OpenRouter-tegoed af. Budget = `min(10, tegoed − 2)`.
@@ -759,27 +747,19 @@ Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en J
    sudo sed -n 's/^LITELLM_MASTER_KEY=//p' /etc/agent-harness/harness-litellm.env | install -m 0600 /dev/stdin /run/user/1000/m8-litellm.key
    ```
 3. Draai op max2, in een clone of worktree `~/Development/max2-m8` van de gemergde main (buiten de worker-checkout), `run.py --preflight` met:
-   - `--harness "node /srv/agent-harness/current/dist/cli.js"`
-   - `--config /etc/agent-harness/harness.json`
-   - `--probe-dir /var/lib/agent-harness/runs`
-   - de case;
-   - alle acht configuratienamen;
-   - `--out ~/m8-runs/review-bench-<datum>`
-   - `--ledger`
-   - `--budget`
-   - `--key-file /run/user/1000/m8-litellm.key`
-4. Rookproef: `--models qwen3.8-or-128k claude-sonnet-5.5-or --runs 1 --out …/rook` (≈ $0,50). Deze runs tellen niet mee in de 24.
-5. Maak het blad met `score.py sheets …/rook --only-f1`. Claude vult alleen f1 in.
-6. Doorgaan mag alleen als:
-   - geen van beide runs `benchfout` is;
-   - sonnet `beoordeeld` is, met `outcome: succeeded`, `NO-GO` en f1 `major`.
+   `--harness "node /srv/agent-harness/current/dist/cli.js" --config /etc/agent-harness/harness.json --probe-dir /var/lib/agent-harness/runs`, de case, alle acht configuratienamen, `--out ~/m8-runs/review-bench-<datum>` (hierna `R`; de preflight schrijft `R/preflight.json`), `--ledger`, `--budget` en `--key-file /run/user/1000/m8-litellm.key`.
+4. Rookproef: `--models qwen3.8-or-128k claude-sonnet-5.5-or --runs 1 --out R/rook --preflight-file R/preflight.json` (≈ $0,50). Deze runs tellen niet mee in de 24.
+5. Maak het blad met `score.py sheets R/rook --only-f1`. Claude vult alleen f1 in, in `R/rook/scores.jsonl`.
+6. Doorgaan mag alleen als `score.py smoke R/rook --scores R/rook/scores.jsonl` "rookproef: door" geeft:
+   - geen van beide runs is `benchfout`;
+   - sonnet is `beoordeeld`, met `outcome: succeeded`, `NO-GO` en f1 `major`.
    Anders stop, en JP beslist.
 
 **P3 — De 24 runs** (spec §4.8, stap 7; C-m2).
 1. Draai run.py met:
-   - de configuraties die ok zijn in `preflight.json` en een actuele aanvaarde probe hebben;
+   - alle acht configuraties. De driver slaat een afgewezen preflight of een niet-geprobede configuratie zelf over, en legt de reden vast in `skipped.json`;
    - `--runs 3`;
-   - `--out …/runs`;
+   - `--out R/runs --preflight-file R/preflight.json`;
    - hetzelfde grootboek en hetzelfde budget.
 2. Bij een tweede benchfout op dezelfde configuratie: stop, en JP beslist.
 3. Na het venster:
@@ -788,16 +768,16 @@ Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en J
 4. Kopieer de run-mappen naar `~/Development/m8-runs/`, buiten elke repo.
 
 **P4 — Scoren en rapport** (spec §4.6, §4.9 en AC10; X-m1, C-m4).
-1. `score.py sheets …/runs`.
+1. `score.py sheets R/runs`.
 2. Claude vult `scores.jsonl` in volgens rubric.md, zonder `sheets-key.json` te openen. Elke extra BLOCKER of MAJOR krijgt een genormaliseerde `key`.
 3. JP beslist één keer per key in `decisions.json`.
-4. `score.py report` schrijft het rapport. Daarin staan:
+4. `score.py report R/runs --preflight R/preflight.json --models <de acht> --runs 3 --smoke-dir R/rook --smoke-scores R/rook/scores.jsonl`, met scores, decisions, grootboek en datum, schrijft het rapport. Daarin staan:
    - het oordeel per model;
    - de preflight en de rookproef met hun bewijs;
    - de `read_file`-tellingen;
    - de grenzen: één case, alleen een document;
    - het vervolg.
-   **AC10:** het rapport heeft 24 runs, of legt per ontbrekende run uit waarom: een benchfout, een configuratie die niet geprobed was, of een preflight die afwees.
+   **AC10:** het rapport heeft 24 runs, of legt per ontbrekende run uit waarom: een benchfout, een configuratie die niet geprobed was, een preflight die afwees, het budget, een stop, of "niet gestart".
 5. Commit in de max2-repo het rapport, de bladen, `scores.jsonl` en `decisions.json`, zonder run-mappen of logs. Dien het in als PR via de Forgejo-API, en merge op JP's go.
 
 ## Ceremonie
