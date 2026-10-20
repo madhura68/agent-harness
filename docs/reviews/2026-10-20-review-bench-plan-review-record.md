@@ -90,8 +90,8 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
 
 | Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
 |---|---|---|---|---|---|
-| CODEX | `cf1e6037-af59-43fd-8c37-b21d0f261c1e` | `5f8683d5-abe8-4682-af25-eeabdf9b41c4` | `96f671d8-576e-4ecb-9ebb-742f5c8f7dee` | linked | **NO-GO** 0/1/0 |
-| CLAUDE | `545642ff-74f7-41fc-b794-89902b0a8eae` | `52d1ca8a-4ba0-46ca-948d-199521cd2535` | `c33124d7-aba2-461a-9155-385b0b8102c0` | linked | **GO** 0/0/6 |
+| CODEX | `cf1e6037-af59-43fd-8c37-b21d0f261c1e` | `5f8683d5-abe8-4682-af25-eeabdf9b41c4` | `96f671d8-576e-4ecb-9ebb-742f5c8f7dee` | linked | **NO-GO** 0/1/0 (job `c641eb38-25e0-4e73-9580-922418874fc0`) |
+| CLAUDE | `545642ff-74f7-41fc-b794-89902b0a8eae` | `52d1ca8a-4ba0-46ca-948d-199521cd2535` | `c33124d7-aba2-461a-9155-385b0b8102c0` | linked | **GO** 0/0/6 (job `d885fd29-743f-4ba4-bf34-ef5fb0a9d096`) |
 
 **Fixes van ronde 2.** Beide reviewers vonden dat ze landen. Alle tien MINORs van spec-ronde 2 staan er nog. Eén fix bleek fout: C2-m2, zie X3-M1.
 
@@ -118,3 +118,29 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
 - Erbij: de MODEL_ERROR-voorwaarde op de override, en kleine verduidelijkingen.
 - Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
 - Plan: 63 210 → 63 164 tekens.
+
+## Ronde 4: revisie 6 (`36baadf7aac2af95edb4887de8f5d354753a428c`)
+
+**Pin:** `plan` @`36baadf7`, sha256 `80ddacb015c6b7553b15f2c57ebebbfd90221851287cbc65bf3dd92a3bae5d54`, 693 regels, 63 164 tekens. Repository: `agent-harness@36baadf7`.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `509288ab-afe4-4a2e-8b92-3293a40adf22` | `81934adf-2947-487a-bd5f-7ccdcb0ad07e` | `fd4a1cde-cbec-4cfb-8571-d8d09bf0d67c` | linked | **GO** 0/0/0 (job `15a02e95-f496-4dee-b66d-751eba8cf91b`) |
+| CLAUDE | `8a9a0d9c-344b-4c48-b16d-c25946691dd3` | `5340cd89-22fa-4a8d-b65d-7fc4125bb7ec` | `9f8e109d-1e43-4ae1-938d-8e5616aa9f81` | linked | **GO** 0/0/3 (job `1f45a0f0-4cca-450b-8dab-d0f1ee413a39`) |
+
+**Fixes van ronde 3.** Beide reviewers vonden dat ze houden, ook X3-M1. De catch meet niets, alleen `onRetry` voedt de guard, en de override geldt alleen bij MODEL_ERROR. X-M1 en X2-M1 bleven dicht. Alle tien MINORs van spec-ronde 2 landen nog. Beide vonden geen kleiner correct alternatief voor de guard alleen via `onRetry`.
+
+**Dubbel GO: de plan-fase is klaar** (revisie 6, `36baadf7`).
+- De MINORs van ronde 4 komen niet meer in het plan, zoals bij de spec: elke wijziging na de GO zou een delta-ronde vragen.
+- Ze landen bij de ceremonie in de taakteksten, als de vervangingen hieronder.
+- Alle drie zijn tegen de tree gecontroleerd.
+
+| # | Bevinding | Landt bij de ceremonie in |
+|---|---|---|
+| C4-m1 | De deadline-case in S1-6 ("deadline al verstreken") kan zo geschreven worden dat hij niet kan falen. `run.ts:334` geeft timed_out vóór de eerste aanroep | S1-6: "met `deps.now` die pas na de derde drop voorbij de deadline springt (de nep-sleep zet de klok door): `timed_out`, niet limiet en niet benchfout" |
+| C4-m2 | S1-6 en S1-7 vragen een nieuwe probe-helper, terwijl `__tests__/fakes/probe-seed.ts` (`seedProbe`) en `__tests__/fakes/worker-config.ts` (`testWorkerConfig`) al bestaan. Geen enkele cli-test spawnt; ze gebruiken `runMain` (`__tests__/cli.test.ts:201`) | S1-6: gebruik `seedProbe` en `testWorkerConfig`; de helper `probe.ts` vervalt. S1-7: "via `runMain` (zoals `__tests__/cli.test.ts`)" in plaats van "via spawn" |
+| C4-m3 | De zin in S1-2 zegt dat elke `UnusableAnswerError` al via `onRetry` geteld is. Dat geldt alleen na een onderbroken wachttijd | S1-2: "Na een onderbroken wachttijd is het antwoord al via `onRetry` geteld (retry-client.ts:119-123). Na de laatste herhaling niet: de run eindigt als benchfout (MODEL_ERROR), ook als dit antwoord het plafond passeert; het bedrag staat via `droppedLast` in usage en het grootboek." |
+
+**Scope-delta r4.** Geen. Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
+
+**Kosten van de loop.** 8 jobs in 4 rondes, plus een mislukte eerste dispatch zonder job. Het verbruik staat niet in de MCP-antwoorden.
