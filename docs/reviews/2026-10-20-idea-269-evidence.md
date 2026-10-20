@@ -1700,3 +1700,632 @@ Letterlijke fragmenten met regelnummers uit repo's buiten de `/work`-checkout (S
   100  general_settings:
   101    master_key: os.environ/LITELLM_MASTER_KEY
 ```
+
+# Aanvulling plan-ronde 1 (bestanden die het plan noemt)
+
+Toegevoegd na plan-review ronde 1. De secties hierboven zijn ongewijzigd; regelnummers daarin blijven geldig. agent-harness-fragmenten hieronder komen van `a2eb8c316a4552a97d357f138e924498538110d3`.
+
+## workers gen-schema.sh (schrijft naar stdout) — `scripts/gen-schema.sh` r. 1-28
+
+`scrum4me-workers@198eb59:scripts/gen-schema.sh`
+
+```bash
+    1  #!/usr/bin/env bash
+    2  # Generate prisma/schema.prisma from scrum4me-shared canonical.
+    3  # Strips url= / directUrl= lines because Prisma 7 prisma.config.ts owns
+    4  # connection URLs (would conflict with datasource block).
+    5  
+    6  set -euo pipefail
+    7  
+    8  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+    9  SHARED="$ROOT/vendor/scrum4me-shared"
+   10  
+   11  # A fresh git worktree does not auto-check-out submodules, so vendor/scrum4me-shared/
+   12  # starts empty and the @shared/* tsconfig alias breaks typecheck/build. Self-heal by
+   13  # initializing the submodule when its lib/ (the @shared/* target) is missing. || true so
+   14  # a network/auth failure doesn't abort install — the hard gate below reports it instead.
+   15  if [ ! -d "$SHARED/lib" ]; then
+   16    echo "scrum4me-shared submodule not checked out — running 'git submodule update --init'…" >&2
+   17    git -C "$ROOT" submodule update --init --recursive vendor/scrum4me-shared >&2 || true
+   18  fi
+   19  
+   20  if [ ! -f "$SHARED/scripts/gen-consumer-schema.sh" ]; then
+   21    echo "error: shared submodule not initialized — run 'git submodule update --init vendor/scrum4me-shared'" >&2
+   22    exit 1
+   23  fi
+   24  
+   25  mkdir -p "$ROOT/prisma"
+   26  PRISMA_CLIENT_OUTPUT="../node_modules/.prisma/client" \
+   27    bash "$SHARED/scripts/gen-consumer-schema.sh" \
+   28    | sed -E '/^[[:space:]]*(url|directUrl)[[:space:]]*=/d'
+```
+
+## workers prisma.config.ts — `prisma.config.ts` r. 1-13
+
+`scrum4me-workers@198eb59:prisma.config.ts`
+
+```ts
+    1  import * as dotenv from 'dotenv'
+    2  import { defineConfig } from 'prisma/config'
+    3  
+    4  // Load .env.local first (Next.js convention), then fall back to .env
+    5  dotenv.config({ path: '.env.local' })
+    6  dotenv.config()
+    7  
+    8  export default defineConfig({
+    9    schema: 'prisma/schema.prisma',
+   10    datasource: {
+   11      url: process.env.DIRECT_URL || process.env.DATABASE_URL!,
+   12    },
+   13  })
+```
+
+## workers lib/prisma.ts (geen server-only, geen dotenv) — `lib/prisma.ts` r. 1-30
+
+`scrum4me-workers@198eb59:lib/prisma.ts`
+
+```ts
+    1  import { PrismaClient } from '@prisma/client'
+    2  import { Pool } from 'pg'
+    3  import { PrismaPg } from '@prisma/adapter-pg'
+    4  
+    5  // During `next build` page-data collection, route modules are evaluated to
+    6  // inspect their exports — at that point DATABASE_URL is not yet available
+    7  // (docker-compose env_file lands at runtime). We default to an empty
+    8  // connection string so module-eval succeeds; Pool/PrismaPg/PrismaClient
+    9  // initialize lazily without actually connecting. The first real query at
+   10  // runtime will fail clearly if DATABASE_URL is still missing.
+   11  // Mirrors the SKIP_ENV_VALIDATION escape hatch in `lib/env.ts`.
+   12  function createPrismaClient() {
+   13    const url = process.env.DATABASE_URL ?? ''
+   14    const pool = new Pool({ connectionString: url })
+   15    const adapter = new PrismaPg(pool)
+   16    return new PrismaClient({
+   17      adapter,
+   18      log: process.env.NODE_ENV === 'development' ? ['query', 'warn', 'error'] : ['warn', 'error'],
+   19    })
+   20  }
+   21  
+   22  declare global {
+   23    var __prisma: PrismaClient | undefined
+   24  }
+   25  
+   26  export const prisma = globalThis.__prisma ?? createPrismaClient()
+   27  
+   28  if (process.env.NODE_ENV !== 'production') {
+   29    globalThis.__prisma = prisma
+   30  }
+```
+
+## workers .gitignore (prisma/schema.prisma niet getrackt) — `.gitignore` r. 1-12
+
+`scrum4me-workers@198eb59:.gitignore`
+
+```text
+    1  node_modules
+    2  .next/
+    3  out/
+    4  dist/
+    5  *.log
+    6  .DS_Store
+    7  .env*
+    8  !.env.example
+    9  prisma/schema.prisma
+   10  prisma/migrations/
+   11  .vercel
+   12  .turbo
+```
+
+## workers tsx-scriptprecedent — `scripts/check-review-source.ts` r. 1-61
+
+`scrum4me-workers@198eb59:scripts/check-review-source.ts`
+
+```ts
+    1  import { createHash } from 'node:crypto'
+    2  import { readFile } from 'node:fs/promises'
+    3  import { pathToFileURL } from 'node:url'
+    4  import { parseArgs } from 'node:util'
+    5  
+    6  import { MARKDOWN_PREVIEW_MAX_BYTES } from '@shared/markdown-profile'
+    7  import { readReviewDocuments } from '@shared/queue-review-documents'
+    8  
+    9  type CheckResult =
+   10    | { ok: true; sha256: string }
+   11    | { ok: false; reason: 'invalid-meta' | 'missing-key' | 'too-large' | 'hash-mismatch' }
+   12  
+   13  export function checkReviewSource(meta: unknown, key: string, bytes: Uint8Array): CheckResult {
+   14    const state = readReviewDocuments(meta)
+   15    if (state.status !== 'available') return { ok: false, reason: 'invalid-meta' }
+   16  
+   17    const reference = state.items.find(item => item.key === key)
+   18    if (!reference) return { ok: false, reason: 'missing-key' }
+   19    if (bytes.byteLength > MARKDOWN_PREVIEW_MAX_BYTES) return { ok: false, reason: 'too-large' }
+   20  
+   21    const sha256 = createHash('sha256').update(bytes).digest('hex')
+   22    return sha256 === reference.sha256
+   23      ? { ok: true, sha256 }
+   24      : { ok: false, reason: 'hash-mismatch' }
+   25  }
+   26  
+   27  async function main(): Promise<void> {
+   28    const { values } = parseArgs({
+   29      options: {
+   30        meta: { type: 'string' },
+   31        key: { type: 'string' },
+   32        file: { type: 'string' },
+   33      },
+   34      strict: true,
+   35    })
+   36    if (!values.meta || !values.key || !values.file) {
+   37      throw new Error('usage: --meta <json-file> --key <key> --file <markdown-file>')
+   38    }
+   39  
+   40    const [metaBytes, sourceBytes] = await Promise.all([
+   41      readFile(values.meta),
+   42      readFile(values.file),
+   43    ])
+   44    const meta = JSON.parse(metaBytes.toString('utf8')) as unknown
+   45    const result = checkReviewSource(meta, values.key, sourceBytes)
+   46    const hash = result.ok ? result.sha256 : '-'
+   47    console.log(`key=${values.key} sha256=${hash} outcome=${result.ok ? 'ok' : result.reason}`)
+   48    if (!result.ok) process.exitCode = 1
+   49  }
+   50  
+   51  const directEntry = process.argv[1]
+   52    ? import.meta.url === pathToFileURL(process.argv[1]).href
+   53    : false
+   54  
+   55  if (directEntry) {
+   56    main().catch((error: unknown) => {
+   57      const reason = error instanceof SyntaxError ? 'invalid-json' : 'input-error'
+   58      console.error(`key=unknown sha256=- outcome=${reason}`)
+   59      process.exitCode = 1
+   60    })
+   61  }
+```
+
+## workers DataTable — `components/shared/data-table.tsx` r. 1-45
+
+`scrum4me-workers@198eb59:components/shared/data-table.tsx`
+
+```tsx
+    1  'use client'
+    2  
+    3  import { Fragment, type ReactNode } from 'react'
+    4  import {
+    5    createSortedRowModel,
+    6    rowSortingFeature,
+    7    tableFeatures,
+    8    useTable,
+    9    type ColumnDef,
+   10    type RowData,
+   11  } from '@tanstack/react-table'
+   12  import {
+   13    Table,
+   14    TableBody,
+   15    TableCell,
+   16    TableHead,
+   17    TableHeader,
+   18    TableRow,
+   19  } from '@/components/ui/table'
+   20  
+   21  const features = tableFeatures({
+   22    rowSortingFeature,
+   23    sortedRowModel: createSortedRowModel(),
+   24  })
+   25  
+   26  export type DataTableColumn<TData extends RowData> = ColumnDef<typeof features, TData>
+   27  export type SingleSort = { column: string; direction: 'asc' | 'desc' }
+   28  
+   29  export function DataTable<TData extends RowData>({
+   30    data,
+   31    columns,
+   32    sort,
+   33    onSortColumn,
+   34    getRowId,
+   35    getRowDomId,
+   36    onRowActivate,
+   37    renderDetailRow,
+   38    getRowTitle,
+   39    getRowClassName,
+   40    getSortButtonLabel,
+   41    caption,
+   42    'data-debug-id': tableDebugId,
+   43  }: {
+   44    data: ReadonlyArray<TData>
+   45    columns: DataTableColumn<TData>[]
+```
+
+## workers useLocalTableSort — `hooks/use-local-table-sort.ts` r. 1-57
+
+`scrum4me-workers@198eb59:hooks/use-local-table-sort.ts`
+
+```ts
+    1  'use client'
+    2  
+    3  import { useCallback, useState, useSyncExternalStore } from 'react'
+    4  
+    5  export type LocalTableSort<TColumn extends string> = {
+    6    column: TColumn
+    7    direction: 'asc' | 'desc'
+    8  }
+    9  
+   10  export function useLocalTableSort<TColumn extends string>({
+   11    storageKey,
+   12    columns,
+   13    defaultSort,
+   14  }: {
+   15    storageKey: string
+   16    columns: readonly TColumn[]
+   17    defaultSort: LocalTableSort<TColumn>
+   18  }) {
+   19    const [chosenSort, setChosenSort] = useState<LocalTableSort<TColumn> | null>(null)
+   20  
+   21    const getSnapshot = useCallback(() => {
+   22      try { return window.localStorage.getItem(storageKey) } catch { return null }
+   23    }, [storageKey])
+   24    const subscribe = useCallback((onStoreChange: () => void) => {
+   25      const onStorage = (event: StorageEvent) => {
+   26        if (event.key !== null && event.key !== storageKey) return
+   27        setChosenSort(null)
+   28        onStoreChange()
+   29      }
+   30      window.addEventListener('storage', onStorage)
+   31      return () => window.removeEventListener('storage', onStorage)
+   32    }, [storageKey])
+   33    const saved = useSyncExternalStore(subscribe, getSnapshot, () => null)
+   34  
+   35    let storedSort: LocalTableSort<TColumn> | null = null
+   36    try {
+   37      const value: unknown = JSON.parse(saved ?? 'null')
+   38      if (value && typeof value === 'object' && 'column' in value && 'direction' in value
+   39        && typeof value.column === 'string' && columns.includes(value.column as TColumn)
+   40        && (value.direction === 'asc' || value.direction === 'desc')) {
+   41        storedSort = { column: value.column as TColumn, direction: value.direction }
+   42      }
+   43    } catch { /* Invalid saved values use the default. */ }
+   44    const sort = chosenSort ?? storedSort ?? defaultSort
+   45  
+   46    function sortBy(column: TColumn) {
+   47      if (!columns.includes(column)) return
+   48      const next: LocalTableSort<TColumn> = {
+   49        column,
+   50        direction: sort.column === column && sort.direction === 'asc' ? 'desc' : 'asc',
+   51      }
+   52      setChosenSort(next)
+   53      try { window.localStorage.setItem(storageKey, JSON.stringify(next)) } catch { /* Keep the current mount usable. */ }
+   54    }
+   55  
+   56    return { sort, sortBy }
+   57  }
+```
+
+## workers test actions/model-registry: opzet — `__tests__/actions/model-registry.test.ts` r. 1-60
+
+`scrum4me-workers@198eb59:__tests__/actions/model-registry.test.ts`
+
+```ts
+    1  import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+    2  import type { AddModelInput } from '@/actions/model-registry'
+    3  
+    4  // tx is de transactiecontext die $transaction aan zijn callback geeft: zo zijn de aanroepen
+    5  // per delegate te controleren. "Geen DB-aanroep" = geen $transaction en geen delegate-aanroep.
+    6  const tx = {
+    7    agentModel: { aggregate: vi.fn(), upsert: vi.fn() },
+    8    modelPrice: { upsert: vi.fn() },
+    9    jobKindConfig: { updateMany: vi.fn() },
+   10  }
+   11  const mockPrisma = { $transaction: vi.fn(), agentModel: { findUnique: vi.fn() } }
+   12  const mockRequireAdmin = vi.fn()
+   13  const mockRevalidate = vi.fn()
+   14  const mockFetch = vi.fn()
+   15  
+   16  vi.mock('@/lib/prisma', () => ({ prisma: mockPrisma }))
+   17  vi.mock('@/lib/auth', () => ({ requireWorkersAdmin: mockRequireAdmin }))
+   18  vi.mock('next/cache', () => ({ revalidatePath: mockRevalidate }))
+   19  
+   20  beforeEach(() => {
+   21    vi.resetAllMocks()
+   22    mockRequireAdmin.mockResolvedValue({ userId: 'admin1', username: 'jp', isAdmin: true })
+   23    mockPrisma.$transaction.mockImplementation(async (callback: (t: typeof tx) => Promise<unknown>) => callback(tx))
+   24    tx.agentModel.aggregate.mockResolvedValue({ _max: { sort_order: 30 } })
+   25    // Standaard geen sleutel op de host en een gestubde fetch: een onverwachte aanroep valt zo op.
+   26    vi.stubEnv('ANTHROPIC_API_KEY', '')
+   27    vi.stubGlobal('fetch', mockFetch)
+   28  })
+   29  
+   30  afterEach(() => {
+   31    vi.unstubAllEnvs()
+   32    vi.unstubAllGlobals()
+   33  })
+   34  
+   35  function expectNoDbCalls() {
+   36    expect(mockPrisma.$transaction).not.toHaveBeenCalled()
+   37    expect(tx.agentModel.aggregate).not.toHaveBeenCalled()
+   38    expect(tx.agentModel.upsert).not.toHaveBeenCalled()
+   39    expect(tx.modelPrice.upsert).not.toHaveBeenCalled()
+   40    expect(tx.jobKindConfig.updateMany).not.toHaveBeenCalled()
+   41  }
+   42  
+   43  const harnessInput = {
+   44    runtime: 'HARNESS' as const,
+   45    model_id: 'gsq-lokaal',
+   46    display_name: 'GSQ lokaal',
+   47    active: true,
+   48  }
+   49  
+   50  const claudeInput: AddModelInput = {
+   51    runtime: 'CLAUDE',
+   52    model_id: 'claude-opus-6',
+   53    display_name: 'Claude Opus 6',
+   54    input_price_per_1m: 10,
+   55    output_price_per_1m: 50,
+   56    active: true,
+   57    default_for_kinds: ['IDEA_CHAT'],
+   58  }
+   59  
+   60  async function load() {
+```
+
+## workers test model-registry-editor: opzet — `__tests__/components/settings/model-registry-editor.test.tsx` r. 1-40
+
+`scrum4me-workers@198eb59:__tests__/components/settings/model-registry-editor.test.tsx`
+
+```tsx
+    1  // @vitest-environment jsdom
+    2  import React from 'react'
+    3  import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+    4  import { fireEvent, render, screen, within } from '@testing-library/react'
+    5  import '@testing-library/jest-dom/vitest'
+    6  import { AgentRuntime } from '@prisma/client'
+    7  import type { ModelWithPrice } from '@/lib/settings/model-registry'
+    8  
+    9  vi.mock('@/actions/model-registry', () => ({
+   10    addModelAction: vi.fn(),
+   11    setModelActiveAction: vi.fn().mockResolvedValue({ ok: true }),
+   12    updateModelPricesAction: vi.fn().mockResolvedValue({ ok: true }),
+   13  }))
+   14  
+   15  import ModelRegistryEditor from '@/components/settings/model-registry-editor'
+   16  import { addModelAction, setModelActiveAction, updateModelPricesAction } from '@/actions/model-registry'
+   17  
+   18  const models: ModelWithPrice[] = [
+   19    { id: 'c2', runtime: AgentRuntime.CODEX, model_id: 'gpt-z', display_name: 'Zulu', active: true, sort_order: 2, notes: null, input_price_per_1m: 0, output_price_per_1m: 3, cache_read_price_per_1m: 0.3, cache_write_price_per_1m: 0 },
+   20    { id: 'c1', runtime: AgentRuntime.CODEX, model_id: 'gpt-a', display_name: 'Alpha', active: false, sort_order: 1, notes: null, input_price_per_1m: 1.5, output_price_per_1m: 4, cache_read_price_per_1m: 0.15, cache_write_price_per_1m: 1.9 },
+   21    { id: 'h1', runtime: AgentRuntime.CLAUDE, model_id: 'claude-a', display_name: 'Bravo', active: true, sort_order: 1, notes: null, input_price_per_1m: null, output_price_per_1m: null, cache_read_price_per_1m: null, cache_write_price_per_1m: null },
+   22  ]
+   23  
+   24  function ids() {
+   25    return within(screen.getByRole('table')).getAllByRole('row').slice(1).map((row) => row.getAttribute('data-row-id'))
+   26  }
+   27  
+   28  beforeEach(() => {
+   29    vi.stubGlobal('localStorage', window.sessionStorage)
+   30    window.localStorage.clear()
+   31    vi.clearAllMocks()
+   32  })
+   33  afterEach(() => vi.unstubAllGlobals())
+   34  
+   35  describe('ModelRegistryEditor', () => {
+   36    it('keeps curated runtime/order/id default and sorts five headings in both directions with numeric prices', () => {
+   37      render(<ModelRegistryEditor models={models} kindOptions={[]} />)
+   38      expect(ids()).toEqual(['h1', 'c1', 'c2'])
+   39      expect(screen.getByRole('columnheader', { name: 'runtime' })).toHaveAttribute('aria-sort', 'ascending')
+   40      for (const heading of ['runtime', 'model_id', 'weergavenaam', 'API-prijs in/out ($/1M)', 'actief']) {
+```
+
+## shared package.json — `package.json` r. 1-26
+
+`scrum4me-shared@8df7f2c:package.json`
+
+```json
+    1  {
+    2    "name": "@scrum4me/shared",
+    3    "version": "0.1.0",
+    4    "private": true,
+    5    "type": "module",
+    6    "description": "Canonical schema + pure-TS lib for Scrum4Me, scrum4me-workers, scrum4me-mcp",
+    7    "scripts": {
+    8      "test": "vitest run",
+    9      "test:watch": "vitest",
+   10      "typecheck": "tsc --noEmit",
+   11      "verify": "bash scripts/verify-no-deps.sh && bash __tests__/scripts/verify-no-deps.test.sh && npm run typecheck && npm test"
+   12    },
+   13    "dependencies": {
+   14      "yaml": "^2.8.4"
+   15    },
+   16    "peerDependencies": {
+   17      "zod": "^3.25.0 || ^4.0.0"
+   18    },
+   19    "devDependencies": {
+   20      "@electric-sql/pglite": "^0.5.8",
+   21      "@types/node": "^24",
+   22      "typescript": "^5.6.0",
+   23      "vitest": "^2.0.0",
+   24      "zod": "^4.0.0"
+   25    }
+   26  }
+```
+
+## shared test list-price — `__tests__/list-price.test.ts` r. 1-44
+
+`scrum4me-shared@8df7f2c:__tests__/list-price.test.ts`
+
+```ts
+    1  import { describe, expect, it } from 'vitest'
+    2  
+    3  import { LIST_PRICE_PROVIDERS, listPriceCardForRuntime, listPriceKey, priceRowKey } from '../lib/list-price'
+    4  
+    5  describe('listPriceCardForRuntime', () => {
+    6    it('maps CLAUDE to anthropic and CODEX to openai at API/USD standard', () => {
+    7      expect(listPriceCardForRuntime('CLAUDE')).toEqual({ provider: 'anthropic', billing_mode: 'API', billing_unit: 'USD', service_tier: 'standard' })
+    8      expect(listPriceCardForRuntime('CODEX')).toEqual({ provider: 'openai', billing_mode: 'API', billing_unit: 'USD', service_tier: 'standard' })
+    9    })
+   10  
+   11    it.each(['HARNESS', 'claude', '', 'toString', '__proto__'])('has no card for %j', runtime => {
+   12      expect(listPriceCardForRuntime(runtime)).toBeNull()
+   13    })
+   14  
+   15    it('covers exactly the priced runtimes', () => {
+   16      expect(Object.keys(LIST_PRICE_PROVIDERS).sort()).toEqual(['CLAUDE', 'CODEX'])
+   17    })
+   18  })
+   19  
+   20  describe('priceRowKey and listPriceKey', () => {
+   21    const row = { runtime: 'CODEX', provider: 'openai', model_id: 'gpt-5.5', billing_mode: 'API', billing_unit: 'USD', service_tier: 'standard' }
+   22  
+   23    it('keys a stored row the same way as the list-price lookup', () => {
+   24      expect(listPriceKey('CODEX', 'gpt-5.5')).toBe(priceRowKey(row))
+   25    })
+   26  
+   27    it('distinguishes rows that share a model_id', () => {
+   28      const keys = new Set([
+   29        priceRowKey(row),
+   30        priceRowKey({ ...row, billing_mode: 'SUBSCRIPTION', billing_unit: 'CREDITS' }),
+   31        priceRowKey({ ...row, billing_mode: 'SUBSCRIPTION', billing_unit: 'USD_PROXY' }),
+   32        priceRowKey({ ...row, runtime: 'CLAUDE', provider: 'anthropic' }),
+   33        priceRowKey({ ...row, service_tier: 'priority' }),
+   34      ])
+   35      expect(keys.size).toBe(5)
+   36    })
+   37  
+   38    it('trims the model and returns null without a runtime card or a model', () => {
+   39      expect(listPriceKey('CLAUDE', ' claude-opus-5-5 ')).toBe(listPriceKey('CLAUDE', 'claude-opus-5-5'))
+   40      expect(listPriceKey('HARNESS', 'gpt-5.5')).toBeNull()
+   41      expect(listPriceKey('CODEX', null)).toBeNull()
+   42      expect(listPriceKey('CODEX', '  ')).toBeNull()
+   43    })
+   44  })
+```
+
+## shared test harness-schema: opzet — `__tests__/harness-schema.test.ts` r. 1-40
+
+`scrum4me-shared@8df7f2c:__tests__/harness-schema.test.ts`
+
+```ts
+    1  import { readFileSync } from 'node:fs'
+    2  import { describe, expect, it } from 'vitest'
+    3  import { HARNESS_CONFIGURATION_NAME, HARNESS_COST_SOURCES, HARNESS_JOB_KINDS } from '../lib/harness-config'
+    4  
+    5  // M45-2a (spec docs/superpowers/specs/2026-10-05-harness-runtime-design.md §5.1 en §6.2 in
+    6  // Scrum4Me): runtime HARNESS, de keuze per product en jobsoort, en het gemelde bedrag per job.
+    7  // Alleen additief; de CHECKs staan als `// SQL:`-commentaar omdat Prisma ze niet kan uitdrukken
+    8  // (de SQL zelf schrijft de migratie in Scrum4Me).
+    9  const schema = readFileSync(new URL('../prisma/schema.prisma', import.meta.url), 'utf8')
+   10  const schemaLines = schema.split('\n')
+   11  
+   12  const block = (kind: 'model' | 'enum', name: string) =>
+   13    schema.match(new RegExp(`${kind} ${name} \\{[\\s\\S]*?\\n\\}`))?.[0] ?? ''
+   14  
+   15  // De regels binnen de accolades, met witruimte samengevouwen: de test hangt zo niet af van de
+   16  // kolomuitlijning in het schema.
+   17  const bodyLines = (kind: 'model' | 'enum', name: string) =>
+   18    block(kind, name)
+   19      .split('\n')
+   20      .slice(1, -1)
+   21      .map((line) => line.trim().replace(/\s+/g, ' '))
+   22      .filter(Boolean)
+   23  const fieldLines = (name: string) =>
+   24    bodyLines('model', name).filter((line) => !line.startsWith('//') && !line.startsWith('@@'))
+   25  const attributeLines = (name: string) => bodyLines('model', name).filter((line) => line.startsWith('@@'))
+   26  
+   27  // De n-de regel direct boven `model <name> {`: 1 = `// SQL:`, 2 = `///`.
+   28  const lineAboveModel = (name: string, n: number) => schemaLines[schemaLines.indexOf(`model ${name} {`) - n]
+   29  const quotedList = (values: readonly string[]) => values.map((value) => `'${value}'`).join(',')
+   30  
+   31  describe('M45-2a: enum AgentRuntime', () => {
+   32    it('bevat CLAUDE, CODEX en HARNESS, in die volgorde (HARNESS is achteraan toegevoegd)', () => {
+   33      expect(bodyLines('enum', 'AgentRuntime')).toEqual(['CLAUDE', 'CODEX', 'HARNESS'])
+   34    })
+   35  })
+   36  
+   37  describe('M45-2a: ProductHarnessChoice', () => {
+   38    it('heeft precies de velden uit het contract, geen extra', () => {
+   39      expect(fieldLines('ProductHarnessChoice')).toEqual([
+   40        'product Product @relation(fields: [product_id], references: [id], onDelete: Cascade)',
+```
+
+## agent-harness package.json — `package.json` r. 1-44
+
+`goofy-moser-804c51@a2eb8c3:package.json`
+
+```json
+    1  {
+    2    "name": "agent-harness",
+    3    "version": "0.1.0",
+    4    "description": "Standalone agent-harness CLI: capability probe and manifest runs against OpenAI-compatible local models",
+    5    "directories": {
+    6      "doc": "docs"
+    7    },
+    8    "scripts": {
+    9      "build": "tsc",
+   10      "typecheck": "tsc --noEmit",
+   11      "lint": "eslint .",
+   12      "test": "vitest run",
+   13      "verify": "npm run lint && npm run typecheck && npm test",
+   14      "dev": "tsx src/cli.ts"
+   15    },
+   16    "repository": {
+   17      "type": "git",
+   18      "url": "https://git.jp-visser.nl/janpeter/agent-harness"
+   19    },
+   20    "author": "",
+   21    "license": "ISC",
+   22    "type": "module",
+   23    "dependencies": {
+   24      "@modelcontextprotocol/sdk": "^1.30.1",
+   25      "ajv": "^8.20.0",
+   26      "undici": "^8.11.2",
+   27      "zod": "^4.6.5"
+   28    },
+   29    "devDependencies": {
+   30      "@types/node": "^26.6.3",
+   31      "eslint": "^10.11.0",
+   32      "tsx": "^4.23.15",
+   33      "typescript": "^6.0.3",
+   34      "typescript-eslint": "^8.70.1",
+   35      "vitest": "^5.0.2"
+   36    },
+   37    "engines": {
+   38      "node": ">=22"
+   39    },
+   40    "bin": {
+   41      "harness": "dist/cli.js"
+   42    },
+   43    "private": true
+   44  }
+```
+
+## agent-harness runbook: sectie LiteLLM — `docs/runbooks/harness-service-max2.md` r. 139-145
+
+`goofy-moser-804c51@a2eb8c3:docs/runbooks/harness-service-max2.md`
+
+```markdown
+  139  ## LiteLLM
+  140  
+  141  - Eerste start: `litellm_up`. Daarna draait de container met `restart: unless-stopped`, ook na een herstart van max2.
+  142  - Upgrade (nieuw image, nieuwe modellen of config): de nieuwe bestanden komen eerst in `current`, dus via een release van agent-harness. Volgorde, na `stop-check.sh`: het commando `harness_release_update` (de dienst blijft gestopt), dan (voor 2e, stap 8.5) het commando `litellm_upgrade` en daarna `harness_probe`; de flow `upgrade_litellm` eindigt met `harness_start` en is pas daarna bruikbaar. `litellm_upgrade` controleert alle bronnen in `current`, kopieert `harness.json`, `config.yaml`, `compose.yml` en de brug-unit naar `/etc` (de vorige als `<bestand>.bak-<tijdstip>`), herstart de brug, haalt het image op en maakt de container opnieuw. **Na een mislukte `litellm_upgrade`** (exit 74 in `pull` of `up`): draai `litellm_upgrade` opnieuw vóór elke probe; de oude container kan nog de oude config draaien terwijl de nieuwe bestanden al staan (en dus de nieuwe hash hebben). Alleen `install` (als het bestand ontbreekt) en `litellm_upgrade` installeren deze bestanden; `release-update` doet dat niet. `litellm_upgrade` neemt `harness.json` dus uit `current` over: controleer daarna `allow` (een eigen toollijst, zie "Toollijst aanpassen", staat dan in `harness.json.bak-<tijdstip>`). Draai `litellm_up` eerst op een host die LiteLLM nog nooit draaide: de herstart van de brug wacht op het netwerk `br-litellm`.
+  143  - De image-digest in `compose.yml` is vastgepind (LiteLLM houdt de providersleutels); eigen code (harness, MCP) wordt niet vastgepind.
+  144  - **Live kostenkaart (ISS-5).** LiteLLM haalt bij elke containerstart zijn model-kostenkaart van GitHub (`main`), ook met een vastgepind image; alleen `LITELLM_LOCAL_MODEL_COST_MAP=True` zet dat uit. Voor OpenRouter staat 1.83.3 `reasoning_effort` alleen toe als die kaart het model als `supports_reasoning` kent, en sinds 2026-10-09 bevat de kaart geen `openrouter/*`-rijen meer (LiteLLM-PR's #45665–#45669). Daarom draagt `qwen3.8-or` in `config.yaml` `model_info: { supports_reasoning: true }`: de router registreert dat onder `openrouter/qwen/qwen3.8-27b`, onafhankelijk van de kaart. Een nieuwe OpenRouter-configuratie met `reasoningEffort` heeft hetzelfde blok nodig. Een herstart van de container (reboot, `litellm_upgrade`) kan dus gedrag veranderen zonder dat de hash verandert; een probe die ineens faalt met `UnsupportedParamsError` wijst hierop. De kosten per antwoord komen uit OpenRouter's `usage.cost` en hangen niet van de kaart af.
+  145  
+```
+
+## Consumenten van de oude naamlijst (S4-T1), origin/main op 2026-10-20
+
+```text
+-- Scrum4Me (https://git.jp-visser.nl/janpeter/Scrum4Me.git) @ 2bd0e46b
+origin/main:app/(app)/chat/[id]/page.tsx:5:import { isHostedHarnessConfiguration } from '@shared/harness-config'
+origin/main:app/(app)/chat/[id]/page.tsx:34:        hosted: isHostedHarnessConfiguration(view.chat.configuration),
+origin/main:app/(app)/chat/layout.tsx:6:import { isHostedHarnessConfiguration } from '@shared/harness-config'
+origin/main:app/(app)/chat/layout.tsx:57:              hosted: isHostedHarnessConfiguration(m.model_id),
+origin/main:components/agent-chat/chat-window.tsx:50:    /** isHostedHarnessConfiguration(configuration), op de server bepaald. */
+origin/main:components/agent-chat/model-picker.tsx:26:  /** Zie isHostedHarnessConfiguration: alles buiten de lokale lijst is gehost. */
+-- scrum4me-workers (https://git.jp-visser.nl/janpeter/scrum4me-workers.git) @ 198eb59
+   (geen treffers)
+-- scrum4me-mcp-stable (https://git.jp-visser.nl/janpeter/scrum4me-mcp.git) @ 511912a
+   (geen treffers)
+-- scrum4me-copilot (https://git.jp-visser.nl/janpeter/scrum4me-copilot.git) @ 800df7a
+   (geen treffers)
+-- Ops-dashboard (https://git.jp-visser.nl/janpeter/Ops-dashboard.git) @ 70245304c
+   (geen treffers)
+```

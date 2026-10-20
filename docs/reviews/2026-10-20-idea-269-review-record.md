@@ -91,3 +91,46 @@ De eerste poging om ook codebestanden te pinnen werd geweigerd met `DISPATCH_INV
 ## Plan-fase
 
 Het plan staat als repobestand `docs/plans/2026-10-20-idea-269-plan.md`, met de YAML-frontmatter die `update_idea_plan_md` valideert. Het is gebonden aan spec rev 4 en volgt besluit 13 (`agent_model_facts`). Ten opzichte van ProductDoc `IDEA-269-plan` rev 2 is het herschreven.
+
+### Plan-ronde 1 (plan, commit `a2eb8c3`)
+
+**Reviewers**
+
+| | CODEX | CLAUDE |
+|---|---|---|
+| request | `f0964637-9f07-4794-8e72-cddb510d1dba` | `4105a64a-c9b1-4318-a4b6-5463ddc32f4e` |
+| root | `81b96e5e-2700-4cb9-b69f-4cbb2d416d30` | `084c90cc-c357-4ae0-bc7a-d64b35da65ee` |
+| key | `aa99dde2-0ad3-4f94-812b-97ccc1e7aaf6` | `675ab74c-9391-42c7-9ceb-d8ad63126b86` |
+| idea_link | linked (PLAN) | linked (PLAN) |
+| uitslag | 0 BLOCKER / 2 MAJOR / 1 MINOR, **NO-GO** | 0 BLOCKER / 1 MAJOR / 8 MINOR, **NO-GO** |
+
+**Pins:**
+- `plan`: sha256 `5abe44e3…`;
+- `spec`: sha256 `820e2f41…`;
+- `evidence`: sha256 `b96b7a71…`;
+- `/work` = Scrum4Me `178811a3`.
+
+**Bepalende bevindingen.** Alle drie de MAJORs zijn door de orchestrator in de tree geverifieerd.
+
+| Bevinding | Bron | Oordeel | Verwerking |
+|---|---|---|---|
+| De code-taken van S2 en S3 laten een agent productie deployen. Daarvoor is een eigen operatorautorisatie nodig (`db-access-policy.md:449`). De eerste deploy stopt met exit 3 tot JP **Approve Policy Hash** draait (`:137-162`, `:346-349`), en de volgorde "workers na S2" is alleen proza. | Claude MAJOR | terecht | S2-T2 en S3-T3 stoppen na de merge, met een expliciet deployverbod. De uitrol staat als geordende JP-stappen in S4-T3: exit 3, Approve Policy Hash, deploy met migrate en apply/check, wrapper-precheck, SELECT-controles, en pas dan workers. S2- en S3-acceptatie, volgordetabel en risico's zijn bijgewerkt. |
+| De praktijkproef gebruikt `status` (Prisma-migratiestatus) als policy-check. `status` stelt geen fingerprint-gelijkheid vast (`db-access-policy.md:40-46`, `:207`). | Codex MAJOR | terecht | S4-T3 stap 1 noemt de apply/check van de deploy als releasepoort; stap 2 is de read-only wrapper-`precheck` als observatiebewijs. `status` staat er expliciet bij als onvoldoende. Alleen geredigeerde fase-uitkomsten worden gelogd. |
+| Geen taak doet `npm run build` voor workers (spec §5.1). Workers-CI draait alleen `verify`. | Codex MAJOR, Claude MINOR 6 | terecht | S3-T3-verificatie en S3-acceptatie: `npm run verify` en `npm run build`. |
+
+**Overige bevindingen**
+
+| Bevinding | Bron | Oordeel | Verwerking |
+|---|---|---|---|
+| Workers' `gen-schema.sh` schrijft naar stdout; S3-T1 gebruikte de Scrum4Me-aanroep. | Claude MINOR 1, Codex MINOR | terecht (geverifieerd: workers `scripts/gen-schema.sh`, `package.json:6-11`) | Commando met `> prisma/schema.prisma`. `postinstall` wordt bewust niet gebruikt, omdat `\|\| true` fouten verbergt. Controle met `grep`: het schema is gitignored. |
+| "Gegroepeerd per onderliggend model" kan in I1 niet: REMOTE-rijen hebben geen upstream na de backfill. | Claude MINOR 2 | terecht | S4-T3 stap 5: "feitelijk op model_id gesorteerd; upstream volgt in I2" |
+| S1-SHA, migratietimestamp en de submodule-pointer staan niet in de S2-T1-tekst. | Claude MINOR 3 | terecht | Commando om de S1-SHA te vinden, timestamp na de laatste map, pointer meecommitten, oude schema via `git show origin/main:prisma/schema.prisma` (Scrum4Me trackt het schema) |
+| Testdetails: observer SELECT is niet gepind; de statementlijst mist INSERT; de Enums-tabel ontbreekt. | Claude MINOR 4 | terecht (geverifieerd: `access-checklist-contract.test.ts:33-52`, `access-checklist-migration.test.ts:64-112`, `data-model.md:966`) | S2-T1 stap 4: exacte `privileges` incl. observer, statementlijst met `INSERT INTO "agent_model_facts"`, `pinnedTables` bevat agent_models. Stap 5: rij in de Enums-tabel. Nagegaan: de `pinnedTableViolations`-scan raakt `INSERT … SELECT FROM "agent_models"` niet, en `migrateAdditive` draait als `scrum4me` (eigenaar). |
+| Driftcheck: DB-pad, volledige YAML-paden, een merge-test die kan falen, exit-2-gevallen en foutteksten | Claude MINOR 5 | terecht | S3-T3: `lib/prisma.ts` (geen server-only, geen dotenv, dus DATABASE_URL verplicht, anders exit 2), precedent `scripts/check-review-source.ts`, volledig pad `litellm_params.extra_body.provider.quantizations`, een fixture die alleen via `<<` klopt plus een negatieve parse, exit-2-gevallen uitgeschreven. S3-T2: de fouttekst komt letterlijk uit de shared-module. |
+| De grep in S4-T1 is niet uitvoerbaar en heeft geen stop. | Claude MINOR 7 | terecht | Clone-URL's en een stop-voorwaarde (treffer → niets verwijderen). De stand per repo op 2026-10-20 staat in de evidence. |
+| Validators die pas in I2 nodig zijn; de DB-rolstap is afleidbaar | Claude MINOR 8 | deels | De validators blijven: spec §4.2 legt ze in I1 vast, en het is bewust gehouden. De DB-rolstap is een notitie geworden (alleen web en preparedWeb schrijven in agent_models, `scrum4me.json:2576-2591`). |
+| Externe bestanden zijn niet te verifiëren uit de evidence. | Codex MINOR | terecht | Evidence aangevuld (achteraan; eerdere regelnummers ongewijzigd): workers `gen-schema.sh`, `prisma.config.ts`, `lib/prisma.ts`, `.gitignore`, `check-review-source.ts`, DataTable, `useLocalTableSort` en de opzet van beide tests; shared `package.json`, list-price-test en harness-schema-test; agent-harness `package.json` en de runbooksectie LiteLLM; consumenten-grep. |
+
+**Eigen vondst bij de verificatie.** S4-T2 noemde "het recept voor het toevoegen of wijzigen van een configuratie" in `harness-service-max2.md`. Zo'n recept bestaat niet. De taak wijst nu de bullet "Upgrade (nieuw image, nieuwe modellen of config)" in `## LiteLLM` aan.
+
+**Scope-delta:** geen werk toegevoegd aan de code-taken. De uitrol staat nu expliciet als JP-stappen in S4-T3; dat werk was er al impliciet. Workers krijgt één extra verificatiecommando (`build`). Eerste resultaat en praktijkproef blijven gelijk. De proef valt nu bewust na een gecontroleerde uitrol.
