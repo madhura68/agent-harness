@@ -599,3 +599,61 @@ export function createTaskTools(opts: TaskToolsOptions): ToolRegistry {
     },
   }
 }
+
+export type ReadOnlyToolsOptions = {
+  /** Review root; every path argument is resolved against it and may never escape it. */
+  root: string
+  /** Test-only overrides for `search`'s internal bounds; see TaskToolsOptions. */
+  searchLimits?: TaskToolsOptions['searchLimits']
+}
+
+const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set(['list_files', 'read_file', 'search'])
+
+/**
+ * In-process ToolRegistry with only the three read tools of createTaskTools (same definitions, limits and
+ * path rules), bounded to `opts.root`. There is no write, edit or test tool and no write path behind the
+ * registry: any other name is answered UNKNOWN_TOOL.
+ */
+export function createReadOnlyTools(opts: ReadOnlyToolsOptions): ToolRegistry {
+  const root = resolve(opts.root)
+  const realRoot = realpathSync(root)
+  const searchBounds: SearchBounds = {
+    totalBytesCap: opts.searchLimits?.totalBytesCap ?? MAX_SEARCH_TOTAL_BYTES,
+    timeoutMs: opts.searchLimits?.timeoutMs ?? SEARCH_TIMEOUT_MS,
+    perFileTimeoutMs: opts.searchLimits?.perFileTimeoutMs ?? SEARCH_PER_FILE_TIMEOUT_MS,
+    now: opts.searchLimits?.now ?? Date.now,
+  }
+
+  const entries: ToolSnapshotEntry[] = TOOL_DEFS.filter((t) => READ_ONLY_TOOL_NAMES.has(t.name))
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }))
+  const snapshot: ToolSnapshot = Object.freeze({
+    entries,
+    hash: createHash('sha256').update(JSON.stringify(entries)).digest('hex'),
+  })
+
+  return {
+    snapshot,
+    toOpenAiTools(): ToolDef[] {
+      return entries.map((e) => ({
+        type: 'function',
+        function: { name: e.name, ...(e.description ? { description: e.description } : {}), parameters: e.inputSchema },
+      }))
+    },
+    async execute(name, args, signal): Promise<ToolExecResult> {
+      switch (name) {
+        case 'list_files':
+          return listFiles(root, realRoot, args.path)
+        case 'read_file':
+          return readFile(root, realRoot, args)
+        case 'search':
+          return search(root, realRoot, args, signal, searchBounds)
+        default:
+          return { ok: false, errorCode: 'UNKNOWN_TOOL', content: 'tool not in snapshot', truncated: false }
+      }
+    },
+    async close(): Promise<void> {
+      // In-process: nothing to release.
+    },
+  }
+}
