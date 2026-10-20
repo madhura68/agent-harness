@@ -87,3 +87,7 @@ De eerste poging om ook codebestanden te pinnen werd geweigerd met `DISPATCH_INV
 | Een latere ALTER op `agent_model_facts` moet in `additiveFollowUpMigrationIds` | Claude | terecht | §3 en §4.7 |
 
 **Scope-delta:** geen. Alleen verduidelijkingen en een smallere actie in I1 (alleen aanmaken). De spec-fase is afgerond met dubbel GO.
+
+## Plan-fase
+
+Het plan staat als repobestand `docs/plans/2026-10-20-idea-269-plan.md`, met de YAML-frontmatter die `update_idea_plan_md` valideert. Het is gebonden aan spec rev 4 en volgt besluit 13 (`agent_model_facts`). Ten opzichte van ProductDoc `IDEA-269-plan` rev 2 is het herschreven.
