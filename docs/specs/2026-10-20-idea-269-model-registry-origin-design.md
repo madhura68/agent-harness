@@ -2,12 +2,20 @@
 title: "IDEA-269 — Herkomst en modelfeiten in de model-registry"
 status: draft
 last_updated: 2026-10-20
-revision: 3
+revision: 4
 ---
 
 # IDEA-269 — Herkomst en modelfeiten in de model-registry
 
 Spec voor IDEA-269 "Toevoegen remote en lokale modellen". Ze bouwt op de grill van 2026-10-20 (grill-doc revisie 2; beslissingen staan als DECISION in de idee-tijdlijn). Waar deze spec een keuze maakt die de grill openliet, staat dat er expliciet bij. Deze repo-kopie is leidend tijdens de review-loop; de ProductDoc `IDEA-269-spec` (product Agent-harness) wordt na de loop gelijkgetrokken.
+
+**Revisie 4** (na review-ronde 2, beide GO): de MINORs van ronde 2 zijn verwerkt.
+- Het precedent wordt aangehaald via bestanden in de tree (§3).
+- Parameteraantallen mogen decimalen hebben (§4.2).
+- De opzoeking in `getAgentChatView` staat vóór de jobs/berichten-reeks, en de bestaande mocks worden aangepast (§4.4).
+- De facts-rij wordt in I1 alleen aangemaakt, nooit omgezet (§4.5).
+- Migratie en contract zijn klaar voordat het webproces verkeer krijgt; `data-model.md` wordt bijgewerkt (§4.3).
+- §4.7 noemt `additiveFollowUpMigrationIds`.
 
 **Revisie 3** (na review-ronde 1; record: `docs/reviews/2026-10-20-idea-269-review-record.md`):
 - **De nieuwe velden komen niet op `agent_models`, maar in een nieuwe 1:1-tabel `agent_model_facts`** (besluit 13, JP). `agent_models` is een gesloten object van de IDEA-213-adoptie; een kolomwijziging daarop geeft `SCHEMA_DRIFT` bij elke deploy.
@@ -81,7 +89,13 @@ JP bevestigde ook vijf spec-keuzes (2026-10-20):
   - `publicPrivileges` leeg;
   - geen `columnGrants`.
 
-  Precedent `0a56c53b` (`20261019120000_product_access_steps`) heeft precies de vorm die hier nodig is: een nieuwe enum, een nieuwe tabel, een FK met `ON DELETE CASCADE` naar een gesloten tabel (`products`), en een additief contract met CRUD voor `web`/`preparedWeb`. Het enumtype staat niet in de catalogus en krijgt geen contract. De commit raakte de submodule-pin, het gegenereerde schema, `migration.sql`, het profiel en twee tests (`__tests__/db/access-checklist-migration.test.ts`, `__tests__/lib/db-access/access-checklist-contract.test.ts`), maar niet `provision.ts` of `contract-inventory.ts`.
+  Precedent `product_access_steps` (IDEA-267) heeft precies de vorm die hier nodig is: een nieuwe enum, een nieuwe tabel, een FK met `ON DELETE CASCADE` naar een gesloten tabel (`products`), en een additief contract met CRUD voor `web`/`preparedWeb`. Het enumtype staat niet in de catalogus en krijgt geen contract. In de tree staat het precedent op deze plekken:
+  - `prisma/migrations/20261019120000_product_access_steps/migration.sql`;
+  - de contractregel achteraan `contracts` in `scripts/db-access/profiles/scrum4me.json`;
+  - de tests `__tests__/db/access-checklist-migration.test.ts` en `__tests__/lib/db-access/access-checklist-contract.test.ts`;
+  - een sectie in `docs/architecture/data-model.md`.
+
+  `scripts/queue-dispatch/provision.ts:31` leidt de additieve migratie-ids zelf af uit de contracten (`splitAdditiveContracts`), dus `provision.ts` en `contract-inventory.ts` hoeven voor een nieuwe tabel niet te veranderen. Een latere migratie die een additieve tabel wijzigt, moet wel in `additiveFollowUpMigrationIds` (`contract-inventory.ts:10`).
 - **Een FK naar `agent_models` verandert de fingerprint van `agent_models` niet.** De FK-constraint heeft `conrelid` = de nieuwe tabel, en de triggers die hij op `agent_models` zet zijn interne triggers (`tgisinternal`), die de fingerprint uitsluit.
 - **Rollen** (`profiles/scrum4me.json`, `roles`): `web` = `scrum4me_web_runtime`, `preparedWeb` = `scrum4me_app`, `observer` = `ops_readonly`, `dispatch`, `projector`, `queue`. Het contract van `agent_models` geeft `web`/`preparedWeb` CRUD en `observer`/`dispatch` SELECT.
 - **Uitrol** gaat alleen via de operator-route in de gewone web-deploy, nooit met een kale `prisma migrate deploy`. De Scrum4Me-CI heeft naast `verify` de jobs `test:dispatch` en `test:dispatch:chain` (`.github/workflows/ci.yml:166,182`); die spelen migraties en contracten af tegen een test-DB.
@@ -141,7 +155,7 @@ model AgentModel {
 }
 ```
 
-- **De back-relation op `AgentModel`** bestaat alleen in Prisma en verandert de tabel niet. Precedent: de back-relation op `Product` in `0a56c53b`.
+- **De back-relation op `AgentModel`** bestaat alleen in Prisma en verandert de tabel niet. Precedent: de back-relation op `Product` voor `ProductAccessStep` (IDEA-267).
 - **Engelse enumwaarden** volgen het patroon van `BillingMode` (keuze 1). De UI-labels zijn Abonnement, Remote en Lokaal. Het woord "herkomst" komt niet in de UI, vanwege "modelherkomst" in usage-detail.
 - **`origin` is NOT NULL op een facts-rij.** Een facts-rij bestaat alleen als iemand de herkomst bewust heeft vastgelegd.
 - **Betekenis van de velden:**
@@ -164,7 +178,8 @@ model AgentModel {
 - `validateModelFacts(runtime, facts)` geeft een lijst met leesbare fouten:
   - `origin` moet in `allowedOrigins` staan;
   - `LOCAL` vereist een `upstream_model` die met `ollama/` begint en daarna niet leeg is (de LOKAAL-regel, besluit 11);
-  - de getallen zijn gehele getallen groter dan 0, en `context_tokens` is hoogstens `max_context_tokens` als beide gezet zijn;
+  - de tokenaantallen (`context_tokens`, `max_context_tokens`, `max_output_tokens`) zijn gehele getallen groter dan 0, en `context_tokens` is hoogstens `max_context_tokens` als beide gezet zijn;
+  - de parameteraantallen (`params_total_b`, `params_active_b`) zijn eindige getallen groter dan 0, met hoogstens twee decimalen en kleiner dan 10⁸ (`Decimal(10,2)`), bijvoorbeeld `3.5`; `params_active_b` is hoogstens `params_total_b` als beide gezet zijn;
   - `capabilities` en `reasoning_efforts` komen uit de const-lijsten, zonder dubbele waarden;
   - `reasoning_efforts` mag alleen gevuld zijn als `capabilities` `reasoning` bevat;
   - `quantization` en `upstream_model` worden getrimd en zijn hoogstens 100 tekens.
@@ -255,6 +270,8 @@ De exacte DDL komt uit `prisma migrate diff` tegen het schema van `origin/main` 
 - `npm run test:dispatch` en `test:dispatch:chain` zijn groen. Die spelen de additieve migratie na de adoptie af en controleren dat `agent_models` niet afwijkt.
 
 **Uitrol** gaat in de gewone web-deploy, via de operator-route (migratie plus `applyContracts`).
+- Die twee moeten klaar zijn voordat het nieuwe webproces verkeer krijgt. Anders faalt de chat-layout op het ontbrekende SELECT-recht; dat is een fout, niet de fail-safe.
+- De Scrum4Me-PR werkt ook `docs/architecture/data-model.md` bij met een sectie `agent_model_facts`, zoals het precedent.
 
 ### 4.4 Chat (Scrum4Me)
 
@@ -262,14 +279,16 @@ Eén pure functie zet de herkomst om naar `hosted`: `isHostedOrigin`.
 
 - **`app/(app)/chat/layout.tsx`:** de bestaande `agentModel.findMany` krijgt `facts: { select: { origin: true } }` in de select. Het samenstellen van de opties verhuist naar een pure functie in `lib/agent-chat/` (bijv. `toChatModelOptions(rows)`), met `hosted: isHostedOrigin(row.facts?.origin)`.
 - **`app/(app)/chat/[id]/page.tsx`:**
-  - `getAgentChatView` (`lib/agent-chat/chats-server.ts`) zoekt de herkomst van `chat.configuration` op, met `agentModel.findFirst({ where: { runtime: 'HARNESS', model_id }, select: { facts: { select: { origin: true } } } })`. Er is bewust geen `active`-filter.
+  - `getAgentChatView` (`lib/agent-chat/chats-server.ts:244`) zoekt de herkomst van `chat.configuration` op, met `agentModel.findFirst({ where: { runtime: 'HARNESS', model_id }, select: { facts: { select: { origin: true } } } })`. Er is bewust geen `active`-filter.
+  - De opzoeking gebeurt direct na het ophalen van de chat, vóór de reeks "jobs vóór berichten" (`chats-server.ts:258`), zodat die volgorde-garantie niet verandert.
   - Hij levert `origin: ModelOrigin | null`, en de pagina zet `hosted: isHostedOrigin(view.origin)`.
 - **Het label volgt de herkomst, niet `active`** (keuze 3). Een inactieve LOCAL-configuratie toont geen "gehost"; verzenden wordt bij een inactieve configuratie al geweigerd. Zonder registry-rij of facts-rij is de herkomst `null`, dus gehost.
 - **Commentaar bijwerken:** de JSDoc in `components/agent-chat/model-picker.tsx:26` en `components/agent-chat/chat-window.tsx:50` noemt `isHostedHarnessConfiguration`. Die regels worden bijgewerkt naar `isHostedOrigin`.
 - **Tests:**
-  - `getAgentChatView` met een gemockte `db` (zoals `__tests__/lib/agent-chat-view.test.ts`). Hij levert LOCAL, REMOTE of `null`, en de query heeft geen `active`-filter; die wordt in de mock-aanroep geasserteerd.
-  - `toChatModelOptions`: LOCAL geeft niet-gehost, ook bij een inactieve rij; REMOTE, SUBSCRIPTION en een ontbrekende facts-rij geven gehost.
-  - De bestaande tests van `model-picker` en `chat-window` blijven ongewijzigd groen.
+  - `getAgentChatView` met een gemockte `db` (`__tests__/lib/agent-chat-view.test.ts`). Hij levert LOCAL, REMOTE of `null` (geen rij of geen facts), de query heeft geen `active`-filter (geasserteerd op de mock-aanroep), en een inactieve LOCAL-rij geeft LOCAL.
+  - De bestaande mocks in dat bestand (`makeDb` en de `db` van de interleave-test) krijgen een `agentModel.findFirst`. De interleave-test blijft bewijzen dat jobs vóór berichten gelezen worden.
+  - `toChatModelOptions`: LOCAL geeft niet-gehost; REMOTE, SUBSCRIPTION en een ontbrekende facts-rij geven gehost. Er is geen inactief geval: de layout-query filtert op `active: true`.
+  - De bestaande tests van `model-picker` en `chat-window` blijven ongewijzigd groen. Het chain-stadium (`__tests__/queue-dispatch-chain/agent-chat-web.integration.test.ts`) roept `getAgentChatView` aan met de web-rol op een echte DB en raakt daarmee het SELECT-recht op `agent_model_facts`.
 - **In dezelfde PR:** de submodule-bump naar de shared-commit uit §4.1–4.2, `gen-schema`, de migratie en het contract (§4.3).
 
 ### 4.5 `/settings/models` in drie secties (workers, I1)
@@ -293,13 +312,15 @@ Eén pure functie zet de herkomst om naar `hosted`: `isHostedOrigin`.
 - Bij HARNESS komt er een verplichte keuze **Remote / Lokaal**, zonder voorkeuze, en een veld "onderliggend model": verplicht bij Lokaal (met de `ollama/`-hint), optioneel bij Remote.
 - **`actions/model-registry.ts`:**
   - het strikte HARNESS-schema krijgt `origin` (`REMOTE` | `LOCAL`) en `upstream_model` erbij, en valideert met `validateModelFacts` vóór elke DB-aanroep;
-  - in dezelfde transactie als de `agentModel.upsert` volgt een `agentModelFacts.upsert` op `agent_model_id` met `origin` en `upstream_model`;
+  - in dezelfde transactie als de `agentModel.upsert` wordt de facts-rij alleen **aangemaakt** (create-only), met `origin` en `upstream_model`;
+  - bestaat er al een facts-rij (de bestaande actie is een upsert, dus een bekende naam is een update), dan blijft die ongemoeid. Wijkt de opgegeven herkomst af, dan weigert de actie met "De herkomst van een bestaande configuratie wijzig je via Bewerken." Herkomst wijzigen is I2 (§4.7), en zo ontstaat er geen ongemerkt pad van gehost naar lokaal;
   - CLAUDE/CODEX krijgen geen facts-rij.
 - **Tests:**
   - de editor rendert drie secties, met elke rij in de juiste sectie, ook een HARNESS-rij zonder facts;
   - HARNESS zonder keuze wordt geweigerd zonder DB-aanroep;
   - Lokaal zonder of met een verkeerd `ollama/`-model wordt geweigerd, met de exacte fout;
-  - de facts-upsert gebeurt in dezelfde transactie;
+  - de facts-rij wordt in dezelfde transactie aangemaakt;
+  - een bestaande naam met een andere herkomst wordt geweigerd, en een bestaande facts-rij blijft ongewijzigd;
   - de HARNESS-payload heeft precies de nieuwe sleutels;
   - sorteren per sectie.
 
@@ -362,6 +383,7 @@ Dit wijkt bewust af van `db:sync-model-prices` in Scrum4Me, dat ook bij drift 0 
   - onderliggend model, context in gebruik, maximale context, max output tokens, quantisatie, parameters totaal en actief;
   - capabilities als aankruisvakjes, en reasoning-efforts als aankruisvakjes die alleen actief zijn als `reasoning` aan staat.
 - **Nieuwe actie:** `updateModelFactsAction(agentModelId, input)`, met een strikt zod-schema, `validateModelFacts` en `requireWorkersAdmin`. Hij doet een upsert van de facts-rij. Voor CLAUDE/CODEX wordt `origin` daarbij server-side `SUBSCRIPTION`.
+- I2 werkt binnen de kolommen van I1. Een extra kolom zou een migratie op een additieve tabel zijn, die in `additiveFollowUpMigrationIds` (`contract-inventory.ts:10`) moet; daarom staan alle feitkolommen al in I1.
 - **Tests:**
   - elke validatieregel komt aan in de UI;
   - een mislukte opslag houdt het paneel open;
@@ -408,7 +430,7 @@ Dit wijkt bewust af van `db:sync-model-prices` in Scrum4Me, dat ook bij drift 0 
    - elke HARNESS-rij heeft een facts-rij: `gsq-lokaal` LOCAL met `upstream_model = 'ollama/qwen3.8-gsq-rco:27b-iq3_s-text'`, de rest REMOTE;
    - CLAUDE/CODEX hebben geen facts-rij.
 3. **Geen import of aanroep meer** van `HARNESS_LOCAL_CONFIGURATIONS` of `isHostedHarnessConfiguration`, ook niet in commentaar. Een grep op `origin/main` van shared, Scrum4Me, workers, scrum4me-mcp, scrum4me-copilot en Ops-dashboard, na stap 4, geeft nul treffers buiten docs en buiten de submodulemap `vendor/`.
-4. De chat-modelkiezer en de chatpagina tonen "gehost" voor elke configuratie behalve `gsq-lokaal` (actief of niet). Een configuratie zonder registry- of facts-rij geldt als gehost.
+4. De chat-modelkiezer toont "gehost" bij elke actieve configuratie behalve `gsq-lokaal`. De chatpagina doet hetzelfde, ook als de configuratie inactief is. Een configuratie zonder registry- of facts-rij geldt als gehost.
 5. `/settings/models` toont drie secties met de kolommen uit §4.5. Een HARNESS-rij toevoegen zonder keuze, of als Lokaal zonder `ollama/`-model, wordt geweigerd. Een geldige HARNESS-rij krijgt in dezelfde transactie haar facts-rij.
 6. **Driftcheck tegen productie en agent-harness `main`:** nul bevindingen in (c) en (d).
    - De proef wordt beoordeeld op die twee secties, niet op de exitcode.
@@ -425,7 +447,7 @@ Dit wijkt bewust af van `db:sync-model-prices` in Scrum4Me, dat ook bij drift 0 
 ## 6. Risico's en open punten
 
 - **Additief contract.** De voorwaarden en het precedent staan in §3. Het contract-testbestand (§4.3) en `test:dispatch` bewijzen ze vóór de merge. Faalt `splitAdditiveContracts` toch, dan stopt de taak en gaat de vraag naar JP; er komt geen ander db-access-pad.
-- **De workers-DB-rol.** Het contract geeft `web` en `preparedWeb` dezelfde rechten als op `agent_models`. Welke van de twee workers gebruikt, controleert de workers-taak, zodat de facts-upsert niet op een ontbrekend recht stuit.
+- **De workers-DB-rol.** Het contract geeft `web` en `preparedWeb` dezelfde rechten als op `agent_models`. Welke van de twee workers gebruikt, controleert de workers-taak, zodat het aanmaken van de facts-rij niet op een ontbrekend recht stuit.
 - **Workers-bump.** Die neemt `c79f6e3` en `cd01a69` mee, die al in de DB staan. De workers-taak moet ook met die wijzigingen groen zijn.
 - **De LOKAAL-regel is een afspraak.** Zie §4.2. De driftcheck en de runbookstap zijn de borging. Er komt geen CHECK-constraint (keuze 5).
 - **Quant-namen** zijn vrije tekst, dus de vergelijking in de driftcheck is voor LOCAL een substring-controle. Dat is bewust grof.
