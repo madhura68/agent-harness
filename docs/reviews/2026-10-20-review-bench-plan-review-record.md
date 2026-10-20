@@ -155,7 +155,7 @@ JP koos "Eerst delta-ronde": de drie MINORs van ronde 4 gaan alsnog in het plan 
 
 | Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
 |---|---|---|---|---|---|
-| CODEX | `0252dee1-bf64-435d-82ef-dc63c0608c18` | `b06e51a4-7909-4474-a3b9-6c2559773a39` | `8900c30d-4061-4c06-bacd-d07ced499305` | linked (PLAN) | **NO-GO** 0/1/0 |
+| CODEX | `0252dee1-bf64-435d-82ef-dc63c0608c18` | `b06e51a4-7909-4474-a3b9-6c2559773a39` | `8900c30d-4061-4c06-bacd-d07ced499305` | linked (PLAN) | **NO-GO** 0/1/0 (job `bc3d0e58-4ccb-4924-921f-5dbb1a7ade95`) |
 
 **C4-m2 en C4-m3 houden.** De vier fakes bestaan met deze signaturen, en `seedProbe` schrijft waar `checkProbeForJob` leest. Via `over` op `configurations` kan een test hosted kiezen. `runMain` is een private helper: de nieuwe testfile bouwt dat wrappertje na ("zoals" staat dat toe). De C4-m3-zin klopt voor beide takken van retry-client.ts:117 en zet geen meting in de catch. X-M1, X2-M1 en X3-M1 blijven dicht. Er zijn geen restanten van `probe.ts`, "via spawn" of "deadline al verstreken".
 
@@ -164,3 +164,23 @@ JP koos "Eerst delta-ronde": de drie MINORs van ronde 4 gaan alsnog in het plan 
 | D1-M1 | De deadlinevariant in S1-6 zet de klok door in een sleep die nooit draait. Met `maxRetries` 3 (retry-client.ts:16, :78) gaat de derde drop nog door `onRetry` (:85). De guard gooit CostStopError vóór de sleep (:88). Zonder verlopen klok wordt het failed/MODEL_ERROR, en via de override limiet met COST_LIMIT_EXCEEDED. Daarnaast is "niet limiet" fout: mapReviewStatus regel 2 (plan:300, spec §4.1) maakt van timed_out limiet | Aanvaard; beide punten zijn tegen de tree en het plan gecontroleerd | S1-6: "deadlinevariant: de nepclient zet de klok van `deps.now` voorbij de deadline vlak vóór hij antwoord 3 teruggeeft, niet in `deps.sleep` (na de derde drop volgt geen wachttijd): `complete()` 3×, `usage.costUsd` 1.20, runStatus `timed_out`, status `limiet` en geen `error`". De catch ziet de verlopen klok (run.ts:373), en de override voor alleen MODEL_ERROR laat timed_out staan |
 
 **Scope-delta d1.** Geen; één testregel is vervangen. Het eerste bruikbare resultaat en de praktijkproef blijven gelijk. Revisie 8 heeft 63 487 tekens, en S1-6 6 699.
+
+## Delta-ronde 2: revisie 8 (`25be81bfed03f9a9bba0d42414f80508ba48c636`)
+
+**Pins:** `plan` @`25be81bf`, sha256 `6fe27726b72bcc48122dc64d2b732cd30adbf35d2170ca74a2d94c8c33f209b4`, 63 487 tekens; `plan-rev7` @`2895f254`, sha256 `c2e20f75c4af3c93c83b9bf1f18bb5ca2bf4676c9d2fd5c43e5018d5e2ba49ad`. Repository: `agent-harness@25be81bf`.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `6309cc8f-b177-4ce4-8eb4-d61ecca8bed6` | `35ce7f08-c777-49a9-9cab-8670ae38dbb7` | `9ca1420e-bf5d-48cf-9b75-0623c70b4be3` | linked (PLAN) | **GO** 0/0/0 (job `77f43e48-9d75-436a-9082-d2d02d5d8246`) |
+
+**D1-M1 houdt.** De reviewer volgde het pad door de tree:
+- het derde antwoord gaat nog door `onRetry` en de guard (retry-client.ts:85, cost.ts:90-110);
+- de CostStopError komt in de catch, en run.ts:373 geeft timed_out vóór de MODEL_ERROR-tak, zonder `error`;
+- de override (plan:293) laat de run staan, en mapReviewStatus geeft limiet;
+- `usage.costUsd` is 1.20 uit drie retry-records, zonder dubbeltelling.
+
+De test vangt het defect: een onvoorwaardelijke override zou COST_LIMIT_EXCEEDED toevoegen en de assertie "geen `error`" breken. C4-m2, C4-m3, X-M1, X2-M1 en X3-M1 blijven dicht.
+
+**GO: de delta is klaar** (revisie 8, `25be81bf`). Volgens JP's keuze ("pas na GO de ceremonie") volgt nu de ceremonie. Een technisch GO autoriseert geen uitvoering, merge of deployment.
+
+**Scope-delta d2.** Geen.
