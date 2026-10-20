@@ -55,14 +55,12 @@ stories:
           - `search` vindt een regel in `sources/doc`.
 
           Acceptatie (AC1, C-m6):
-          - `git diff origin/main -- src/worker/task-tools.ts` toont alleen toegevoegde regels, allemaal na het einde van createTaskTools.
-          - `git diff origin/main --stat -- __tests__/task-tools.test.ts` is leeg, en die test is groen.
+          - `git diff origin/main...HEAD -- src/worker/task-tools.ts` toont alleen toegevoegde regels, allemaal na het einde van createTaskTools.
+          - `git diff origin/main...HEAD --stat -- __tests__/task-tools.test.ts` is leeg, en die test is groen.
 
           Verificatie: `npx vitest run __tests__/task-tools-readonly.test.ts __tests__/task-tools.test.ts`, daarna `npm run verify`.
 
           Grenzen: het productiegedrag verandert niet; geen private MacSearch-teksten, fixtures zijn synthetisch.
-
-          Commit: `feat(bench): createReadOnlyTools voor review-bench (M8)`.
       - title: "Gedeelde tracked client: weggevallen kosten en providers (C-m1)"
         priority: 2
         implementation_plan: |
@@ -75,7 +73,7 @@ stories:
           - Nieuw: src/bench/tracked-client.ts.
           - Wijzig src/bench/task-bench.ts:
             - verwijder de lokale `withDroppedCost`;
-            - vervang de wrapper uit r. 326-351 door de helper;
+            - vervang de wrapper uit r. 326-351 door de helper, en haal de dan ongebruikte imports `createRetryingClient` en `UnusableAnswerError` weg (r. 16; lint faalt anders);
             - `retries`, `providers` en `droppedLastUsd` (r. 259-262) vervallen. Declareer `let tracked: TrackedClient | undefined` vóór de try. Het resultaat (r. 465-467) gebruikt `tracked?.providers ?? []`, `tracked?.retries ?? []` en `withDroppedCost(run?.usage ?? NO_USAGE, tracked?.droppedCosts() ?? [])`, ook op de paden die eindigen vóór de client bestaat.
           - Nieuw: __tests__/bench-tracked-client.test.ts.
 
@@ -92,10 +90,9 @@ stories:
 
           Met `guard` (review-bench, plan-r1 X-M1). De live guard van runManifest ziet alleen het antwoord dat `complete()` teruggeeft (src/run.ts:330, :404; src/cost.ts:94-109). Een antwoord met finishReason `other` is betaald, maar valt weg in de retry-lus (src/bench/retry-client.ts:112-124). Daarom, in `onRetry`, ná de drie stappen hierboven, alleen voor een record met kind `finish_other`:
           - `stop = guard.afterResponse(dropped) ?? guard.beforeRequest()`;
-          - `dropped` is het weggevallen antwoord als CompleteResult: `toolCalls: []`, `usage.costUsd = r.costUsd`, `provider = r.provider`, de rest nul of leeg;
-          - bij een stop: bewaar hem voor `costStop()` en gooi `new CostStopError(stop)`. Dat is vóór de wachttijd en vóór de herhaalaanvraag;
-          - een `UnusableAnswerError` (definitief weggevallen, zonder record) gaat in de catch ook als `dropped` naar de guard, met dezelfde stopregel; een stop wordt bewaard en de fout gaat ongewijzigd door.
-          Zo telt elk antwoord één keer in de guard: een weggevallen antwoord hier, het teruggegeven antwoord in runManifest. Een weggevallen hosted antwoord zonder bedrag geeft COST_UNKNOWN, net als elk ander hosted antwoord.
+          - `dropped` is het weggevallen antwoord als CompleteResult: `message: { content: null, toolCalls: [] }`, `usage.costUsd = r.costUsd`, `provider = r.provider`, de rest nul of leeg;
+          - bij een stop: bewaar hem voor `costStop()` en gooi `new CostStopError(stop)`. Dat is vóór de wachttijd en vóór de herhaalaanvraag.
+          Zo telt de guard elk antwoord één keer: een weggevallen antwoord hier, het teruggegeven antwoord in runManifest. Een `UnusableAnswerError` gaat niet naar de guard: hij komt na de laatste herhaling (de run eindigt dan) of na een onderbroken wachttijd, en dan is dat antwoord al via `onRetry` geteld (retry-client.ts:119-123). Het bedrag staat via `droppedLast` in usage. Een weggevallen hosted antwoord zonder bedrag geeft COST_UNKNOWN, net als elk ander hosted antwoord.
 
           Tests (eerst rood):
           - Eerst een antwoord met finishReason `other` en `costUsd` 0.01, daarna succes: `retries` heeft 1 record, en `withDroppedCost({..., costUsd: 0.05}, droppedCosts())` geeft 0.06 (`toBeCloseTo`).
@@ -104,15 +101,13 @@ stories:
           - Zonder `retryTransient` gaat er geen herhaling om de base heen.
           - Hosted guard met plafond "1", drie keer `other` à 0.40. Na de derde komt een CostStopError met COST_LIMIT_EXCEEDED. `base.complete` is 3× aangeroepen, `costStop()` is gezet en `droppedCosts()` telt op tot 1.20.
           - Hosted guard, één keer `other` zonder bedrag: CostStopError met COST_UNKNOWN, en `base.complete` 1×.
-          - Hosted guard, plafond "1", vier keer `other` à 0.30: UnusableAnswerError, `base.complete` 4×, en `costStop()` met COST_LIMIT_EXCEEDED.
+          - Hosted guard, één keer `other` à 0.01, daarna een stop tijdens de wachttijd: UnusableAnswerError, `costStop()` leeg, `guard.summary().responses` 1, en `droppedCosts()` telt 0.01.
           - Zonder guard en vier keer `other`: na 3 herhalingen een UnusableAnswerError, en `base.complete` 4×, zoals nu.
 
           Acceptatie:
-          - `git diff origin/main --stat -- __tests__/bench-task-bench.test.ts __tests__/bench-retry-client.test.ts` is leeg, en beide zijn groen.
+          - `git diff origin/main...HEAD --stat -- __tests__/bench-task-bench.test.ts __tests__/bench-retry-client.test.ts` is leeg, en beide zijn groen.
 
           Verificatie: `npx vitest run __tests__/bench-tracked-client.test.ts __tests__/bench-task-bench.test.ts __tests__/bench-retry-client.test.ts`, daarna `npm run verify`.
-
-          Commit: `refactor(bench): gedeelde tracked client voor dropped cost (M8, C-m1)`.
       - title: "DispatchResult-schema, validator en REVIEW_RESULT_INVALID"
         priority: 2
         implementation_plan: |
@@ -167,8 +162,6 @@ stories:
           - Een object met andere sleutelvolgorde in `documents` wordt aanvaard.
 
           Verificatie: `npx vitest run __tests__/bench-review-validator.test.ts`, daarna `npm run verify` (tsc vangt elke uitputtende switch over ErrorCode).
-
-          Commit: `feat(bench): DispatchResult-validator voor review-bench (M8)`.
       - title: "adaptReviewPrompt met getelde vervangingen A1–A6"
         priority: 2
         implementation_plan: |
@@ -207,8 +200,6 @@ stories:
           - Met één extra `` `/work` `` gooit de functie, met een fout die A3 noemt.
 
           Verificatie: `npx vitest run __tests__/bench-review-prompt.test.ts`, daarna `npm run verify`.
-
-          Commit: `feat(bench): adaptReviewPrompt (M8)`.
       - title: "Review-case-lader met hashcontrole en werkmap"
         priority: 2
         implementation_plan: |
@@ -231,7 +222,7 @@ stories:
             - `limits`: `{ maxTurns, maxOutputTokens, maxWallSeconds, maxToolErrors }`, alle vier verplicht, gehele getallen;
             - `contextTokens`: een positief geheel getal, verplicht;
             - `maxCostUsd`: een decimale string.
-          - `export class CaseInvalidError extends Error`. De melding is `CASE_INVALID: <bestand>: <reden>`.
+          - `export type ReviewCase = z.infer<typeof ReviewCaseSchema>` en `export class CaseInvalidError extends Error`. De melding is `CASE_INVALID: <bestand>: <reden>`.
           - `export type LoadedReviewCase = { case: ReviewCase; dir: string; prompt: string; payload: unknown; expectedDocuments: unknown }`
           - `export function loadReviewCase(caseDir: string): LoadedReviewCase`
           - `export function stageReviewCase(loaded: LoadedReviewCase, runDir: string): string`. Geeft het pad van `<runDir>/root` terug.
@@ -258,8 +249,6 @@ stories:
           - `stageReviewCase` maakt een root met byte-gelijke bestanden.
 
           Verificatie: `npx vitest run __tests__/bench-review-case.test.ts`, daarna `npm run verify`.
-
-          Commit: `feat(bench): review-case-lader (M8)`.
       - title: "runReviewBench: gate, run, statusmapping en bench-result.json"
         priority: 2
         implementation_plan: |
@@ -301,7 +290,7 @@ stories:
              - de limieten uit de case, met contextTokens uit de case en niet uit de configuratie;
              - als enige bericht een user-bericht met de aangepaste prompt uit stap 1, zonder systeemprompt.
              - RunDeps: `connectRegistry` = `createReadOnlyTools({ root })`, `afterAnswer` = de validator, `costGuard` = `guard`, en `signal`.
-          6. Een stop door het signaal geeft `benchError: 'afgebroken'`, zoals bij M7. Heeft `tracked.costStop()` een stop, dan wordt de run `{ ...run, status: 'failed', error: stop.error }` vóór mapReviewStatus (plan-r1 X-M1). COST_LIMIT_EXCEEDED wordt zo limiet, COST_UNKNOWN benchfout.
+          6. Een stop door het signaal geeft `benchError: 'afgebroken'`, zoals bij M7. Heeft `tracked.costStop()` een stop en is de run `failed` met MODEL_ERROR, dan wordt hij `{ ...run, error: stop.error }` vóór mapReviewStatus (plan-r1 X-M1); timed_out en afgebroken blijven. COST_LIMIT_EXCEEDED wordt zo limiet, COST_UNKNOWN benchfout.
           7. Schrijf `<out>/<runId>/bench-result.json` via redactDeep, met `usage: withDroppedCost(run?.usage ?? NO_USAGE, tracked?.droppedCosts() ?? [])`, ook op het pad zonder run.
 
           mapReviewStatus. De volgorde is de betekenis:
@@ -323,18 +312,16 @@ stories:
             - tool-respons, totaal boven `maxCostUsd`: limiet met COST_LIMIT_EXCEEDED.
           - Weggevallen antwoorden (plan-r1 X-M1 en C-m3), hosted, `maxCostUsd` "1", met een directe `deps.sleep`:
             - twee keer finishReason `other` à 0.40, daarna een antwoord met een toolcall à 0.25: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, geen `tool_result` in de trace, en `usage.costUsd` 1.05 (`toBeCloseTo`);
-            - drie keer `other` à 0.40: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, `usage.costUsd` 1.20;
+            - drie keer `other` à 0.40: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, `usage.costUsd` 1.20; met de deadline al verstreken (`deps.now`) blijft het timed_out;
             - één keer `other` à 0.02, daarna een geldig antwoord à 0.05: beoordeeld, en `usage.costUsd` 0.07 in bench-result.json.
           - AC4-aanvulling: een CaseInvalidError laat `out` leeg.
           - AC7, met `DUMMY_KEY` uit __tests__/helpers.ts. Na elk geval geeft `leakedFragments(inhoud)` een lege lijst voor elk bestand onder `out`; dat vangt ook een afgekapt prefix:
             - een nepclient gooit een ModelError met de key in de melding;
-            - een antwoordbody van `bodyWithKeyAt(190)` bevat de key.
+            - de body-case met de echte modelclient staat in taak 7.
 
           Verificatie: `npx vitest run __tests__/bench-review-bench.test.ts`, daarna `npm run verify`.
 
           Grenzen: geen `checks`-diagnose (X-m3), geen dekkingsmeting (score.py telt uit de trace, C-m4).
-
-          Commit: `feat(bench): runReviewBench (M8)`.
       - title: "CLI harness review-bench, task-bench-teksten byte-gelijk, README"
         priority: 2
         implementation_plan: |
@@ -378,8 +365,6 @@ stories:
           - Een label met een punt (`claude-sonnet-5.5-or`) wordt aanvaard. Een label met `/` geeft de UsageError van `BENCH_LABEL`.
 
           Verificatie: `npx vitest run __tests__/cli-review-bench.test.ts __tests__/cli.test.ts`, daarna `npm run verify`.
-
-          Commit: `feat(cli): harness review-bench (M8)`.
       - title: "Drie nieuwe configuraties in deploy/max2, met deploy-test en runbook"
         priority: 2
         implementation_plan: |
@@ -415,8 +400,6 @@ stories:
           - `git push -u origin feat/m8-review-bench`, en `git ls-remote --heads origin feat/m8-review-bench` toont de commit.
 
           Grenzen: geen merge (die volgt in P1, op JP's go) en geen serveractie.
-
-          Commit: `feat(deploy): drie propriëtaire configuraties voor M8`.
   - title: "S2 — review_bench in llm-bench (max2-repo)"
     description: >-
       De bevroren case met herkomst en controlescript, de rubric, de driver met preflight en de scorer met de beslisregel. Repo max2
@@ -462,8 +445,6 @@ stories:
           - `python3 -m unittest discover -s llm-bench/review_bench -v` is groen.
 
           Grenzen: de case-inhoud staat alleen in de private max2-repo; geen sleutel en geen log in de repo.
-
-          Commit: `feat(review-bench): case macsearch-idea263-spec-r5 en rubric (M8)`.
       - title: "Driver run.py met preflight, grootboek en budget"
         priority: 2
         implementation_plan: |
@@ -477,7 +458,7 @@ stories:
           - Nieuw: `run.py`. Overgenomen uit task_bench/run.py:
             - read_ledger, ledger_total, append_ledger, StopFlag en Harness.call;
             - check_budget, met één wijziging. M7 stopt pas als het totaal de grens bereikt (run.py:451-454) en kent geen vooruitschatting. Erratum op spec §4.7: daar staat "met dezelfde vooruitschatting als M7". M8 stopt vóór een run als `totaal + maxCostUsd van de case > --budget`. Het plafond van $1 per run is zacht; de marge van $2 dekt de overschrijding;
-            - existing_results en hervatten, per run: run n van een label gaat naar `--out <out>/<label>/r<n>`. Hervatten, de benchfout-teller en `skipped.json` werken per `(label, n)`. Een benchError `CONFIGURATION_NOT_PROBED` telt, net als `afgebroken`, ook in `seen` niet als benchfout;
+            - existing_results en hervatten, met MODEL_STATUSES = beoordeeld, limiet en resultaat_ongeldig, per run: run n van een label gaat naar `--out <out>/<label>/r<n>`. Hervatten, de benchfout-teller en `skipped.json` werken per `(label, n)`. Een benchError `CONFIGURATION_NOT_PROBED` telt, net als `afgebroken`, ook in `seen` niet als benchfout;
             - de regel "één herhaling bij een benchfout, bij een tweede stoppen";
             - de exitcodes en mask_secrets.
             Niet overgenomen: on_openrouter, fetch_endpoints en PINNED_QUANTIZATIONS.
@@ -531,8 +512,6 @@ stories:
           Verificatie: `python3 -m unittest discover -s llm-bench/review_bench -v` en `python3 -m unittest discover -s llm-bench/task_bench -v`, beide groen.
 
           Grenzen: de driver doodt de harness nooit, hij zet alleen de stopvlag (zoals M7); geen sleutel in argv of onder `--out`.
-
-          Commit: `feat(review-bench): driver met preflight (M8)`.
       - title: "Scorer score.py: blinde bladen, beslisregel en rapport"
         priority: 2
         implementation_plan: |
@@ -548,7 +527,7 @@ stories:
           - Nieuw: `fixtures/score/`, met synthetische bench-result-, scores-, decisions-, trace.jsonl- en skipped-fixtures.
 
           Subcommando's:
-          - Elk subcommando leest `<out>/<label>/r<n>/*/bench-result.json`. Per `(label, n)` telt een resultaat met een modelstatus (beoordeeld, limiet, resultaat_ongeldig), anders het laatste.
+          - Elk subcommando leest `<out>/<label>/r<n>/*/bench-result.json`. Per `(label, n)` telt een resultaat met een modelstatus (beoordeeld, limiet, resultaat_ongeldig), anders het laatste op mtime.
           - `score.py sheets <out> [--only-f1]`:
             - per run met status `beoordeeld` komt er `<out>/sheets/<uuid4-hex8>.md`, met alleen `result.report_markdown` en `result.summary`;
             - de koppeling id → run-map staat apart in `<out>/sheets-key.json`;
@@ -595,13 +574,11 @@ stories:
           Verificatie: `python3 -m unittest discover -s llm-bench/review_bench -v` is groen. Daarna `git push -u origin feat/m8-review-bench`.
 
           Grenzen: geen `checks`-diagnose (X-m3); een blad bevat nooit de koppeling met het model.
-
-          Commit: `feat(review-bench): scorer en rapport (M8)`.
 ---
 
 # M8 — review-bench: implementatieplan
 
-_Status: draft (2026-10-20), revisie 5. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: draft (2026-10-20), revisie 6. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
@@ -623,6 +600,7 @@ Elke taak kopieert de grenzen die voor haar gelden. Hier staan de grenzen die ov
 - **Geheimen:** de masterkey gaat alleen via `--api-key-env LITELLM_MASTER_KEY`, en de waarde komt nooit in argv, log, trace, resultaat, repo of Scrum4Me. `FORGEJO_TOKEN` gaat alleen via `curl --config`.
 - **Private inhoud:** de MacSearch-case staat alleen in de private max2-repo; agent-harness krijgt alleen synthetische fixtures en de echte `review.md`; `~/Development/m8-case-staging/logs/` komt in geen repo en gaat niet naar een subagent.
 - **Forgejo, nooit `gh`:** geen merge zonder JP, nooit `git branch -D`, nooit een kale `git stash`.
+- **Commits:** één commit per taak, conventional, met het waarom en `(M8)` in de titel, bijvoorbeeld `feat(bench): createReadOnlyTools voor review-bench (M8)`.
 
 ## Review Focus
 
@@ -634,7 +612,7 @@ Elke taak kopieert de grenzen die voor haar gelden. Hier staan de grenzen die ov
 
 ## Waar de MINORs van ronde 2 landen
 
-Elke MINOR van spec-ronde 2 landt bij de taak of stap die zijn code noemt; C-m7 vraagt geen actie. De spec blijft na de GO ongewijzigd; errata staan in het plan.
+Elke MINOR van spec-ronde 2 landt bij de taak of stap die zijn code noemt (C-m7: geen actie). Errata staan in het plan, niet in de spec.
 
 ## Volgorde
 
@@ -668,7 +646,7 @@ Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en J
 
 **P2 — Preflight en rookproef** (spec §4.7 en §4.8, stap 6; C-m5).
 1. JP leest het OpenRouter-tegoed af. Budget = `min(10, tegoed − 2)`.
-2. Sleutel. Alleen het lezen gaat met sudo; het bestand wordt door janpeter geschreven, met 0600. Claude ziet de waarde nooit.
+2. Sleutel. JP draait dit in een terminal; alleen het lezen gaat met sudo, en het bestand wordt door janpeter geschreven, met 0600. Claude ziet de waarde nooit; nooit `cat` of `echo` van het bestand.
    ```bash
    sudo sed -n 's/^LITELLM_MASTER_KEY=//p' /etc/agent-harness/harness-litellm.env | install -m 0600 /dev/stdin /run/user/1000/m8-litellm.key
    ```
@@ -677,7 +655,7 @@ Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en J
 4. Rookproef: `--models qwen3.8-or-128k claude-sonnet-5.5-or --runs 1 --out R/rook --preflight-file R/preflight.json` (≈ $0,50). Deze runs tellen niet mee in de 24.
 5. Maak het blad met `score.py sheets R/rook --only-f1`. Claude vult alleen f1 in, in `R/rook/scores.jsonl`.
 6. Doorgaan mag alleen als `score.py smoke R/rook --scores R/rook/scores.jsonl` "rookproef: door" geeft:
-   - geen van beide runs is `benchfout`;
+   - beide resultaten bestaan, en geen van beide is `benchfout`;
    - sonnet is `beoordeeld`, met `outcome: succeeded`, `NO-GO` en f1 `major`.
    Anders stop, en JP beslist.
 

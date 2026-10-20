@@ -57,7 +57,7 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
 
 | Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
 |---|---|---|---|---|---|
-| CODEX | `c94e5fc5-2054-4ff7-a274-80af391444ae` | `80b58724-9e71-4596-9976-7e2e043b4928` | `efc6fb47-1701-4e1f-9f26-4e588306dbe8` | linked | **NO-GO** 0/1/1 |
+| CODEX | `c94e5fc5-2054-4ff7-a274-80af391444ae` | `80b58724-9e71-4596-9976-7e2e043b4928` | `efc6fb47-1701-4e1f-9f26-4e588306dbe8` | linked | **NO-GO** 0/1/1 (job `08686032-ddd7-4d1c-9ef6-30d2cad9d11d`) |
 | CLAUDE | `274c42fb-385c-4d85-baf9-99d00cd26da2` | `d5dba36d-ff09-473a-bdf5-809bcf848e6d` | `69bfb83d-2506-42af-a778-5bba4c0ec2a1` | linked | **GO** 0/0/6 (job `fdff3268-fc63-434d-8e68-9d136ac37f6f`) |
 
 **Fixes van ronde 1.** Beide reviewers vonden dat ze houden, tegen de tree gecontroleerd. Het pad van X-M1 is apart nagelopen: de throw uit `onRetry` (`retry-client.ts:84-92`, `:119-124`), MODEL_ERROR in `run.ts:374-379`, en de volgorde `afterResponse` dan `beforeRequest`. Beide aanvaardden de drie afwijkingen (C-m3, C-m8, C-m5). Alle tien MINORs van spec-ronde 2 landen nog.
@@ -83,3 +83,38 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
   - de story-AC's verwijzen nu naar de codes;
   - korte geneste lijsten zijn op één regel gezet.
 - Plan: 63 017 → 63 210 tekens. De grootste `implementation_plan` is S2-2, met 6 708 tekens.
+
+## Ronde 3: revisie 5 (`f0f186157f9233abcd96e3aaf5b102ec4c9e7e5b`)
+
+**Pin:** `plan` @`f0f18615`, sha256 `fe7b915198c0fa19b5d23782bba26018b39651d27f5c9f14d46af4c690610bec`. Repository: `agent-harness@f0f18615`.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `cf1e6037-af59-43fd-8c37-b21d0f261c1e` | `5f8683d5-abe8-4682-af25-eeabdf9b41c4` | `96f671d8-576e-4ecb-9ebb-742f5c8f7dee` | linked | **NO-GO** 0/1/0 |
+| CLAUDE | `545642ff-74f7-41fc-b794-89902b0a8eae` | `52d1ca8a-4ba0-46ca-948d-199521cd2535` | `c33124d7-aba2-461a-9155-385b0b8102c0` | linked | **GO** 0/0/6 |
+
+**Fixes van ronde 2.** Beide reviewers vonden dat ze landen. Alle tien MINORs van spec-ronde 2 staan er nog. Eén fix bleek fout: C2-m2, zie X3-M1.
+
+**Triage ronde 3.**
+
+| # | Bevinding | Besluit en remedie |
+|---|---|---|
+| X3-M1 / C3-m1 (convergent) | De catch voor `UnusableAnswerError` (C2-m2) meet ook de lege fout van een onderbroken wachttijd (`retry-client.ts:119-123`, `:91`). Dat geeft COST_UNKNOWN, en de override in S1-6 maakt dan van `timed_out` een benchfout | Geaccepteerd. Gecontroleerd: `retry-client.ts:91` en `:119-123`, en de bestaande test `__tests__/bench-retry-client.test.ts:466-482`. Remedie: de kleinste, dus C2-m2 teruggedraaid. De catch meet niets meer; alleen `onRetry` voedt de guard. De zin over "één keer" is nu waar, met de reden erbij. De override in S1-6 geldt alleen voor `failed` met MODEL_ERROR, zodat timed_out en afgebroken blijven staan. De test met vier keer 0.30 is vervangen door een test met een onderbroken wachttijd: `costStop()` blijft leeg en de guard zag één antwoord. Er is een deadline-test bij S1-6. Bewust geaccepteerd: een laatste weggevallen antwoord dat het plafond passeert, geeft benchfout (MODEL_ERROR) in plaats van limiet. De run eindigt daar, en het bedrag staat in usage en het grootboek. |
+| C3-m2 | Na de extractie blijven in `task-bench.ts:16` imports ongebruikt, en dan faalt lint | Geaccepteerd. Gecontroleerd: `eslint.config.js:8` en `package.json` verify. S1-2 haalt `createRetryingClient` en `UnusableAnswerError` weg. |
+| C3-m3 | MODEL_STATUSES is in S2-2 niet gedefinieerd, en "het laatste" in S2-3 is dubbelzinnig | Geaccepteerd. MODEL_STATUSES is nu beoordeeld, limiet en resultaat_ongeldig, en "het laatste" is het laatste op mtime. |
+| C3-m4 | De diffs in S1-1 en S1-2 vergelijken met `origin/main`, maar de branch begint op een andere branch | Geaccepteerd, met een andere remedie. Gecontroleerd: `git diff origin/main...HEAD --stat` raakt alleen docs (4 bestanden). De diffs gebruiken nu de merge-base (`origin/main...HEAD`). Dat dekt ook een main die intussen verder is. |
+| C3-m5 | P2 stap 2 noemt niet wie het sudo-commando draait | Geaccepteerd. JP draait het in een terminal, en `cat`/`echo` van het bestand mag niet. |
+| C3-m6 | Kleine formuleringsgaten | Geaccepteerd: `message: { content: null, toolCalls: [] }`, `export type ReviewCase`, de body-case in S1-6 verwijst naar de echte modelclient in S1-7, en P2 stap 6 noemt "beide resultaten bestaan". |
+
+**Scope-herbeoordeling vóór ronde 4.**
+- Het ontwerppunt dat terugkomt, is de live guard voor weggevallen antwoorden: X-M1 in ronde 1, C2-m2 in ronde 2 en X3-M1 in ronde 3.
+- Het kleinere alternatief is de guard helemaal schrappen. Dan zouden we vertrouwen op het zachte plafond, het grootboek na elke run en de marge van $2.
+- Dat alternatief is afgewezen. X-M1 liet zien dat gerapporteerde kosten binnen één run de reserve kunnen passeren, terwijl de guard ze niet ziet.
+- Gekozen is daarom de kleinste vorm die X-M1 dicht: alleen `onRetry`. De catch-uitbreiding van ronde 2 is weer weg.
+- Geen nieuwe scope, en geen JP-beslissing nodig.
+
+**Scope-delta r5→r6.**
+- Eruit: het meten in de catch (C2-m2) en de 11 losse commit-regels. Die zijn vervangen door één regel in Global Constraints.
+- Erbij: de MODEL_ERROR-voorwaarde op de override, en kleine verduidelijkingen.
+- Het eerste bruikbare resultaat en de praktijkproef blijven gelijk.
+- Plan: 63 210 → 63 164 tekens.
