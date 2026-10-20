@@ -189,3 +189,28 @@ JP koos bij de ceremonie-poort "Eerst delta-review rev 3".
   - shared `access-checklist-schema.test.ts`;
   - de Ops-dashboard-flows `update_scrum4me_web`, `approve_policy_hash`, `redeploy_all` en `update_scrum4me_workers`.
 - **Consumenten-grep ververst:** Scrum4Me main staat nu op `f95675ef`, met dezelfde zes treffers. De commits na `178811a3` raken geen relevante paden.
+
+**Delta-ronde 1** (CODEX)
+
+| | |
+|---|---|
+| request | `fcbeac5c-3b64-4ce0-9343-9b725af2e1dc` |
+| root | `f0aacf6a-ff47-4f1a-81d8-baf7f43ce732` |
+| key | `71af3597-34f5-4367-88c8-d307260b8b2a` |
+| idea_link | linked (PLAN) |
+| uitslag | 0 / 0 / 1 MINOR, **GO** |
+
+**Pins:**
+- `plan`: rev 3 @ `1d2f137`, sha256 `a2652973…`;
+- `plan_prev`: rev 2 @ `8aa748f`;
+- `spec`: `820e2f41…`;
+- `evidence`: `0f48cfff…` @ `8ade41c`.
+
+**Wijzigingen:** 11 van de 12 hielden. #4 hield deels.
+
+**MINOR:** "geen bestaande test pint de veldregels van AgentModel" is niet bewezen in de evidence.
+- **Oordeel:** terecht als bewijsgat.
+- **Lokaal nagegaan:** `git grep "fieldLines(.AgentModel.)\|model AgentModel"` in shared `__tests__` @ `8df7f2c` gaf geen treffer.
+- **Verwerking:** de stelling is in S1-T1 vervangen door een controle die de uitvoerder zelf draait, met de instructie om een eventuele bestaande test uit te breiden.
+
+**Plan-fase afgerond:** dubbel GO (ronde 2) en delta-GO (rev 3), met de delta-MINOR verwerkt.
