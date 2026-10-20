@@ -13,8 +13,9 @@ import { isGreen, verifyText } from '../worker/task-impl.js'
 import { createTaskTools, type VerifyRun } from '../worker/task-tools.js'
 import type { BenchCase } from './case.js'
 import { BENCH_DIR, evaluateHidden, hiddenCheckScript, readHiddenReport, type HiddenReportRead, type HiddenResult } from './hidden-check.js'
-import { createRetryingClient, UnusableAnswerError, type RetryRecord } from './retry-client.js'
+import type { RetryRecord } from './retry-client.js'
 import { BENCH_SYSTEM_PROMPT, benchTaskPrompt } from './task-prompt.js'
+import { createTrackedClient, withDroppedCost, type TrackedClient } from './tracked-client.js'
 import { AdminChangedError, assertAdminUnchanged, capturePatch, createWorkspace, git, isRunnerConfig, restoreForHiddenCheck, snapshotAdmin, swapNodeModules, type Workspace } from './workspace.js'
 
 export type ModelSpec = z.infer<typeof ModelSpecSchema>
@@ -188,16 +189,6 @@ class BenchFault extends Error {}
 const NO_USAGE: RunResult['usage'] = { source: 'missing', inputTokens: 0, outputTokens: 0, turns: 0, toolCalls: 0, toolErrors: 0 }
 
 /**
- * `usage` with the cost of the dropped answers added to its `costUsd`: `costs` has an entry per dropped answer, and `undefined` for one
- * that reported no cost. Like the other sums of `usage`, `costUsd` stays absent unless some response reported it.
- */
-function withDroppedCost(usage: RunResult['usage'], costs: Array<number | undefined>): RunResult['usage'] {
-  const reported = costs.filter((cost): cost is number => cost !== undefined)
-  if (reported.length === 0) return usage
-  return { ...usage, costUsd: (usage.costUsd ?? 0) + reported.reduce((sum, cost) => sum + cost, 0) }
-}
-
-/**
  * One bench run (spec §4.1): a fresh clone of the repo at the case's `base_commit`; prepare; the model loop of the worker with the
  * bench prompts, the six task tools and the verify gate; the patch against `base_commit`; and, for a run that completes with a
  * patch, the hidden check with the tests of `ref_commit`. The result is in `<out>/<runId>/bench-result.json` on every path, also
@@ -256,10 +247,8 @@ export async function runTaskBench(o: {
   let hiddenRunnerError = false
   let reds = 0
   let lastTail = undefined as string | undefined
-  const retries: RetryRecord[] = []
-  const providers: string[] = []
-  // The cost of the answer that was dropped on the last attempt: no retry follows it, so it is on the error and not in `retries`.
-  let droppedLastUsd = undefined as number | undefined
+  // The model client with its retries, providers and dropped costs (src/bench/tracked-client.ts); absent until the pipeline has made it.
+  let tracked: TrackedClient | undefined
   // The `runnerError` of the first verify container that failed outside the model (see `runVerify`).
   let verifyFault = undefined as string | undefined
 
@@ -322,31 +311,8 @@ export async function runTaskBench(o: {
 
     // The model loop of runTaskJob; the gate runs verify on every final answer.
     const base: ModelClient = (o.deps?.createClient ?? createModelClient)({ ...spec, ...(o.apiKey ? { apiKey: o.apiKey } : {}) })
-    const retrying = o.retryTransient
-      ? createRetryingClient(base, {
-          sleep: o.deps?.sleep,
-          onRetry: (r) => {
-            retries.push(r)
-            // A dropped answer is a response too: who served it is evidence (spec §5 criterion 2), and this is the moment it arrived.
-            if (r.provider) providers.push(r.provider)
-            trace.event({ type: 'model_retry', ...r })
-          },
-        })
-      : base
-    const client: ModelClient = {
-      async complete(messages, options) {
-        const res = await retrying.complete(messages, options).catch((err: unknown) => {
-          // The answer that was dropped for good has no record: its cost and its provider are on the error, and only then (see UnusableAnswerError).
-          if (err instanceof UnusableAnswerError) {
-            if (err.costUsd !== undefined) droppedLastUsd = (droppedLastUsd ?? 0) + err.costUsd
-            if (err.provider) providers.push(err.provider)
-          }
-          throw err
-        })
-        if (res.provider) providers.push(res.provider)
-        return res
-      },
-    }
+    tracked = createTrackedClient(base, { retryTransient: o.retryTransient, trace, sleep: o.deps?.sleep })
+    const client: ModelClient = tracked.client
 
     const repairs = o.task.maxVerifyRepairs
     const afterAnswer = async (_answer: string, signal: AbortSignal): Promise<AfterAnswerResult> => {
@@ -462,9 +428,9 @@ export async function runTaskBench(o: {
     ...(run?.error ? { error: run.error } : {}),
     gate: { reds, ...(lastTail !== undefined ? { lastTail } : {}) },
     ...(hidden ? { hidden } : {}),
-    usage: withDroppedCost(run?.usage ?? NO_USAGE, [...retries.map((r) => r.costUsd), droppedLastUsd]),
-    providers,
-    retries,
+    usage: withDroppedCost(run?.usage ?? NO_USAGE, tracked?.droppedCosts() ?? []),
+    providers: tracked?.providers ?? [],
+    retries: tracked?.retries ?? [],
     patchBytes: patch?.bytes ?? 0,
     durationMs: Date.now() - started,
     ...(benchError !== undefined ? { benchError } : {}),
