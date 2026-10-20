@@ -312,7 +312,7 @@ stories:
             - tool-respons, totaal boven `maxCostUsd`: limiet met COST_LIMIT_EXCEEDED.
           - Weggevallen antwoorden (plan-r1 X-M1 en C-m3), hosted, `maxCostUsd` "1", met een directe `deps.sleep`:
             - twee keer finishReason `other` à 0.40, daarna een antwoord met een toolcall à 0.25: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, geen `tool_result` in de trace, en `usage.costUsd` 1.05 (`toBeCloseTo`);
-            - drie keer `other` à 0.40: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, `usage.costUsd` 1.20; met `deps.now` die pas na de derde drop voorbij de deadline springt (de nep-sleep zet de klok door): `timed_out`, niet limiet en niet benchfout;
+            - drie keer `other` à 0.40: limiet met COST_LIMIT_EXCEEDED, `complete()` 3×, `usage.costUsd` 1.20; deadlinevariant: de nepclient zet de klok van `deps.now` voorbij de deadline vlak vóór hij antwoord 3 teruggeeft, niet in `deps.sleep` (na de derde drop volgt geen wachttijd): `complete()` 3×, `usage.costUsd` 1.20, runStatus `timed_out`, status `limiet` en geen `error`;
             - één keer `other` à 0.02, daarna een geldig antwoord à 0.05: beoordeeld, en `usage.costUsd` 0.07 in bench-result.json.
           - AC4-aanvulling: een CaseInvalidError laat `out` leeg.
           - AC7, met `DUMMY_KEY` uit __tests__/helpers.ts. Na elk geval geeft `leakedFragments(inhoud)` een lege lijst voor elk bestand onder `out`; dat vangt ook een afgekapt prefix:
@@ -578,7 +578,7 @@ stories:
 
 # M8 — review-bench: implementatieplan
 
-_Status: draft (2026-10-20), revisie 7. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: draft (2026-10-20), revisie 8. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 

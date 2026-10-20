@@ -148,3 +148,19 @@ Beide reviewers vonden geen kandidaat om te schrappen. Alle claims over de tree 
 ## JP-gate na de GO (2026-10-20)
 
 JP koos "Eerst delta-ronde": de drie MINORs van ronde 4 gaan alsnog in het plan (revisie 7), met één delta-review door Codex vóór de ceremonie. De claude-sessie schreef de wijziging, dus reviewt de andere modelfamilie. De tabel "Landt bij de ceremonie in" hierboven is daarmee vervangen door revisie 7.
+
+## Delta-ronde 1: revisie 7 (`2895f254739f7d5a289d78f08ea5878d90c9b767`)
+
+**Pins:** `plan` @`2895f254`, sha256 `c2e20f75c4af3c93c83b9bf1f18bb5ca2bf4676c9d2fd5c43e5018d5e2ba49ad`, 63 361 tekens; `plan-rev6` @`36baadf7`, sha256 `80ddacb015c6b7553b15f2c57ebebbfd90221851287cbc65bf3dd92a3bae5d54`. Repository: `agent-harness@2895f254`. Eén reviewer, de andere modelfamilie dan de auteur.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `0252dee1-bf64-435d-82ef-dc63c0608c18` | `b06e51a4-7909-4474-a3b9-6c2559773a39` | `8900c30d-4061-4c06-bacd-d07ced499305` | linked (PLAN) | **NO-GO** 0/1/0 |
+
+**C4-m2 en C4-m3 houden.** De vier fakes bestaan met deze signaturen, en `seedProbe` schrijft waar `checkProbeForJob` leest. Via `over` op `configurations` kan een test hosted kiezen. `runMain` is een private helper: de nieuwe testfile bouwt dat wrappertje na ("zoals" staat dat toe). De C4-m3-zin klopt voor beide takken van retry-client.ts:117 en zet geen meting in de catch. X-M1, X2-M1 en X3-M1 blijven dicht. Er zijn geen restanten van `probe.ts`, "via spawn" of "deadline al verstreken".
+
+| # | Bevinding | Oordeel | Remedie (revisie 8) |
+|---|---|---|---|
+| D1-M1 | De deadlinevariant in S1-6 zet de klok door in een sleep die nooit draait. Met `maxRetries` 3 (retry-client.ts:16, :78) gaat de derde drop nog door `onRetry` (:85). De guard gooit CostStopError vóór de sleep (:88). Zonder verlopen klok wordt het failed/MODEL_ERROR, en via de override limiet met COST_LIMIT_EXCEEDED. Daarnaast is "niet limiet" fout: mapReviewStatus regel 2 (plan:300, spec §4.1) maakt van timed_out limiet | Aanvaard; beide punten zijn tegen de tree en het plan gecontroleerd | S1-6: "deadlinevariant: de nepclient zet de klok van `deps.now` voorbij de deadline vlak vóór hij antwoord 3 teruggeeft, niet in `deps.sleep` (na de derde drop volgt geen wachttijd): `complete()` 3×, `usage.costUsd` 1.20, runStatus `timed_out`, status `limiet` en geen `error`". De catch ziet de verlopen klok (run.ts:373), en de override voor alleen MODEL_ERROR laat timed_out staan |
+
+**Scope-delta d1.** Geen; één testregel is vervangen. Het eerste bruikbare resultaat en de praktijkproef blijven gelijk. Revisie 8 heeft 63 487 tekens, en S1-6 6 699.
