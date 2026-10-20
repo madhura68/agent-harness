@@ -177,3 +177,15 @@ Het plan staat als repobestand `docs/plans/2026-10-20-idea-269-plan.md`, met de 
 **Scope-delta:** geen. Alleen verduidelijkingen en testscherpte, plus één kleinere actie in S3-T2: weigeren vóór het schrijven in plaats van een rollback. Dat past binnen spec §4.5.
 
 **Plan-fase afgerond met dubbel GO** (ronde 2, rev 2). Rev 3 bevat alleen de MINORs hierboven.
+
+### Delta-review plan rev 3 (op verzoek van JP, 2026-10-20)
+
+JP koos bij de ceremonie-poort "Eerst delta-review rev 3".
+- **Reviewer:** één, kruismodel ten opzichte van de auteur. De wijzigingen zijn door Claude geschreven, dus `runtime: CODEX`.
+- **Rondes:** maximaal 5.
+- **Basis:** `git diff 8aa748f..1d2f137 -- docs/plans/2026-10-20-idea-269-plan.md`.
+- **Evidence aangevuld** (achteraan; eerdere regelnummers ongewijzigd):
+  - workers `lib/env.ts`;
+  - shared `access-checklist-schema.test.ts`;
+  - de Ops-dashboard-flows `update_scrum4me_web`, `approve_policy_hash`, `redeploy_all` en `update_scrum4me_workers`.
+- **Consumenten-grep ververst:** Scrum4Me main staat nu op `f95675ef`, met dezelfde zes treffers. De commits na `178811a3` raken geen relevante paden.

@@ -2313,7 +2313,7 @@ Toegevoegd na plan-review ronde 1. De secties hierboven zijn ongewijzigd; regeln
 ## Consumenten van de oude naamlijst (S4-T1), origin/main op 2026-10-20
 
 ```text
--- Scrum4Me (https://git.jp-visser.nl/janpeter/Scrum4Me.git) @ 2bd0e46b
+-- Scrum4Me (https://git.jp-visser.nl/janpeter/Scrum4Me.git) @ f95675ef
 origin/main:app/(app)/chat/[id]/page.tsx:5:import { isHostedHarnessConfiguration } from '@shared/harness-config'
 origin/main:app/(app)/chat/[id]/page.tsx:34:        hosted: isHostedHarnessConfiguration(view.chat.configuration),
 origin/main:app/(app)/chat/layout.tsx:6:import { isHostedHarnessConfiguration } from '@shared/harness-config'
@@ -2328,4 +2328,268 @@ origin/main:components/agent-chat/model-picker.tsx:26:  /** Zie isHostedHarnessC
    (geen treffers)
 -- Ops-dashboard (https://git.jp-visser.nl/janpeter/Ops-dashboard.git) @ 70245304c
    (geen treffers)
+```
+
+# Aanvulling delta-review (plan rev 3)
+
+Toegevoegd voor de delta-review van plan rev 3. Alle secties hierboven zijn ongewijzigd. Ops-dashboard-fragmenten komen van origin/main `70245304c5c4f5099cf65adde4598bb4bff66766`.
+
+## workers lib/env.ts (SKIP_ENV_VALIDATION en NEXT_PHASE) — `lib/env.ts` r. 1-47
+
+`scrum4me-workers@198eb59:lib/env.ts`
+
+```ts
+    1  import { z } from 'zod'
+    2  
+    3  const envSchema = z.object({
+    4    DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
+    5    DIRECT_URL: z.string().optional(),
+    6    WORKERS_SESSION_SECRET: z.string().min(32, 'WORKERS_SESSION_SECRET must be at least 32 characters'),
+    7    NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+    8    MCP_HTTP_URL: z.string().url().default('http://localhost:8000'),
+    9    // Lege string (env_file: `MCP_DEFAULT_TOKEN=`) → undefined, zodat de
+   10    // ontbrekende-token foutstaat bereikbaar blijft (spec §6.7) en env-validatie
+   11    // niet faalt op een leeg veld.
+   12    MCP_DEFAULT_TOKEN: z.preprocess((v) => {
+   13      if (typeof v !== 'string') return v
+   14      const t = v.trim()
+   15      return t === '' ? undefined : t
+   16    }, z.string().min(1).optional()),
+   17    // Publieke base-URL van de scrum4me-WEB-app waar de QR-login naar verwijst.
+   18    // Bewust de ANDERE app (niet de workers-host): de telefoon scant de QR en opent
+   19    // ${WEB_APP_BASE_URL}/m/pair om goed te keuren. Gevalideerd als URL; default =
+   20    // de Docker-deploy die dezelfde Postgres deelt. Override per deploy.
+   21    WEB_APP_BASE_URL: z.string().url().default('https://thuis.jp-visser.nl'),
+   22  })
+   23  
+   24  export type Env = z.infer<typeof envSchema>
+   25  
+   26  // Skip env validation during static analysis at build time.
+   27  // `next build` does a production-build pass that imports modules to collect
+   28  // route metadata; at that point the docker-compose env_file values aren't
+   29  // available yet. NEXT_PHASE is set automatically by next; SKIP_ENV_VALIDATION
+   30  // is an explicit escape hatch we set in the Dockerfile builder stage.
+   31  // At runtime (dev/start/test) env_file provides DATABASE_URL +
+   32  // WORKERS_SESSION_SECRET, so validation runs and throws on missing values.
+   33  const SKIP_VALIDATION =
+   34    process.env.SKIP_ENV_VALIDATION === '1' ||
+   35    process.env.NEXT_PHASE === 'phase-production-build'
+   36  
+   37  const parsed = envSchema.safeParse(process.env)
+   38  
+   39  if (!SKIP_VALIDATION && !parsed.success) {
+   40    console.error('Invalid environment variables:', parsed.error.flatten().fieldErrors)
+   41    throw new Error('Invalid environment configuration')
+   42  }
+   43  
+   44  // Cast tot Env zodat consumers het typesysteem behouden; bij SKIP_VALIDATION
+   45  // kan env een leeg object zijn — alleen consumers die statisch tijdens build
+   46  // een veld lezen merken dat (waarde wordt undefined). Runtime is altijd valid.
+   47  export const env: Env = parsed.success ? parsed.data : ({} as Env)
+```
+
+## shared test access-checklist-schema (precedent, fieldLines) — `__tests__/access-checklist-schema.test.ts` r. 1-50
+
+`scrum4me-shared@8df7f2c:__tests__/access-checklist-schema.test.ts`
+
+```ts
+    1  import { readFileSync } from 'node:fs'
+    2  import { describe, expect, it } from 'vitest'
+    3  
+    4  // IDEA-267 I1 (plan M54 Taak 5a, spec docs/specs/2026-10-18-idea-267-toegang-per-product.md §6 in
+    5  // Scrum4Me): de vinkjes van de tab Toegang per product en stap. Alleen additief; de migratie en het
+    6  // contract staan in Scrum4Me.
+    7  const schema = readFileSync(new URL('../prisma/schema.prisma', import.meta.url), 'utf8')
+    8  
+    9  const block = (kind: 'model' | 'enum', name: string) =>
+   10    schema.match(new RegExp(`${kind} ${name} \\{[\\s\\S]*?\\n\\}`))?.[0] ?? ''
+   11  
+   12  // De regels binnen de accolades, met witruimte samengevouwen.
+   13  const bodyLines = (kind: 'model' | 'enum', name: string) =>
+   14    block(kind, name)
+   15      .split('\n')
+   16      .slice(1, -1)
+   17      .map((line) => line.trim().replace(/\s+/g, ' '))
+   18      .filter(Boolean)
+   19  const fieldLines = (name: string) =>
+   20    bodyLines('model', name).filter((line) => !line.startsWith('//') && !line.startsWith('@@'))
+   21  const attributeLines = (name: string) => bodyLines('model', name).filter((line) => line.startsWith('@@'))
+   22  
+   23  describe('IDEA-267: enum ProductAccessStepState', () => {
+   24    it('bevat DONE en NOT_APPLICABLE, in die volgorde', () => {
+   25      expect(bodyLines('enum', 'ProductAccessStepState')).toEqual(['DONE', 'NOT_APPLICABLE'])
+   26    })
+   27  })
+   28  
+   29  describe('IDEA-267: ProductAccessStep', () => {
+   30    it('heeft precies de velden uit spec §6, geen extra', () => {
+   31      expect(fieldLines('ProductAccessStep')).toEqual([
+   32        'product Product @relation(fields: [product_id], references: [id], onDelete: Cascade)',
+   33        'product_id String',
+   34        'step_key String @db.VarChar(64)',
+   35        'state ProductAccessStepState',
+   36        'context_at_check String?',
+   37        'updated_at DateTime @updatedAt',
+   38      ])
+   39    })
+   40  
+   41    it('heeft de sleutel product_id + step_key en de tabelnaam product_access_steps, verder niets', () => {
+   42      expect(attributeLines('ProductAccessStep')).toEqual([
+   43        '@@id([product_id, step_key])',
+   44        '@@map("product_access_steps")',
+   45      ])
+   46    })
+   47  
+   48    it('heeft de back-relation access_steps op Product', () => {
+   49      expect(fieldLines('Product')).toContain('access_steps ProductAccessStep[]')
+   50    })
+```
+
+## Ops-flow update_scrum4me_web — `deploy/ops-agent/baseline/flows/update_scrum4me_web.yml` r. 1-30
+
+`Ops-dashboard@7024530:deploy/ops-agent/baseline/flows/update_scrum4me_web.yml`
+
+```yaml
+    1  # Deploy the latest Scrum4Me web application from source.
+    2  # Copy to /etc/ops-agent/flows/update_scrum4me_web.yml on the host.
+    3  #
+    4  # Steps:
+    5  #   0. Refuse a checkout with entries not owned by ops-agent (ISS-24)
+    6  #   1. Show current git status (dirty tree aborts later at git_pull)
+    7  #   2. Fetch remote refs
+    8  #   3. Show commits ahead of upstream
+    9  #   4. Fast-forward pull (aborts if working tree is dirty)
+   10  #   5. Init/update git submodules (vendor/scrum4me-shared sinds M16 fase 0)
+   11  #   5a. Prepare the policy bundle for the pulled release (exit 3 = run approve_policy_hash)
+   12  #   6. Install dependencies
+   13  #   7. Apply database migrations
+   14  #   8. Build the application
+   15  #   9. Restart the systemd service
+   16  #  10. Smoke-test the public endpoint (200 or 401 = pass)
+   17  
+   18  name: Update Scrum4Me Web
+   19  description: Pull latest code, init submodules, install deps, run migrations, build, and restart scrum4me-web.service
+   20  steps:
+   21    - command_key: repo_ownership_check
+   22      on_failure: abort
+   23  
+   24    - command_key: git_status
+   25      args: ["/srv/scrum4me/repos/Scrum4Me"]
+   26      on_failure: continue
+   27  
+   28    - command_key: git_fetch
+   29      args: ["/srv/scrum4me/repos/Scrum4Me"]
+   30      on_failure: abort
+```
+
+## Ops-flow approve_policy_hash — `deploy/ops-agent/baseline/flows/approve_policy_hash.yml` r. 1-25
+
+`Ops-dashboard@7024530:deploy/ops-agent/baseline/flows/approve_policy_hash.yml`
+
+```yaml
+    1  # Approve a staged Scrum4Me policy-hash change (PBI-164 / ST-1588).
+    2  # prepare_policy_bundle stops redeploy_all / update_scrum4me_web with exit 3 when the policy
+    3  # hash of the pulled release differs from the active one, and stages the new values. This
+    4  # flow shows which policy inputs changed, activates the new POLICY_ROOT + POLICY_HASH and
+    5  # runs the operator precheck. Rerun the deploy afterwards.
+    6  
+    7  name: Approve Policy Hash
+    8  description: Review and activate a staged Scrum4Me database-access policy hash, then run the precheck
+    9  steps:
+   10    - command_key: approve_policy_hash
+   11      on_failure: abort
+```
+
+## Ops-flow redeploy_all (web, MCP-worker en workers in één flow) — `deploy/ops-agent/baseline/flows/redeploy_all.yml` r. 1-28
+
+`Ops-dashboard@7024530:deploy/ops-agent/baseline/flows/redeploy_all.yml`
+
+```yaml
+    1  # Volledige redeploy van de Scrum4Me-stack — alle vier de repos in één flow.
+    2  # Copy to /etc/ops-agent/flows/redeploy_all.yml on the host.
+    3  #
+    4  # Volgorde:
+    5  #   1. scrum4me-web (Scrum4Me)        — host systemd, draait migrations
+    6  #   2. MCP-worker (scrum4me-docker + scrum4me-mcp via image-rebuild)
+    7  #   3. scrum4me-workers               — compose service, admin-UI
+    8  #
+    9  # Volgorde-redenering:
+   10  #   - Web eerst: de DB-migratie is additief en niet-breaking, dus veilig
+   11  #     terwijl de oude worker + workers nog draaien.
+   12  #   - MCP-worker daarna: nieuwe MCP-code kan afhankelijk zijn van de nieuwe
+   13  #     DB-kolommen/enums uit de web-migratie.
+   14  #   - scrum4me-workers laatst: gebruikt dezelfde DB als web (geen eigen
+   15  #     migrations) en is read-only voor de DB; veilig om als laatste op te
+   16  #     pikken.
+   17  #
+   18  # Steps:
+   19  #   0.     scrum4me-web: refuse a checkout not owned by ops-agent (ISS-24)
+   20  #   1-10.  scrum4me-web: status, fetch, log-ahead, pull, submodule-init,
+   21  #          npm ci, migrate, build, restart service, smoke-test
+   22  #          (policy bundle is prepared right after submodule-init; exit 3 = run approve_policy_hash)
+   23  #   11-18. MCP-worker: status + fetch + pull scrum4me-docker, fetch scrum4me-mcp,
+   24  #          cache-busted image rebuild, container recreate, health-wait,
+   25  #          re-apply multi-worker scale
+   26  #   19-27. scrum4me-workers: status, fetch, log-ahead, pull, submodule-init,
+   27  #          build, recreate, wait-healthy, smoke
+   28  #
+```
+
+## Ops-flow update_scrum4me_workers — `deploy/ops-agent/baseline/flows/update_scrum4me_workers.yml` r. 1-52
+
+`Ops-dashboard@7024530:deploy/ops-agent/baseline/flows/update_scrum4me_workers.yml`
+
+```yaml
+    1  # Deploy the latest scrum4me-workers admin-UI from source.
+    2  # Copy to /etc/ops-agent/flows/update_scrum4me_workers.yml on the host.
+    3  #
+    4  # scrum4me-workers is een compose-service (Next.js 16 standalone). Geen
+    5  # migrations — workers gebruikt de bestaande scrum4me-DB schema, de
+    6  # canonical migrator blijft scrum4me-web.
+    7  #
+    8  # Steps:
+    9  #   1. Show current git status (dirty tree aborts later at git_pull)
+   10  #   2. Fetch remote refs
+   11  #   3. Show commits ahead of upstream
+   12  #   4. Fast-forward pull (aborts if working tree is dirty)
+   13  #   5. Init/update git submodules (vendor/scrum4me-shared)
+   14  #   6. Build the docker compose service image
+   15  #   7. Force-recreate the container (picks up the new image)
+   16  #   8. Wait for the container healthcheck to report healthy
+   17  #   9. Smoke-test the public /api/health endpoint
+   18  
+   19  name: Update Scrum4Me Workers
+   20  description: Pull latest scrum4me-workers code, init submodule, rebuild compose image, recreate container, wait healthy, smoke /api/health
+   21  steps:
+   22    - command_key: git_status
+   23      args: ["/srv/scrum4me/repos/scrum4me-workers"]
+   24      on_failure: continue
+   25  
+   26    - command_key: git_fetch
+   27      args: ["/srv/scrum4me/repos/scrum4me-workers"]
+   28      on_failure: abort
+   29  
+   30    - command_key: git_log_ahead
+   31      args: ["/srv/scrum4me/repos/scrum4me-workers"]
+   32      on_failure: continue
+   33  
+   34    - command_key: git_pull
+   35      args: ["/srv/scrum4me/repos/scrum4me-workers"]
+   36      on_failure: abort
+   37  
+   38    - command_key: git_submodule_update
+   39      args: ["/srv/scrum4me/repos/scrum4me-workers"]
+   40      on_failure: abort
+   41  
+   42    - command_key: docker_compose_build_scrum4me_workers_with_metadata
+   43      on_failure: abort
+   44  
+   45    - command_key: docker_compose_up_recreate
+   46      args: ["scrum4me-workers"]
+   47      on_failure: abort
+   48  
+   49    - command_key: wait_for_health_workers
+   50      on_failure: continue
+   51  
+   52    - command_key: curl_smoke_workers
 ```
