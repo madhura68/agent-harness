@@ -214,3 +214,35 @@ JP koos bij de ceremonie-poort "Eerst delta-review rev 3".
 - **Verwerking:** de stelling is in S1-T1 vervangen door een controle die de uitvoerder zelf draait, met de instructie om een eventuele bestaande test uit te breiden.
 
 **Plan-fase afgerond:** dubbel GO (ronde 2) en delta-GO (rev 3), met de delta-MINOR verwerkt.
+
+## Ceremonie (2026-10-20)
+
+JP koos "Ceremonie starten" na de delta-GO.
+
+**Eerste poging:** `create_sprint` onder scrum4me-workers met `idea_id` werd geweigerd: het idee hoorde alleen bij Agent-harness. Er is niets aangemaakt. JP maakte scrum4me-workers secundair product van IDEA-269; daarna is de ceremonie opnieuw gestart.
+
+| Object | Code | id | idea_link |
+|---|---|---|---|
+| Sprint | S-2026-10-20-1 | `cmvgq3a6n00407217jk6lm80h` | `build_sprint_id`: **set** |
+| PBI | PBI-47 | `cmvgq3kqa00417217kphcfhdz` | `pbi_id`: **set** |
+
+`source_docs` (de PLAN-doc) is weggelaten: de MCP weigert een doc van een ander product (Agent-harness). De PBI-beschrijving noemt het spec-pad.
+
+**Stories en taken** (implementation_plan letterlijk uit de frontmatter van rev 3 @ `970dbd9`; schatting per taak):
+
+| Story | Taak | Repo | min / $ |
+|---|---|---|---|
+| ST-083 S1 | T-270 Enum ModelOrigin en model AgentModelFacts | scrum4me-shared | 6 / 3,50 |
+| | T-271 Helpermodule model-registry-fields en de list-price-pin | scrum4me-shared | 9 / 5,50 |
+| ST-084 S2 | T-272 Shared-bump, migratie, additief contract en tests | Scrum4Me | 18 / 11,00 |
+| | T-273 Chat: 'gehost' uit agent_model_facts.origin | Scrum4Me | 10 / 7,00 |
+| ST-085 S3 | T-274 Shared-bump, registry-lib met facts en drie secties | scrum4me-workers | 14 / 9,00 |
+| | T-275 Model toevoegen: verplichte herkomst | scrum4me-workers | 10 / 7,00 |
+| | T-277 Driftcheck db:check-harness-registry | scrum4me-workers | 13 / 8,50 |
+| ST-086 S4 | T-276 Shared: oude lijst verwijderen | scrum4me-shared | 5 / 2,50 |
+| | T-278 agent-harness runbook | agent-harness | 4 / 1,50 |
+| | T-279 Uitrol en praktijkproef I1 met JP | (product: workers) | 4 / 2,50 |
+
+`verify_only` van T-279 staat in de taakbeschrijving; `create_task` kent dat veld niet.
+
+Na de laatste taak: idee op PLANNED. Hardstop: er is nog niets geïmplementeerd.
