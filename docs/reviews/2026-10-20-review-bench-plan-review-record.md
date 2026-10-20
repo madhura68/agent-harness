@@ -184,3 +184,37 @@ De test vangt het defect: een onvoorwaardelijke override zou COST_LIMIT_EXCEEDED
 **GO: de delta is klaar** (revisie 8, `25be81bf`). Volgens JP's keuze ("pas na GO de ceremonie") volgt nu de ceremonie. Een technisch GO autoriseert geen uitvoering, merge of deployment.
 
 **Scope-delta d2.** Geen.
+
+## Ceremonie (2026-10-20)
+
+Volgens JP's keuze ("pas na GO de ceremonie"), vanuit plan revisie 8 (`25be81bf`). Het plan staat op het idee als ProductDoc `idea-270-plan`, revisie 3 (`cmvgsqzzl0032fl177nz88u33`, status PLAN_READY). De server herformatteert de YAML-frontmatter: 63 551 tekens tegen 63 487 lokaal. Begin en eind zijn gelijk.
+
+| Object | Id / code | idea_link |
+|---|---|---|
+| Sprint | `cmvgsscuk003hfl17u41uid6k` (S-2026-10-20-1) | `build_sprint_id`: **set** |
+| PBI | `cmvgssj2c003ifl171c4rmqdd` (PBI-12), source_doc PLAN rev 3 | `pbi_id`: **set** |
+| Story S1 | `cmvgssphb003kfl17ic8qomfe` (ST-032) | — |
+| Story S2 | `cmvgssrjo003lfl17tb3otgpi` (ST-033), repo max2 | — |
+
+**Taken.** Ze komen in de volgorde van het plan. Elke taak heeft:
+- de `implementation_plan` letterlijk uit het plan;
+- een description met doel, referenties (spec, plan, review-records) en de Global Constraints;
+- een schatting.
+
+| Taak | Titel | Schatting |
+|---|---|---|
+| T-93 | createReadOnlyTools | 6 min / $4 |
+| T-94 | Gedeelde tracked client (C-m1) | 12 min / $9 |
+| T-95 | DispatchResult-schema en validator | 12 min / $8 |
+| T-96 | adaptReviewPrompt A1–A6 | 6 min / $4 |
+| T-97 | Review-case-lader | 9 min / $6 |
+| T-98 | runReviewBench | 20 min / $14 |
+| T-99 | CLI review-bench en README | 12 min / $8 |
+| T-100 | Drie configuraties in deploy/max2 | 6 min / $4 |
+| T-101 | Case, SOURCE.md, rubric, check_case.py (max2, alleen Mac) | 15 min / $10 |
+| T-102 | Driver run.py (max2) | 20 min / $14 |
+| T-103 | Scorer score.py (max2) | 20 min / $14 |
+
+**Totaal:** 138 min, $95. Basis is `get_estimate_history`: 4 meetbare taken (T-89 t/m T-92) met een tijdratio van 0,18–0,65 en ongeveer $0,3–1 per minuut.
+
+**Hardstop.** Materialiseren is geen uitvoeren. De sprint start alleen op JP's opdracht. P1–P4 zijn sessiestappen, elk op JP's go.
