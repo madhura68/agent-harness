@@ -6,6 +6,7 @@ import type { Manifest } from '../manifest.js'
 import { createModelClient, type ModelClient, type ReasoningEffort } from '../model-client.js'
 import { runManifest } from '../run.js'
 import { openTrace, type RunResult, type TraceWriter } from '../trace.js'
+import { modelSpecFor } from '../worker/job-configuration.js'
 import { checkProbeForJob } from '../worker/probe-gate.js'
 import { collectSecretValues, redactDeep, redactText } from '../worker/redact.js'
 import { createReadOnlyTools } from '../worker/task-tools.js'
@@ -154,12 +155,8 @@ export async function runReviewBench(o: {
 
     // One guard for the retry layer, which sees the answers that are dropped, and for the run loop, which sees the ones that come back.
     const guard = createCostGuard({ mode: configuration.costMode, ceilingNanos: parseCeilingNanos(c.maxCostUsd), configuration: o.configuration })
-    const spec: ModelSpec = {
-      baseUrl: o.config.litellm.baseUrl,
-      name: o.configuration,
-      ...(configuration.reasoningEffort !== undefined ? { reasoningEffort: configuration.reasoningEffort } : {}),
-      ...(configuration.extraBody !== undefined ? { extraBody: configuration.extraBody } : {}),
-    }
+    // The model block as the worker builds it for a job (`modelSpecFor`): one place decides what a configuration hands to the client.
+    const spec: ModelSpec = modelSpecFor(o.config, { name: o.configuration, configuration, maxCostUsd: c.maxCostUsd })
     // The key goes to the client and nowhere else: not into the manifest, so not into the trace, and not into the result.
     const base = (o.deps?.createClient ?? createModelClient)({ ...spec, ...(o.apiKey ? { apiKey: o.apiKey } : {}) })
     tracked = createTrackedClient(base, { retryTransient: configuration.costMode === 'hosted', trace, sleep: o.deps?.sleep, guard })

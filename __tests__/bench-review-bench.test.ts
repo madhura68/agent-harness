@@ -238,6 +238,18 @@ describe('runReviewBench: the run', () => {
     expect(written(s, result)).toEqual(JSON.parse(JSON.stringify(result)))
   })
 
+  it('stages an empty work/ next to payload.json and sources/, so list_files on it is an answer and not a tool error (the prompt says work/ is empty)', async () => {
+    const s = setup()
+    const { client } = scripted([toolReply('list_files', { path: 'work' }), reply(validAnswer())])
+    const { result } = await bench(s, client)
+
+    expect(result.status).toBe('beoordeeld')
+    expect(result.toolErrors).toBe(0)
+    expect(traceOf(s, result).find((e) => e.type === 'tool_result')).toMatchObject({ callId: 'call_1', ok: true })
+    expect(readdirSync(join(s.out, result.runId, 'root')).sort()).toEqual(['payload.json', 'sources', 'work'])
+    expect(readdirSync(join(s.out, result.runId, 'root', 'work'))).toEqual([])
+  })
+
   it.each(['succeeded', 'failed'])('a valid answer with outcome %s is beoordeeld: the scorer decides about the outcome', async (outcome) => {
     const s = setup()
     const { client } = scripted([reply(validAnswer({ outcome }))])
@@ -314,6 +326,25 @@ describe('runReviewBench: how a run ends (AC6)', () => {
     expect(result.status).toBe('beoordeeld')
     expect(result.validation.attempts).toBe(2)
     expect(result.validation.errors).toHaveLength(1)
+  })
+
+  it('a final answer with content null (reasoning only, no tool call) is one invalid answer, not a crash: one repeat question, then a valid answer is beoordeeld', async () => {
+    const s = setup()
+    const reasoningOnly: CompleteResult = { ...reply(''), message: { content: null, toolCalls: [] }, reasoning: 'let me think about the documents' }
+    const { client, seen } = scripted([reasoningOnly, reply(validAnswer())])
+    const { result } = await bench(s, client)
+    expect(result.status).toBe('beoordeeld')
+    expect(result.runStatus).toBe('completed')
+    expect(result.error).toBeUndefined()
+    expect(result.result).toEqual(VALID)
+    expect(result.validation).toEqual({ attempts: 2, errors: ['antwoord is niet precies één JSON-object'] })
+    expect(seen).toHaveLength(2)
+    // The empty answer stays in the transcript, followed by the repeat question with the reason.
+    expect(seen[1].messages.slice(-2)).toEqual([
+      { role: 'assistant', content: '' },
+      { role: 'user', content: 'antwoord is niet precies één JSON-object\n\nAntwoord alleen met het gecorrigeerde JSON-object.' },
+    ])
+    expect(traceOf(s, result).filter((e) => e.type === 'after_answer').map((e) => e.outcome)).toEqual(['retry', 'accept'])
   })
 
   it('an answer cut off by finishReason length is a limiet, and never reaches the validator', async () => {
@@ -434,6 +465,25 @@ describe('runReviewBench: answers that were dropped but paid for (plan-r1 X-M1, 
     expect(result.usage.costUsd).toBeCloseTo(1.2)
     expect(written(s, result).usage.costUsd).toBeCloseTo(1.2)
     expect(result.retries).toHaveLength(3) // the stopping answer is a record too, so its cost is on the bill
+  })
+
+  it('a dropped answer that reports no amount is a benchfout with COST_UNKNOWN, not the MODEL_ERROR that the stop looks like to the run: no retry, no tool', async () => {
+    const s = setup({ hosted: true })
+    // The second step is what a guard that did not stop would reach: a retry would get this tool answer and run the tool.
+    const { client, seen } = scripted([dropped(undefined, 'A'), toolReply('read_file', { path: 'payload.json' }, { cost: 0.05 })])
+    const { result } = await bench(s, client)
+    // COST_UNKNOWN is a BENCH_CODES code (mapReviewStatus rule 1): a cost that is unknown is a failure of the bench, never a limiet.
+    expect(result.status).toBe('benchfout')
+    expect(result.runStatus).toBe('failed')
+    expect(result.error?.code).toBe('COST_UNKNOWN')
+    expect(result.error?.message).toContain(TEST_CONFIGURATION)
+    expect(result.benchError).toBeUndefined()
+    expect(seen).toHaveLength(1)
+    expect(traceOf(s, result).some((e) => e.type === 'tool_result')).toBe(false)
+    expect(result.retries).toEqual([{ attempt: 1, kind: 'finish_other', provider: 'A' }]) // the stopping answer is a record, without an amount
+    expect(result.providers).toEqual(['A'])
+    expect(result.usage.costUsd).toBeUndefined() // nothing was reported, so nothing is on the bill
+    expect(written(s, result).error?.code).toBe('COST_UNKNOWN')
   })
 
   it('three dropped answers of 0.40 with the deadline passed by the third: timed_out stays, the status is limiet, there is no error', async () => {

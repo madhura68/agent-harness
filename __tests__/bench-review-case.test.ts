@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CaseInvalidError, loadReviewCase, ReviewCaseSchema, stageReviewCase } from '../src/bench/review-case.js'
@@ -325,14 +325,17 @@ describe('stageReviewCase', () => {
   /** A run dir that does not exist yet: the harness makes it. */
   const runDirOf = (): string => join(benchTmp('run'), 'run-1')
 
-  it('makes <runDir>/root with payload.json and sources/<key>, byte for byte, and nothing else', () => {
+  it('makes <runDir>/root with payload.json, sources/<key> byte for byte, and an empty work/, and nothing else', () => {
     const made = makeCase()
     const runDir = runDirOf()
 
     const root = stageReviewCase(loadReviewCase(made.dir), runDir)
 
     expect(root).toBe(join(runDir, 'root'))
-    expect(readdirSync(root).sort()).toEqual(['payload.json', 'sources'])
+    expect(readdirSync(root).sort()).toEqual(['payload.json', 'sources', 'work'])
+    // The prompt says "work/ is empty unless a repository checkout is provided", so a list_files on it must not be a tool error.
+    expect(statSync(join(root, 'work')).isDirectory()).toBe(true)
+    expect(readdirSync(join(root, 'work'))).toEqual([])
     expect(readdirSync(join(root, 'sources')).sort()).toEqual(['__dispatch_input', 'doc'])
     expect(bytesOf(root, 'payload.json').equals(bytesOf(made.dir, 'payload.json'))).toBe(true)
     expect(bytesOf(root, 'sources', 'doc').equals(bytesOf(made.dir, 'sources', 'doc'))).toBe(true)

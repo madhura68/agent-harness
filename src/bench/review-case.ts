@@ -170,9 +170,11 @@ export function loadReviewCase(caseDir: string): LoadedReviewCase {
 }
 
 /**
- * Makes the workspace `<runDir>/root` of the model: `payload.json` and `sources/<key>`, byte copies. Every file is hashed again on the
- * way, because the load is over by now, and all of them are read before anything is written, so a file that changed leaves no root
- * behind. A root that exists already is an error (EEXIST): a run never sees the files of another. Returns the path of the root.
+ * Makes the workspace `<runDir>/root` of the model: `payload.json` and `sources/<key>`, byte copies, and an empty `work/`. The
+ * production prompt says "`work/` is empty unless a repository checkout is provided", and in production `/work` is a checkout or empty;
+ * the bench provides no checkout, so `work/` exists and is empty, and the model's `list_files work/` is not a tool error. Every file is
+ * hashed again on the way, because the load is over by now, and all of them are read before anything is written, so a file that changed
+ * leaves no root behind. A root that exists already is an error (EEXIST): a run never sees the files of another. Returns the path of the root.
  */
 export function stageReviewCase(loaded: LoadedReviewCase, runDir: string): string {
   const { case: c, dir } = loaded
@@ -185,5 +187,6 @@ export function stageReviewCase(loaded: LoadedReviewCase, runDir: string): strin
   writeFileSync(join(root, 'payload.json'), payload)
   mkdirSync(join(root, 'sources'))
   for (const { key, bytes } of sources) writeFileSync(join(root, 'sources', key), bytes)
+  mkdirSync(join(root, 'work')) // empty: the bench provides no repository checkout
   return root
 }

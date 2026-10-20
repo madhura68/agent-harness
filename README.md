@@ -168,7 +168,7 @@ harness review-bench --case <dir> --config <harness.json> --configuration <name>
 - `--label`: één pad-onderdeel (letters, cijfers, `.`, `_` en `-`), met dezelfde regel als bij task-bench. Het wordt een deel van de naam van de run-map.
 - `--api-key-env`: de naam van de omgevingsvariabele met de masterkey van LiteLLM, onder dezelfde regels als `harness worker`. De waarde komt nooit in argv, uitvoer, trace of resultaat.
 
-**Uitvoer.** Op stdout staat één regel, `<status> <run-dir>`. In `<out>/<case-id>-<label>-<hex8>/` staan `root/` (de werkmap van het model: `payload.json` en `sources/`), `trace.jsonl` en `bench-result.json` (status, het aanvaarde resultaat of `null`, de validatiepogingen, tokens en kosten, `peakInputTokens`, providers en herhalingen). Zodra de sleutel gelezen is, wordt elke regel die review-bench op stdout of stderr schrijft ermee gemaskeerd, net als de trace en het resultaat: ook de melding bij een ongeldig label en die van een fout die het schrijven van het resultaat verhindert.
+**Uitvoer.** Op stdout staat één regel, `<status> <run-dir>`. In `<out>/<case-id>-<label>-<hex8>/` staan `root/` (de werkmap van het model: `payload.json`, `sources/` en een lege `work/`), `trace.jsonl` en `bench-result.json` (status, het aanvaarde resultaat of `null`, de validatiepogingen, tokens en kosten, `peakInputTokens`, providers en herhalingen). Zodra de sleutel gelezen is, wordt elke regel die review-bench op stdout of stderr schrijft ermee gemaskeerd, net als de trace en het resultaat: ook de melding bij een ongeldig label en die van een fout die het schrijven van het resultaat verhindert.
 
 **De vier statussen.**
 - `beoordeeld`: de run eindigde en de validator aanvaardde een `DispatchResult`, ongeacht het verdict. Of de run voldoet, beslist de scorer.
@@ -176,6 +176,6 @@ harness review-bench --case <dir> --config <harness.json> --configuration <name>
 - `limiet`: een grens van de case raakte op (beurten, tijd, uitvoertokens, toolfouten, het contextvenster of `maxCostUsd`).
 - `benchfout`: de bench zelf faalde, nooit een oordeel over het model: de gate weigerde, de modelaanroep faalde, een tool ontbrak (`TOOL_NOT_AVAILABLE`) of de harness zelf faalde, de kosten waren onbekend bij een gehoste configuratie, of de run is met Ctrl-C afgebroken (`benchError: "afgebroken"`).
 
-**Exitcode.** 0 zodra `bench-result.json` geschreven is, welke status ook; `benchfout` en `afgebroken` tellen mee. 1 bij een gebruiksfout, een ongeldige case (`CASE_INVALID`, op stderr) of een fout die het schrijven van het resultaat verhindert.
+**Exitcode.** 0 zodra `bench-result.json` geschreven is, welke status ook; `benchfout` en `afgebroken` tellen mee. 1 bij een gebruiksfout, een ongeldige case (`CASE_INVALID`, op stderr), een productieprompt waar de vervangingen van de bench niet meer op passen (`review-prompt: …`, op stderr, vóór er een run-map is) of een fout die het schrijven van het resultaat verhindert; in al die gevallen is er geen `bench-result.json`.
 
 Ontwerp en plan: [docs/specs/2026-10-20-review-bench-design.md](docs/specs/2026-10-20-review-bench-design.md), [docs/plans/M8-review-bench.md](docs/plans/M8-review-bench.md).
