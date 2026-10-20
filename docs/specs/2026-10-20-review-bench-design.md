@@ -2,7 +2,7 @@
 title: "Agent-harness M8 — remote modellen op een echte review (review-bench)"
 status: draft
 last_updated: 2026-10-20
-revision: 1
+revision: 2
 ---
 
 # Agent-harness M8 — remote modellen op een echte review (review-bench)
@@ -21,7 +21,7 @@ Voor IDEA-270. De grill met JP vond plaats op 2026-10-20 (ProductDoc `GRILLS/ide
 - Elke run is gescoord met de rubric (§4.6).
 - Per model staat er een oordeel volgens de beslisregel (§1, hieronder).
 
-**Eerste praktijkproef:** halverwege het increment (§4.8, stap 5). Op max2 draaien twee runs via LiteLLM: `qwen3.8-or-128k` en de controle `claude-sonnet-5.5`. De proef bewijst drie dingen voordat de 24 runs starten:
+**Eerste praktijkproef:** halverwege het increment (§4.8, stap 6). Op max2 draaien twee runs via LiteLLM: `qwen3.8-or-128k` en de controle `claude-sonnet-5.5-or`. De proef bewijst drie dingen voordat de 24 runs starten:
 - dat de prompt, de tools en de validator werken;
 - wat een run echt kost;
 - of de controle de bekende MAJOR vindt.
@@ -29,12 +29,13 @@ Voor IDEA-270. De grill met JP vond plaats op 2026-10-20 (ProductDoc `GRILLS/ide
 **Beslisregel per model.**
 - Een run **voldoet** als:
   - de harness een geldige `DispatchResult` aanvaardt (§4.4);
+  - `outcome` `succeeded` is. Een `failed` resultaat is in productie een mislukte job, ook met een verdict (`prompt` regel 47; `completion.ts:64-70`);
   - het verdict `NO-GO` is;
   - F1 gevonden is als MAJOR of BLOCKER;
   - er geen extra MAJOR of BLOCKER is die JP ongeldig verklaart.
 - **Kandidaat:** 3 van de 3 runs voldoen. **Twijfel:** 2 van de 3. Anders **valt het model af**.
 - Kosten en tijd staan in het rapport, zonder drempel.
-- **Geldigheid van de bench.** Is geen van beide harness-controles (`claude-sonnet-5.5` en `gpt-6.1-sol`, via de harness) kandidaat, dan luidt het oordeel voor alle modellen **onbeslist: runtime**. Het verschil met de productie-reviewers ligt dan aan de harness: de prompt, de tools, of het ontbreken van Claude Code en de Codex CLI eromheen. Dat wordt eerst onderzocht, en de open modellen worden nog niet beoordeeld.
+- **Geldigheid van de bench.** Is geen van beide harness-controles (`claude-sonnet-5.5-or` en `gpt-6.1-sol-or`, via de harness) kandidaat, dan luidt het oordeel voor alle modellen **onbeslist: runtime**. Het verschil met de productie-reviewers ligt dan aan de harness: de prompt, de tools, of het ontbreken van Claude Code en de Codex CLI eromheen. Dat wordt eerst onderzocht, en de open modellen worden nog niet beoordeeld.
 
 **Niet-doelen:**
 - **Een productie-runner voor `QUEUE_REVIEW`.** HARNESS kan die jobs niet claimen (§3). Dat wordt een eigen idee, als M8 een kandidaat oplevert.
@@ -43,7 +44,8 @@ Voor IDEA-270. De grill met JP vond plaats op 2026-10-20 (ProductDoc `GRILLS/ide
 - **Shell, git en code lezen.** De case is een review van alleen een document.
 - **Andere cases:** plan r4 (contextdruk) en ISS-2 (code lezen).
 - **Nieuwe open-weight modellen** (kimi, gpt-oss).
-- **Een judge-model.** Zie M5-besluit 4.
+- **Een judge-model.** M5-besluit 4 scoorde alleen met automatische checks. M8 scoort met de hand, volgens een rubric (besluit 6), en ook zonder judge-model.
+- **Een test die 128k context vraagt.** De minimale 128k is een eis aan de modelkeuze. De case zelf blijft ver onder het venster: Claude Code piekte op ~56k, waarvan ~18k de vaste basis van de CLI. Het rapport zet `peakInputTokens` naast het venster.
 - **Gedrag van de productie-worker.** Er komen drie configuraties bij, maar `runTaskJob`, `runIdeaChatJob` en `runAgentChatJob` veranderen niet.
 
 ## 2. Besluiten
@@ -74,7 +76,7 @@ Voor IDEA-270. De grill met JP vond plaats op 2026-10-20 (ProductDoc `GRILLS/ide
 - Er is geen MCP, er zijn geen skills, en er is geen max-turns- of kostenplafond.
 
 **Hoe productie het resultaat aanneemt.**
-- `finalizeChildResult` (`scrum4me-docker lib/dispatch-child.ts:197-222`, commit `75d2888`) controleert in deze volgorde:
+- `finalizeChildResult` (`scrum4me-docker lib/dispatch-child.ts:197-222`; het bestand is laatst gewijzigd in `75d2888` en gelezen op HEAD `78e7347d`) controleert in deze volgorde:
   1. `/output/result.json` is een gewoon bestand van hooguit 256 KiB.
   2. JSON en het strikte `dispatchResultSchema` (`scrum4me-shared lib/queue-dispatch-validation.ts:117-124`, commit `7c41ddc`).
   3. Bij een review moet `review` aanwezig zijn, ook bij `outcome: failed`. `canonical(review.documents)` moet gelijk zijn aan `canonical(input.review_documents)`: de volgorde van sleutels telt niet, de volgorde in arrays wel.
@@ -95,18 +97,14 @@ Voor IDEA-270. De grill met JP vond plaats op 2026-10-20 (ProductDoc `GRILLS/ide
   - de `afterAnswer`-hook (`run.ts:10-13`, `:434-440`);
   - de vorm van `bench-result.json` (`task-bench.ts:42-60`);
   - `withStopSignals` en `readJsonConfig` (`cli.ts`).
-- De werktools staan in `worker/task-tools.ts`. `createTaskTools` geeft altijd alle zes, waarvan drie schrijven, en `tools.allow` wordt voor registries in het proces niet afgedwongen. Er is dus een eigen factory nodig.
+- De werktools staan in `worker/task-tools.ts`.
+  - `createTaskTools` (`:553`) geeft altijd alle zes tools. Daarvan schrijven er twee (`write_file`, `edit_file`), en `run_tests` start de verify-container.
+  - `tools.allow` wordt voor registries in het proces niet afgedwongen. Er is dus een eigen factory nodig.
+  - `listFiles` (`:193`), `readFile` (`:234`) en `search` (`:389`) zijn losse functies in de module.
 - `createCostGuard` (`cost.ts:77`) bestaat, maar de bench gebruikt hem niet.
 - De probe-gate `checkProbeForJob` (`worker/probe-gate.ts:114`) bestaat.
 
-**Productieroute.** HARNESS kan `QUEUE_REVIEW` niet claimen. Er zijn zeven blokkades:
-- `eligibility.ts:40-52`;
-- de runtime-enums `CLAUDE|CODEX` in de dispatch-validatie en de registratie;
-- `job-adapter.ts:38-41`;
-- `harness-config.ts:6`;
-- `kind-prompts.ts:63`;
-- de HARNESS-spec, die reviews als non-goal noemt;
-- `worker.ts:123-137`.
+**Productieroute.** HARNESS kan `QUEUE_REVIEW` niet claimen. In deze repo is dat te zien aan `worker.ts:123-137`: die routeert alleen `TASK_IMPLEMENTATION`, `AGENT_CHAT` en `IDEA_CHAT`. De blokkades in de andere repo's (claimfilter, runtime-enums, enqueue, resolver, kind-prompts) staan in de inventarisatienotitie van de grill (IDEA-270). Ze zijn informatief, geen eis voor M8.
 
 ## 4. Opzet
 
@@ -125,6 +123,7 @@ harness review-bench --case <map> --config <harness.json> --configuration <naam>
   - `costMode`, voor de kostenbewaking.
 - Zo draait de bench precies de configuratie die productie zou draaien, inclusief het provider-blok van LiteLLM.
 - `--api-key-env` levert de masterkey van LiteLLM, met dezelfde regels als `worker`.
+- **CLI-aanpassingen.** `cliArgsConfig` is `strict` (`cli.ts:42-66`), dus `--probe-dir` en de andere nieuwe sleutels moeten daar bij. `withStopSignals` (`:517`) noemt in zijn melding "task-bench", en `requiredValues` (`:556`) is getypeerd op `TASK_BENCH_FLAGS`. Beide worden gegeneraliseerd, zonder gedragswijziging voor task-bench.
 
 **Probe-gate.**
 - `checkProbeForJob(config, <probe-dir>, <naam>)` controleert vóór elke modelaanroep.
@@ -158,7 +157,6 @@ harness review-bench --case <map> --config <harness.json> --configuration <naam>
 - `status` en `runStatus`, `error?`;
 - `result`: de aanvaarde `DispatchResult`, of `null`;
 - `validation`: het aantal pogingen en de foutmeldingen;
-- `sourceCoverage`: per bronsleutel het deel van de regels dat `read_file` teruggaf (§4.3);
 - `usage`: tokens in, uit, cache-read, reasoning en `costUsd`;
 - `peakInputTokens`: het grootste `inputTokens` van één respons;
 - `turns`, `toolCalls`, `toolErrors`, `providers[]`, `retries[]`, `durationMs`, `benchError?`.
@@ -167,7 +165,7 @@ harness review-bench --case <map> --config <harness.json> --configuration <naam>
 1. `benchfout`: de case of gate faalde, er is geen run, of `MODEL_ERROR`, `HARNESS_ERROR`, `TOOL_NOT_AVAILABLE` of `COST_UNKNOWN`.
 2. `limiet`: `budget_exceeded`, `timed_out`, `TOO_MANY_TOOL_ERRORS`, `CONTEXT_EXHAUSTED` of `COST_LIMIT_EXCEEDED`.
 3. `resultaat_ongeldig`: `failed` met `REVIEW_RESULT_INVALID`.
-4. `beoordeeld`: `completed` met een aanvaarde `DispatchResult`, ongeacht het verdict.
+4. `beoordeeld`: `completed` met een aanvaarde `DispatchResult`, ongeacht het verdict en ongeacht `outcome`. Of de run voldoet, beslist de scorer (§1): die eist ook `outcome: succeeded`.
 5. Al het andere: `benchfout`.
 
 **Exitcode.** Exit 0 als `bench-result.json` geschreven is, ongeacht de status. Anders exit 1, zoals bij task-bench.
@@ -176,9 +174,9 @@ harness review-bench --case <map> --config <harness.json> --configuration <naam>
 
 | Bestand | Inhoud | Bewijs |
 |---|---|---|
-| `case.json` | id, `prompt`, `payload`, `sources[]` (key, bestand, sha256), `limits`, `contextTokens: 131072`, `maxCostUsd: "1"` | — |
+| `case.json` | id, `prompt` en `payload` (elk een bestand plus sha256), `sources[]` (key, bestand, sha256), `limits`, `contextTokens: 131072`, `maxCostUsd: "1"` | — |
 | `review.md` | de productieprompt, onveranderd | sha256 `f56fe0a641ddb007e5216a2063b02460e60b9836c08cbc2229d8f8661fee4ead`, commit `e89c0961` |
-| `payload.json` | `{dispatch:{input, source_artifacts}}` van de **Claude-job** `1a78c1b8` (6942 B): het paar dat bij `review.md` hoort | structureel; er is geen hash van `payload.json` vastgelegd |
+| `payload.json` | `{dispatch:{input, source_artifacts}}` van de **Claude-job** `1a78c1b8` (6942 B): het paar dat bij `review.md` hoort | structureel gecontroleerd. Productie legde geen hash vast; de bevroren kopie krijgt nu sha256 `5a52a843cbca3f20cf9a6026a7764450b29217980aba4c9b70219c675aff4f8f` in `case.json` |
 | `sources/doc` | spec revisie 5 (30 673 B) | sha256 `7d5e35872c417a5656ef53794aff95675f3ac0716f6e3c46951d509f029fadaf` = payload = `sha256sum` in het log |
 | `sources/__dispatch_input` | `canonicalDispatchInput` van de input (6705 B) | sha256 `9f6580562a3d9847e49a82697782219f22ef949d4d1a4396040106b25aaef9e3` = `source_artifacts` |
 | `ref-result-claude.json`, `ref-result-codex.json` | de productieresultaten, gereconstrueerd uit de logs | NO-GO 0/1/6 en NO-GO 0/2/2 |
@@ -187,6 +185,7 @@ harness review-bench --case <map> --config <harness.json> --configuration <naam>
 
 - **Opslag.** De case bevat de tekst van een private MacSearch-spec en staat daarom alleen in de private max2-repo, zoals de M7-cases. In agent-harness komen alleen synthetische testfixtures.
 - **Logs.** De gekopieerde run-logs komen in geen enkele repo.
+- **Payload onveranderd.** De `objective` in de payload is de rondebody van productie. Daarin staat "Write only scratch files under `/tmp/`". De bench zet die tekst niet om: het is wat de productie-reviewers zagen, en zonder schrijftools heeft hij geen effect. `SOURCE.md` vermeldt dit.
 - **Limieten** in `case.json`:
   - `maxTurns: 30`;
   - `maxOutputTokens: 64000`, over de hele run (Claude gebruikte er hooguit 26k).
@@ -205,14 +204,12 @@ harness review-bench --case <map> --config <harness.json> --configuration <naam>
   - 300 regels voor `list_files`;
   - 20 000 tekens voor `read_file` zonder `offset`/`limit`;
   - 100 treffers en een worker-thread voor `search`.
-- Daarvoor krijgt `task-tools.ts` een gedeelde interne bouwer. `createTaskTools` verandert van buiten niet, en de bestaande tests blijven ongewijzigd groen.
+- `createReadOnlyTools` is een zusterfunctie in `task-tools.ts`:
+  - ze hergebruikt `listFiles`, `readFile`, `search` en de drie bijbehorende definities uit `TOOL_DEFS`;
+  - `createTaskTools` en de padbewaking blijven ongewijzigd, ook de foutteksten (die noemen "worktree");
+  - de bestaande tests blijven ongewijzigd groen.
 - **Waarom een factory en geen filter:** met een filter over `createTaskTools` blijven de schrijfpaden achter de registry bestaan. `allow` wordt niet afgedwongen (§3).
-- De foutteksten noemen de werkmap in plaats van "worktree", alleen in de read-only variant.
-
-**Dekking.**
-- Een omhulsel rond `read_file` houdt per bestand onder `sources/` bij welke regels er teruggegeven zijn.
-- `sourceCoverage` is het aantal unieke teruggegeven regels gedeeld door het aantal regels, per bronsleutel.
-- Doel: een NO-GO van een model dat de spec maar half las, is zo zichtbaar.
+- **Geen dekkingsmeting in M8.** Een omhulsel rond `read_file` zou meten vóór `runManifest` het resultaat aan het venster aanpast (`run.ts:492-510`), dus niet wat het model echt zag. De trace bevat de argumenten van elke `tool_call` en de `tool_window`-events, zodat dekking later uit de trace te berekenen is.
 
 ### 4.4 Validator (`afterAnswer`)
 
@@ -291,9 +288,9 @@ De validator speelt de controles van `finalizeChildResult` na. De stappen gelden
   - `f1`: `major` | `minor` | `nee`;
   - `f2`: `major` | `minor` | `nee`;
   - `minors`: een lijst uit M1–M6;
-  - `extra`: elke andere BLOCKER of MAJOR, met een voorstel `geldig` of `ongeldig` en één zin reden.
-- **JP** beslist per extra bevinding (`jp`: `geldig` | `ongeldig`).
-- `score.py` voegt daarna `scores.jsonl` en de `bench-result.json`'s samen en past de beslisregel van §1 toe.
+  - `extra`: elke andere BLOCKER of MAJOR, met een `key`, een voorstel `geldig` of `ongeldig` en één zin reden. De `key` is een korte genormaliseerde naam van de onderliggende bevinding (bijv. `x-temp-path-race`). Dezelfde bevinding in een andere run of bij een ander model krijgt dezelfde `key`.
+- **JP** beslist één keer per `key` (`decisions.json`: `key` → `geldig` | `ongeldig`). Die beslissing geldt voor alle runs met die `key`.
+- `score.py` voegt daarna `scores.jsonl`, `decisions.json` en de `bench-result.json`'s samen en past de beslisregel van §1 toe, inclusief `outcome: succeeded` uit `result`. Een `extra` zonder beslissing houdt het oordeel van dat model op "open".
 
 **Herkenning volgens het review-record van r5:**
 - **F1:** de crash- of startup-cleanup verwijdert een vastgelegd pad zonder identiteitscontrole, zodat een vreemd bestand op dat pad weg kan. Of de cleanup draait maar één keer, zodat een half bestand blijft staan. Eén van beide kernen telt.
@@ -320,6 +317,14 @@ De validator speelt de controles van `finalizeChildResult` na. De stappen gelden
 - de controle `on_openrouter` en het ophalen van de endpointlijst: de pin staat in `config.yaml`;
 - `PINNED_QUANTIZATIONS`.
 
+**Preflight.** Vóór de rookproef stuurt `run.py --preflight` per configuratie één aanvraag naar LiteLLM, met de standaardbibliotheek:
+- `max_tokens` 64 000, de echte grens van de case (§4.2);
+- de `reasoning_effort` van de configuratie;
+- één dummy-tool;
+- de opdracht "Antwoord alleen: OK".
+
+De preflight bewijst per configuratie dat er onder `max_price`, `data_collection: deny` en `require_parameters` een endpoint is dat deze aanvraag aanneemt. De probe bewijst dat niet: die gebruikt kleine aanvragen. Een configuratie die faalt, valt uit de bench (rapport) vóór er een venster loopt. De kosten tellen in het grootboek.
+
 **Volgorde.** De runs wisselen per ronde over de modellen: ronde 1 draait alle 8, daarna ronde 2, daarna ronde 3. Zo vallen storingen die van het tijdstip afhangen niet steeds op hetzelfde model.
 
 **Budget.** `--budget <USD>` is het plafond voor dit venster.
@@ -340,7 +345,7 @@ De validator speelt de controles van `finalizeChildResult` na. De stappen gelden
    - de validator en het gekopieerde schema;
    - `adaptReviewPrompt`;
    - de case-lader;
-   - `harness review-bench`;
+   - `harness review-bench`, met de CLI-generalisatie van §4.1;
    - `REVIEW_RESULT_INVALID`;
    - tests;
    - de README.
@@ -351,24 +356,28 @@ De validator speelt de controles van `finalizeChildResult` na. De stappen gelden
    - de case met `SOURCE.md`;
    - een controlescript dat alle hashes en de koppeling payload ↔ `sources` opnieuw controleert;
    - `rubric.md`;
-   - `run.py`, `score.py` en `models.json`, met tests (een nep-harness zoals in M7).
-4. **Release en herprobe op max2,** volgens `harness-service-max2.md` ("Upgrade"):
-   - `stop-check.sh`;
-   - `harness_release_update`;
-   - `litellm_upgrade`;
-   - `harness_probe` (alle configuraties);
-   - `harness_start`.
+   - `run.py` (met `--preflight`), `score.py` en `models.json`, met tests (een nep-harness zoals in M7).
+4. **Merge naar `main`** van de agent-harness-wijzigingen (stap 1 en 2), op JP's go.
+   - `release-update` bouwt de release van `origin/main` (runbook regel 43). Zonder merge kent productie `review-bench` en de drie configuraties niet.
+   - De release brengt ook de nieuwe `createReadOnlyTools`, de uitgebreide `ErrorCode` en de CLI-generalisatie naar productie. Het gedrag van de jobs verandert niet: AC1 en de bestaande tests bewijzen dat.
+5. **Release en herprobe op max2,** volgens `harness-service-max2.md` ("Upgrade"), in een venster zonder lopende HARNESS-jobs:
+   1. `stop-check.sh`;
+   2. `harness_release_update`;
+   3. `litellm_upgrade`. Controleer daarna `allow` in `/etc/agent-harness/harness.json`: `litellm_upgrade` zet het bestand terug op de kopie uit `current`;
+   4. `harness_probe` (alle configuraties);
+   5. **Lees elke `probe-<naam>/probe.json`, ook als de actie niet met 0 eindigt.** `--all` geeft exit 0 alleen als alles aanvaard is, dus een afgewezen nieuwe configuratie geeft dezelfde exit als een afgewezen bestaande;
+   6. `harness_start` alleen als alle negen bestaande configuraties een actuele aanvaarde probe hebben. Een afgewezen nieuwe configuratie valt uit de bench (rapport) en raakt productie niet.
 
-   Elke configuratie moet aanvaard zijn. Een nieuwe configuratie die niet aanvaard wordt, valt uit de bench (rapport) en raakt productie niet. Een bestaande die niet meer aanvaard wordt: stop, terugzetten volgens het runbook, en JP.
-5. **Rookproef** (op JP's go): `qwen3.8-or-128k` en `claude-sonnet-5.5-or`, één run elk, ≈ $0,50.
+   **Terugzetten**, als een bestaande configuratie niet meer aanvaard wordt: stop, en JP. De volgorde is `harness_release_rollback` → `litellm_upgrade` (die zet de bestanden uit de vorige `current` terug en maakt de container opnieuw) → `allow` controleren → `harness_probe` → per configuratie lezen → `harness_start`. Alleen `harness_release_rollback` volstaat niet: dan draait LiteLLM door met de nieuwe `config.yaml`, en de probe faalt opnieuw.
+6. **Preflight** (§4.7) voor alle acht configuraties, daarna de **rookproef** (op JP's go): `qwen3.8-or-128k` en `claude-sonnet-5.5-or`, één run elk, ≈ $0,50.
 
    Doorgaan als:
    - geen van beide runs `benchfout` is. `limiet` en `resultaat_ongeldig` van qwen zijn modelgedrag, geen fout van de bench;
-   - de sonnet-controle `beoordeeld` is en F1 vindt.
+   - de sonnet-run `beoordeeld` is, met `outcome: succeeded`, verdict `NO-GO` en F1 als MAJOR of BLOCKER. De beoordeling van extra bevindingen volgt pas bij het scoren.
 
-   Anders: stop en JP. De runs van de rookproef tellen niet mee in de 24.
-6. **De 24 runs** (op JP's go), in één of meer vensters.
-7. **Scoren:** blinde bladen, Claude vult in, JP beslist over de extra bevindingen, `score.py` maakt het rapport.
+   Anders: stop en JP. Dat is juist het signaal waar de controle voor is (§1). De runs van de rookproef tellen niet mee in de 24.
+7. **De 24 runs** (op JP's go), in één of meer vensters.
+8. **Scoren:** blinde bladen, Claude vult in, JP beslist één keer per `key`, en `score.py` maakt het rapport.
 
 ### 4.9 Het rapport (`llm-bench/results/review-bench-<datum>.md`, max2)
 
@@ -383,14 +392,18 @@ De validator speelt de controles van `finalizeChildResult` na. De stappen gelden
   - tokens en piekcontext;
   - wandtijd en turns;
   - toolfouten;
-  - `sourceCoverage`.
+  - `outcome`.
+- **Venster:** `peakInputTokens` naast de 131072 van het venster, zodat duidelijk is hoeveel context de case echt vroeg.
 - **Eerste vergelijking:** de open modellen tegenover de **harness-controles**.
 - **Context, als aparte rijen:** de productieruns `1a78c1b8` (Claude Code, $0,39) en `7146cbe9` (Codex CLI, ≈ $0,10).
 - **Verder:** het venster of de vensters, het grootboek, de probe-uitslagen, afwijkingen en wat het oordeel betekent voor een vervolgidee (productie-runner).
 
 ## 5. Acceptatiecriteria
 
-1. **Read-only.** De registry van `createReadOnlyTools` biedt precies `list_files`, `read_file` en `search`. Een aanroep van `write_file`, `edit_file` of `run_tests` geeft `UNKNOWN_TOOL`. Een pad buiten de root, via `..` of een symlink, wordt geweigerd. De tests van `createTaskTools` blijven ongewijzigd groen.
+1. **Read-only.** De registry van `createReadOnlyTools` biedt precies `list_files`, `read_file` en `search`.
+   - Een aanroep van `write_file`, `edit_file` of `run_tests` geeft `UNKNOWN_TOOL`.
+   - Een pad buiten de root, via `..` of een symlink, wordt geweigerd.
+   - `createTaskTools` is ongewijzigd: de diff raakt die functie en de padbewaking niet, en de bestaande tests blijven ongewijzigd groen.
 2. **Validator.** Een geldig productieresultaat wordt aanvaard (een synthetische fixture in de vorm van `ref-result-*`). Elk van de volgende geeft precies één herhaalvraag en daarna `REVIEW_RESULT_INVALID`:
    - tekst rond het object;
    - een onbekende sleutel;
@@ -399,18 +412,29 @@ De validator speelt de controles van `finalizeChildResult` na. De stappen gelden
    - een resultaat boven 256 KiB.
    - Een object in één fence ` ```json ` wordt aanvaard.
 3. **Prompt.** `adaptReviewPrompt` op de fixture geeft exact de vastgelegde verwachting. Buiten A1–A6 zijn alle regels byte-gelijk. Een prompt met één ontbrekende of extra treffer laat de functie gooien.
-4. **Case.** Een gewijzigde byte in `sources/doc` of in `review.md` geeft `CASE_INVALID` zonder run-map. Een case zonder `contextTokens` wordt geweigerd.
+4. **Case.** Een gewijzigde byte in `sources/doc`, `review.md` of `payload.json` geeft `CASE_INVALID` zonder run-map. Een case zonder `contextTokens` wordt geweigerd.
 5. **Gate en kosten.** Een configuratie zonder aanvaarde probe geeft `benchfout` met `CONFIGURATION_NOT_PROBED` en geen modelaanroep (nepclient). Met een nepclient geeft een antwoord zonder bedrag bij `hosted` `COST_UNKNOWN`, en een totaal boven `maxCostUsd` met openstaande tool-aanroepen `COST_LIMIT_EXCEEDED`.
 6. **Statusmapping.** Elke regel van §4.1 heeft een test.
-7. **Sleutel.** Een dummywaarde in de variabele van `--api-key-env` staat nergens in stdout, stderr, `trace.jsonl` of `bench-result.json`.
+7. **Sleutel.** Een dummywaarde in de variabele van `--api-key-env` staat nergens in stdout, stderr, `trace.jsonl` of `bench-result.json`. De test loopt over paden die de waarde zouden lekken:
+   - een nepclient die een `ModelError` gooit met de waarde in de melding;
+   - een antwoordbody die de waarde bevat.
 8. **Deploy.** `deploy-max2.test.ts` legt de 12 namen vast, en de waarden van de drie nieuwe configuraties, met een eigen anker. `npm run verify` is groen.
-9. **max2.** Het controlescript bevestigt alle hashes van de case. De unittests van `review_bench` zijn groen, en die van `task_bench` blijven groen.
-10. **Praktijk.** De rookproef (§4.8, stap 5) staat met haar bewijs in het rapport. Het rapport heeft 24 runs, of legt per ontbrekende run uit waarom (benchfout, of een configuratie die niet geprobed was).
+9. **max2.** Het controlescript bevestigt alle hashes van de case. De unittests van `review_bench` zijn groen, ook die van `--preflight` met een nep-LiteLLM. Die van `task_bench` blijven groen.
+10. **Praktijk.** De preflight en de rookproef (§4.8, stap 6) staan met hun bewijs in het rapport.
+11. **Beslisregel.** `score.py` wordt getest met synthetische `bench-result`-, `scores`- en `decisions`-fixtures:
+    - 3/3 geeft kandidaat, 2/3 twijfel en 1/3 valt af;
+    - een run met `outcome: failed` en `NO-GO` voldoet niet;
+    - een extra MAJOR met `key` beslist als `ongeldig` laat de run niet voldoen, en dat geldt in elke run met die `key`;
+    - een `extra` zonder beslissing geeft "open";
+    - zijn beide controles geen kandidaat, dan is het oordeel voor alle modellen "onbeslist: runtime";
+    - een blind scoreblad bevat geen configuratienaam en geen modelnaam. Het rapport heeft 24 runs, of legt per ontbrekende run uit waarom (benchfout, of een configuratie die niet geprobed was).
 
 ## 6. Risico's en open punten
 
 - **Productiewijziging.** De herprobe raakt alle 12 configuraties. Die gaat in een venster zonder lopende HARNESS-jobs, met het runbook voor terugzetten.
-- **Data.** De MacSearch-spec gaat naar OpenRouter-providers, ook OpenAI, Azure, Bedrock, Google en Anthropic, met `data_collection: deny`. Of een provider aan het filter voldoet, blijkt pas uit de probe.
+- **Data.** De MacSearch-spec gaat naar OpenRouter-providers, ook OpenAI, Azure, Bedrock, Google en Anthropic, met `data_collection: deny`. Of een provider aan het filter voldoet, blijkt pas uit de probe en de preflight.
+  - Dit wijkt af van M5-besluit 3, waar alleen Agent-harness-docs naar OpenRouter mochten.
+  - JP koos in deze grill de MacSearch-case met de route via OpenRouter (besluiten 2 en 4).
 - **Kosten van de controles.** Sonnet en sol schatten we op ~$0,35–0,45 per run. De bench zelf heeft geen prompt-cache-strategie, dus de kosten kunnen hoger uitvallen dan in productie. De rookproef meet het.
 - **Vergelijkbaarheid.** De harness mist de systeemprompt van Claude Code en die van de Codex CLI. Juist daarom zijn er de controles en de geldigheidsregel (§1).
 - **Eén case.** Het oordeel geldt voor een review van alleen een document, met één bekende MAJOR. Een kandidaat is nog geen bewijs voor plan-reviews of reviews met code. Dat staat in het rapport.
