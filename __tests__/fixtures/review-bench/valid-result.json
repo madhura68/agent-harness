@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "outcome": "succeeded",
+  "summary": "Synthetic review of an example spec and plan: GO, with one minor remark on naming.",
+  "report_markdown": "# Review of the example spec and plan\n\n## Verdict\n\nGO. The plan follows the spec step by step.\n\n## Findings\n\n- MINOR: the plan calls the cache `store`, the spec calls it `cache`.\n\n## Checked\n\nBoth documents were read in full from /sources.",
+  "checks": [
+    { "name": "spec read in full", "status": "passed", "evidence": "Read /sources/spec from the first line to the last; 40 lines." },
+    { "name": "plan matches spec", "status": "passed", "evidence": "Every step of the plan maps to a section of the spec." },
+    { "name": "cross-check with the code", "status": "not_run", "evidence": "No repository was mounted for this synthetic review." }
+  ],
+  "review": {
+    "verdict": "GO",
+    "documents": {
+      "version": 1,
+      "items": [
+        {
+          "key": "spec",
+          "title": "Example spec",
+          "product_id": "example-product",
+          "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "source": "git",
+          "path": "docs/example/spec.md",
+          "commit_sha": "0123456789abcdef0123456789abcdef01234567"
+        },
+        {
+          "key": "plan",
+          "title": "Example plan",
+          "product_id": "example-product",
+          "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+          "source": "product_doc",
+          "doc_id": "doc-0001",
+          "revision_id": "rev-0001"
+        }
+      ]
+    }
+  }
+}

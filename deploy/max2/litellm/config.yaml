@@ -87,6 +87,40 @@ model_list:
       timeout: 600
       extra_body: *or-fp8-extra
     model_info: *or-reasoning-info
+  # M8 review-bench (2026-10-20): three proprietary models, so the review bench can compare them with the open-weight ones
+  # above. There is no quantizations pin: proprietary endpoints do not publish a quantization, so a filter on one would leave
+  # no endpoint at all. The max_price (USD per million tokens) sits above the FP8 limit of 2/5 because the proprietary models
+  # cost more than the open-weight ones; 3/12 still keeps an expensive endpoint out. The rest of the provider block is the
+  # same as for the FP8 models. supports_reasoning: true for the same reason as ISS-5 above.
+  - model_name: gpt-6-luna-or
+    litellm_params:
+      model: openrouter/openai/gpt-6-luna
+      api_key: os.environ/OPENROUTER_API_KEY
+      timeout: 600
+      extra_body: &or-proprietary-extra
+        provider:
+          data_collection: "deny"
+          require_parameters: true
+          allow_fallbacks: true
+          sort: "price"
+          max_price:
+            prompt: 3
+            completion: 12
+    model_info: *or-reasoning-info
+  - model_name: claude-sonnet-5.5-or
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-5.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      timeout: 600
+      extra_body: *or-proprietary-extra
+    model_info: *or-reasoning-info
+  - model_name: gpt-6.1-sol-or
+    litellm_params:
+      model: openrouter/openai/gpt-6.1-sol
+      api_key: os.environ/OPENROUTER_API_KEY
+      timeout: 600
+      extra_body: *or-proprietary-extra
+    model_info: *or-reasoning-info
 
 litellm_settings:
   turn_off_message_logging: true

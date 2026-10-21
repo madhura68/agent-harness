@@ -23,9 +23,12 @@ describe('deploy/max2/harness.json', () => {
 
   it('voldoet aan het strikte workerschema en noemt precies de configuraties uit litellm/config.yaml', () => {
     expect(Object.keys(cfg.configurations).sort()).toEqual([
+      'claude-sonnet-5.5-or',
       'deepseek-v4-flash-or',
       'deepseek-v4-pro-or',
       'glm-5.3-or',
+      'gpt-6-luna-or',
+      'gpt-6.1-sol-or',
       'gsq-lokaal',
       'minimax-m3-or',
       'qwen3.8-or',
@@ -55,12 +58,43 @@ describe('deploy/max2/harness.json', () => {
       expect(cfg.configurations[naam]).toEqual({ costMode: 'hosted', contextTokens: 65536, reasoningEffort: 'high' })
     }
     expect(cfg.configurations['minimax-m3-or']).toEqual({ costMode: 'hosted', contextTokens: 65536 })
+    // M8 review-bench: three proprietary models behind OpenRouter, all with the 131072 window the review case needs.
+    expect(cfg.configurations['gpt-6-luna-or']).toEqual({ costMode: 'hosted', contextTokens: 131072, reasoningEffort: 'medium' })
+    expect(cfg.configurations['claude-sonnet-5.5-or']).toEqual({ costMode: 'hosted', contextTokens: 131072, reasoningEffort: 'high' })
+    expect(cfg.configurations['gpt-6.1-sol-or']).toEqual({ costMode: 'hosted', contextTokens: 131072, reasoningEffort: 'medium' })
+    // The new configurations come last (review record round 2, C-m3), after the existing ones, in this order.
+    expect(Object.keys(cfg.configurations).slice(-3)).toEqual(['gpt-6-luna-or', 'claude-sonnet-5.5-or', 'gpt-6.1-sol-or'])
   })
 
   it('pint de vergelijkingsmodellen op FP8 zonder dataverzameling, en houdt qwen3.8-or op BF16', () => {
     expect(yaml).toMatch(/extra_body: &or-fp8-extra\n\s+provider:\n\s+quantizations: \["fp8"\]\n\s+data_collection: "deny"/)
     expect(yaml.match(/extra_body: \*or-fp8-extra/g)).toHaveLength(3)
     expect(yaml).toMatch(/quantizations: \["bf16"\]/)
+  })
+
+  it('geeft de drie propriëtaire modellen één provider-blok zonder quantizations, met de OpenRouter-modelnamen en alleen een sleutelverwijzing', () => {
+    // The anchor is defined once, on the first proprietary item, and carries no quantizations pin: proprietary endpoints do not publish one.
+    expect(yaml.match(/&or-proprietary-extra/g)).toHaveLength(1)
+    expect(yaml).toMatch(
+      /extra_body: &or-proprietary-extra\n\s+provider:\n\s+data_collection: "deny"\n\s+require_parameters: true\n\s+allow_fallbacks: true\n\s+sort: "price"\n\s+max_price:\n\s+prompt: 3\n\s+completion: 12\n/,
+    )
+    expect(yaml.match(/extra_body: \*or-proprietary-extra/g)).toHaveLength(2)
+    // Each of the three items: its model_name, the OpenRouter model, the key reference, the timeout and the reasoning model_info.
+    for (const [naam, model] of [
+      ['gpt-6-luna-or', 'openrouter/openai/gpt-6-luna'],
+      ['claude-sonnet-5.5-or', 'openrouter/anthropic/claude-sonnet-5.5'],
+      ['gpt-6.1-sol-or', 'openrouter/openai/gpt-6.1-sol'],
+    ] as const) {
+      const blok = yaml.match(new RegExp(`- model_name: ${naam.replace(/\./g, '\\.')}\\n((?:    .*\\n)+)`))
+      expect(blok, naam).not.toBeNull()
+      expect(blok![1]).toContain(`model: ${model}\n`)
+      expect(blok![1]).not.toContain('quantizations')
+      expect(blok![1]).toContain('api_key: os.environ/OPENROUTER_API_KEY\n')
+      expect(blok![1]).toContain('timeout: 600\n')
+      expect(blok![1]).toMatch(/model_info: \*or-reasoning-info\n$/)
+    }
+    // The FP8 anchor is untouched: still three users and no proprietary item points at it.
+    expect(yaml.match(/extra_body: \*or-fp8-extra/g)).toHaveLength(3)
   })
 
   it('geeft een taak met repo_url de repo-sleutel voor agent-harness en bevat geen geheime waarde', () => {

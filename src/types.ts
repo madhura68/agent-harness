@@ -59,6 +59,7 @@ export type ErrorCode =
   | 'COST_UNKNOWN'
   | 'PRODUCT_SCOPE'
   | 'TOOL_BUDGET'
+  | 'REVIEW_RESULT_INVALID'
 
 // Tool contracts live here so run.ts and registry.ts share the same types.
 export type ServerSpec = { command: string; args: string[]; env?: Record<string, string> } // = Manifest.tools.server

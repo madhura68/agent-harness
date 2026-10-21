@@ -47,6 +47,21 @@
     "minimax-m3-or": {
       "costMode": "hosted",
       "contextTokens": 65536
+    },
+    "gpt-6-luna-or": {
+      "costMode": "hosted",
+      "contextTokens": 131072,
+      "reasoningEffort": "medium"
+    },
+    "claude-sonnet-5.5-or": {
+      "costMode": "hosted",
+      "contextTokens": 131072,
+      "reasoningEffort": "high"
+    },
+    "gpt-6.1-sol-or": {
+      "costMode": "hosted",
+      "contextTokens": 131072,
+      "reasoningEffort": "medium"
     }
   },
   "mcp": {

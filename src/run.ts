@@ -10,7 +10,7 @@ import type { ChatMessage, CompleteResult, ErrorCode, RunStatus, ToolCall, ToolD
 export type AfterAnswerResult =
   | { kind: 'accept' } // run ends as completed with this answer
   | { kind: 'retry'; message: string } // added as a user message; the loop continues
-  | { kind: 'fail'; code: 'VERIFY_FAILED'; message: string } // run ends as failed
+  | { kind: 'fail'; code: 'VERIFY_FAILED' | 'REVIEW_RESULT_INVALID'; message: string } // run ends as failed
 
 /**
  * The cost ceiling of a run (M45-2d). The worker passes the guard of the job; a run without one (the CLI) has no ceiling. A stop is the
