@@ -77,3 +77,24 @@ Repository: `agent-harness@97902ddf`. De body bevatte de delta en de remedies va
 **Scope-delta.** De indeling wordt preciezer, en de releasecontrole krijgt één extra `stat`. Er komt geen bouwwerk bij. Het eerste bruikbare resultaat en de eerste praktijkproef blijven gelijk.
 
 **Nog een delta-ronde.** Grill-besluit 9 vraagt een delta-ronde bij een MAJOR, en ronde 2 gaf er één (D-M1). Ronde 3 is daarom weer een delta-ronde.
+
+## Ronde 3 (delta): revisie 3 (`a8e85dbfd3f372d9cfac31ec406793ab8172ca01`)
+
+**Pins:**
+- `plan` @`a8e85dbf`, sha256 `9e76a9138dd21788f0fa1b472d58689b06c127b52b3fcb0e7786a18aa63ef214`;
+- `plan-rev2` @`97902ddf`, sha256 `6d3a6686b7dffb8ac7ed7d4dc5440596c2f95c7c680b440fe857f00fcd304b62`.
+
+Repository: `agent-harness@a8e85dbf`.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `38658448-8706-452e-9013-b58ee340ca94` | `82242645-61c6-4ae7-a621-349d36b73ce1` | `eb33cb73-2660-4a2b-b95d-2d769dfc6122` | linked (PLAN) | **GO** 0/0/0 |
+
+**D-M1, D-m2 en D-m3 zijn opgelost.** De reviewer controleerde ze tegen de tree.
+- **D-M1.** Elk terminaal limietpad valt onder precies één regel van §4.3 (`src/run.ts:248, 333-353, 373, 384-391, 412-415, 464, 497-499, 513-514`, en `src/cost.ts:84-87`). De output-telling past bij de grens ≥ B. Een length-antwoord mét toolcalls dat eindigt in een time-out valt alleen onder regel 1.
+- **D-m2.** De link-mtime maakt een A→B→A-wissel via `swap_current` zichtbaar (`agent-harness-ops.sh:211-224`).
+- **D-m3.** §8 legt de verificatiegrens vast.
+
+Er zijn geen nieuwe bevindingen. De reviewer heeft geen tests of build gedraaid: de container heeft geen `node_modules` en geen registry. Ook de max2-checks heeft hij niet gedraaid.
+
+**Uitkomst.** Plan revisie 3 (`a8e85dbf`) heeft GO. Volgens de methodiek wachten nu de ceremonie (1 story, 2 taken) en de vensters op JP.
