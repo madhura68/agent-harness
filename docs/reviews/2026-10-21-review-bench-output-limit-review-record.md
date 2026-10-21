@@ -98,3 +98,20 @@ Repository: `agent-harness@a8e85dbf`.
 Er zijn geen nieuwe bevindingen. De reviewer heeft geen tests of build gedraaid: de container heeft geen `node_modules` en geen registry. Ook de max2-checks heeft hij niet gedraaid.
 
 **Uitkomst.** Plan revisie 3 (`a8e85dbf`) heeft GO. Volgens de methodiek wachten nu de ceremonie (1 story, 2 taken) en de vensters op JP.
+
+## Ceremonie (JP's go, 2026-10-21)
+
+JP accepteert de afwijking in de kop van het rapport (plan §4.4). PR janpeter/agent-harness#61 is gemerged.
+
+| Object | Id | idea_link |
+|---|---|---|
+| Sprint `S-2026-10-21-1` | `cmvicha43008hfl17s8mwe6jv` | `build_sprint_id`: set |
+| PBI-13 | `cmvichdyk008ifl17wdmi97o9`, met bronnen PLAN `cmvica2zy007ofl17d8rvvas9` en GRILL `cmvi9u240006nfl175cy77fma` | `pbi_id`: set |
+| Story ST-034 | `cmvichjn0008lfl175lm1x2gv`, repo max2 | — |
+
+| Taak | Titel | Schatting |
+|---|---|---|
+| T-104 (`cmvichyjj008mfl17vlj4tse6`) | Case-varianten out128k/out256k en het preflight-plafond in run.py | 8 min / $6 |
+| T-105 (`cmvicib75008nfl17aap1qy9m`) | Het 128k-venster en zo nodig het 256k-venster op max2, met rapporten (op JP's go) | 45 min / $30 |
+
+IDEA-272 staat op PLANNED. Er is een hardstop: de uitvoering begint pas op JP's opdracht.
