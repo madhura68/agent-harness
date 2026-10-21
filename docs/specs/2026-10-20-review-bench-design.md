@@ -1,13 +1,15 @@
 ---
 title: "Agent-harness M8 — remote modellen op een echte review (review-bench)"
 status: reviewed
-last_updated: 2026-10-20
-revision: 2
+last_updated: 2026-10-21
+revision: 3
 ---
 
 # Agent-harness M8 — remote modellen op een echte review (review-bench)
 
 Voor IDEA-270. De grill met JP vond plaats op 2026-10-20 (ProductDoc `GRILLS/idea-270-grill`, revisie 2). Alle besluiten in §2 zijn van JP. De inventarisatie in §3 is gemeten aan de dispatch-run-logs van scrum4me-server.
+
+Revisie 3 (2026-10-21) is een erratum na de dubbele GO van revisie 2: de werkmap krijgt een lege `work/` (§4.1). De delta-review staat in het plan-record, `docs/reviews/2026-10-20-review-bench-plan-review-record.md`.
 
 ## 1. Doel, eerste resultaat, niet-doelen
 
@@ -135,7 +137,7 @@ harness review-bench --case <map> --config <harness.json> --configuration <naam>
 - de payload tegen de lijst `sources`.
 - Een afwijking is een `benchfout` met `CASE_INVALID: <bestand>`, nog vóór de run-map.
 
-**Werkmap.** De harness kopieert `payload.json` en `sources/` naar een verse `<run>/root/`. De tools zien alleen die map.
+**Werkmap.** De harness kopieert `payload.json` en `sources/` naar een verse `<run>/root/`, met een lege `work/` ernaast. De tools zien alleen die map. `review.md` zegt dat `work/` leeg is tenzij er een checkout is; de payload heeft geen `requirements.repository`, dus in productie was `/work` leeg, en een `list_files work/` van het model is geen toolfout.
 
 **Limieten** komen uit `case.json` (`limits`).
 - `contextTokens` komt **uit de case en niet uit de configuratie**: 131072, terwijl de bestaande deployments op 65536 staan.

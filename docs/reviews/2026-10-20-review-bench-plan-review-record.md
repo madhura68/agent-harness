@@ -218,3 +218,36 @@ Volgens JP's keuze ("pas na GO de ceremonie"), vanuit plan revisie 8 (`25be81bf`
 **Totaal:** 138 min, $95. Basis is `get_estimate_history`: 4 meetbare taken (T-89 t/m T-92) met een tijdratio van 0,18–0,65 en ongeveer $0,3–1 per minuut.
 
 **Hardstop.** Materialiseren is geen uitvoeren. De sprint start alleen op JP's opdracht. P1–P4 zijn sessiestappen, elk op JP's go.
+
+## Delta-ronde 3: revisie 9 en spec revisie 3 (`6a56af139de53732a5b6cdac7443e704e0d232fb`), na de bouw (2026-10-21)
+
+JP koos "Edit + Codex delta review": drie errata die de bouw liet zien, met één delta-review door Codex. P1–P3 wachten er niet op; P4 wel. De claude-sessie schreef de wijziging, dus reviewt de andere modelfamilie.
+
+1. Een lege `work/` in de werkmap: spec §4.1 "Werkmap" en plan S1-5. De code kwam uit de eindreview van S1 (`d5deefd`).
+2. P4 stap 4 krijgt `--notes R/notes.md`.
+3. P4 stap 4 zegt dat `--smoke-dir` en `--smoke-scores` samengaan, en dat `--smoke-scores` een bestaand bestand moet zijn.
+
+**Pins:**
+- `plan` @`6a56af13`, sha256 `22030042567af3cce63e41ab93a26aa4a2768b5d8d3dcbd4f886db9811874c90`;
+- `spec` @`6a56af13`, sha256 `d254034a0dc62fd9ca95fc91c0b77ab3b7eb54a03850462dd704c5b4c53b7a57`.
+
+Repository: `agent-harness@6a56af13`. De delta (`git diff HEAD~1..HEAD`) en een excerpt van max2 `score.py` @`29493ab1` stonden in de body. score.py ligt buiten `/work`.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `54af0923-4870-4077-a122-76588d46161b` | `2cc4db75-a2be-4297-96cf-e233df4fc64c` | `1f7301b2-f2cb-4f29-bad5-d1e243a2ceaf` | linked (PLAN) | **GO** 0/0/2 (job `82d25b05-8c5d-4de5-8429-0061b4030c98`) |
+
+**De drie errata houden.** De reviewer controleerde ze tegen de tree:
+- `stageReviewCase` (review-case.ts:179-192) en de test (bench-review-case.test.ts:328-342) maken `root/work/` en eisen dat die leeg is;
+- review-bench.ts:154 en :184 geven die root aan de read-only tools, en task-tools.ts:193-231 geeft voor een lege map een lege lijst zonder fout;
+- P4 klopt met het excerpt: score.py:954-958 (de rook-argumenten samen, en een bestaand bestand) en :886-896 (`--notes` mag niet leeg zijn);
+- spec §4.9 wordt bediend. Er is geen andere operationele `report`-aanroep zonder de vlaggen.
+
+| # | Bevinding | Oordeel |
+|---|---|---|
+| D3-m1 | De privé-payload achter de reden ("geen `requirements.repository`") zat niet in de bronnen. | Klopt als waarneming, maar de bewering houdt. Op de Mac is gemeten dat `dispatch.input.requirements` van de bevroren payload (max2 @`29493ab1`, sha256 `5a52a843…`) precies `access`, `environment_keys` en `runtime` heeft. Hetzelfde staat in max2 `SOURCE.md`, onder "Geen repository". Niet in het plan. |
+| D3-m2 | "Met een lege `work/` ernaast" kan gelezen worden als naast `root/`. Code, test en plan maken `<run>/root/work/`. | Klopt. Geparkeerd: de wijziging na de GO zou een nieuwe delta-ronde vragen (zoals de MINORs van plan-ronde 4). De code en het plan, regel 240, zijn eenduidig. Bij een volgende spec-revisie wordt het `<run>/root/work/`. |
+
+**GO: de delta is klaar** (plan revisie 9, spec revisie 3, `6a56af13`). Een technisch GO autoriseert geen uitvoering, merge of deployment.
+
+**Scope-delta d3.** Geen. Drie errata en geen nieuw gedrag. Het eerste bruikbare resultaat (het rapport na P4) en de praktijkproef (de rookproef in P2) blijven gelijk.
