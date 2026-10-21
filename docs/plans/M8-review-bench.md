@@ -1,7 +1,7 @@
 ---
 title: "M8 — review-bench: remote modellen op een echte review — implementatieplan"
 status: draft
-last_updated: 2026-10-20
+last_updated: 2026-10-21
 sprint:
   goal: "M8 review-bench: acht remote modellen draaien elk 3× de spec-r5-review van MacSearch IDEA-263 via LiteLLM op max2, gescoord met de rubric. Het rapport geeft een oordeel per model."
 pbi:
@@ -237,7 +237,7 @@ stories:
              - `dispatch.input.review_documents` bestaat; dat wordt `expectedDocuments`;
              - `dispatch.source_artifacts` bevat precies dezelfde sleutels met dezelfde sha256 als `sources[]` in case.json, in beide richtingen.
 
-          stageReviewCase: maak `<runDir>/root/` aan, met `payload.json` en `sources/<key>` als byte-kopie.
+          stageReviewCase: maak `<runDir>/root/` aan, met `payload.json` en `sources/<key>` als byte-kopie, en een lege `work/` (spec §4.1, "Werkmap").
 
           Tests (eerst rood):
           - De synthetische case laadt.
@@ -246,7 +246,7 @@ stories:
           - Zonder `contextTokens` geeft het CASE_INVALID met `case.json`.
           - Een sleutel in case.json die niet in `source_artifacts` staat, of omgekeerd, geeft CASE_INVALID.
           - Een bronbestand dat een symlink is, wordt geweigerd.
-          - `stageReviewCase` maakt een root met byte-gelijke bestanden.
+          - `stageReviewCase` maakt een root met byte-gelijke bestanden en een lege `work/`.
 
           Verificatie: `npx vitest run __tests__/bench-review-case.test.ts`, daarna `npm run verify`.
       - title: "runReviewBench: gate, run, statusmapping en bench-result.json"
@@ -578,7 +578,7 @@ stories:
 
 # M8 — review-bench: implementatieplan
 
-_Status: draft (2026-10-20), revisie 8. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
+_Status: draft (2026-10-21), revisie 9. Een technisch GO autoriseert geen ceremonie, venster, serveractie, merge of uitvoering._
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
@@ -588,7 +588,7 @@ _Status: draft (2026-10-20), revisie 8. Een technisch GO autoriseert geen ceremo
 
 **Tech Stack:** TypeScript (Node 24), vitest, `npm run verify`; Python 3 met alleen de standaardbibliotheek, `unittest`; LiteLLM met OpenRouter.
 
-**Spec:** `docs/specs/2026-10-20-review-bench-design.md` revisie 2, dubbel GO (`86628ea3`). Het review-record staat in `docs/reviews/2026-10-20-review-bench-spec-review-record.md`. De spec is bindend. Dit plan detailleert het hele increment (besluit 8).
+**Spec:** `docs/specs/2026-10-20-review-bench-design.md` revisie 3: revisie 2 met dubbel GO (`86628ea3`), plus het erratum `work/` in §4.1. Het review-record staat in `docs/reviews/2026-10-20-review-bench-spec-review-record.md`. De spec is bindend. Dit plan detailleert het hele increment (besluit 8).
 
 **Vorm:** de sprint-taken (S1, S2) staan alleen in de yaml-frontmatter, en elke `implementation_plan` staat op zichzelf. De praktijkstappen op max2 zijn sessiestappen, geen sprint-taken: `verify_only` staat alleen een lege diff toe (`scrum4me-mcp src/verify/gate.ts:11-12`) en houdt een worker niet tegen.
 
@@ -675,7 +675,11 @@ Terugzetten, als een bestaande configuratie niet meer aanvaard wordt: stop, en J
 1. `score.py sheets R/runs`.
 2. Claude vult `scores.jsonl` in volgens rubric.md, zonder `sheets-key.json` te openen. Elke extra BLOCKER of MAJOR krijgt een genormaliseerde `key`.
 3. JP beslist één keer per key in `decisions.json`.
-4. `score.py report R/runs --preflight R/preflight.json --models <de acht> --runs 3 --smoke-dir R/rook --smoke-scores R/rook/scores.jsonl`, met scores, decisions, grootboek en datum, schrijft het rapport. Daarin staan:
+4. `score.py report R/runs --preflight R/preflight.json --models <de acht> --runs 3 --smoke-dir R/rook --smoke-scores R/rook/scores.jsonl --notes R/notes.md`, met scores, decisions, grootboek en datum, schrijft het rapport.
+   - `--smoke-dir` en `--smoke-scores` gaan samen, en `--smoke-scores` moet een bestaand bestand zijn: een leeg bestand als geen rookrun beoordeeld is.
+   - `R/notes.md` schrijft Claude vooraf: het venster, de probe-uitkomsten van P1, de afwijkingen en het vervolg. Het komt letterlijk in de sectie "Venster, probes en afwijkingen"; een handmatige bewerking van het rapport gaat bij de volgende `report` verloren.
+
+   Het rapport bevat:
    - het oordeel per model;
    - de preflight en de rookproef met hun bewijs;
    - de `read_file`-tellingen;
