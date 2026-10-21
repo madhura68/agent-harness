@@ -6,7 +6,16 @@ last_updated: 2026-10-21
 
 # M9 — review-bench: open modellen met een ruimere output-limiet (IDEA-272)
 
-Revisie 1, 2026-10-21. Spec en plan staan in één document (grill-besluit 9).
+Revisie 2, 2026-10-21. Spec en plan staan in één document (grill-besluit 9).
+
+Revisie 2 verwerkt Codex-ronde 1 (NO-GO, 2 MAJOR en 3 MINOR):
+- **C-M1:** een `limiet`-run krijgt een oorzaak (§4.3). Een length-stop met budget over gaat naar JP.
+- **C-M2:** een releasecontrole vóór en na elk venster (§4.5).
+- **C-m3:** één regel voor stap 2.
+- **C-m4:** "turn 1 is de grootste request" is een meting, geen invariant.
+- **C-m5:** de herkomst van de metingen staat erbij.
+
+Het review-record staat in `docs/reviews/2026-10-21-review-bench-output-limit-review-record.md`.
 
 Bronnen:
 - de grill: Scrum4Me IDEA-272, ProductDoc `idea-272-grill`;
@@ -68,7 +77,7 @@ Overgenomen uit M8:
 - **Statussen.** `budget_exceeded` en `timed_out` worden `limiet` (`review-bench.ts:67`), `MODEL_ERROR` wordt `benchfout` (`review-bench.ts:55, 65`).
 - **Retries.** Een request met HTTP 408, 429, 5xx of een netwerkfout krijgt maximaal 3 retries (`src/bench/retry-client.ts:16-19`).
 
-**M8-traces op max2** (`~/m8-runs/review-bench-2026-10-21`, 24 runs plus 4 rookruns):
+**M8-traces op max2** (`~/m8-runs/review-bench-2026-10-21`, 24 runs plus 4 rookruns). De auteur heeft deze waarden gemeten. De traces staan in geen repo.
 - **De eerste request.** In alle 28 traces heeft turn 1 `promptEstimate` 3198 en `maxTokens` 64000.
 - **Latere turns.** De laagste `promptEstimate` na turn 1 per configuratie:
 
@@ -79,7 +88,10 @@ Overgenomen uit M8:
   | pro | 3962 |
   | qwen | 6143 |
 
-  Alle vier liggen boven 3198. Bij deze vier is turn 1 dus de request met de grootste `max_tokens`.
+  Alle vier liggen boven 3198. In de gemeten traces was turn 1 bij deze vier dus de request met de grootste `max_tokens`.
+
+  De code garandeert dat niet. Na elk antwoord kalibreert de harness de schatting op de echte `inputTokens` (`src/run.ts:263, 384`), en `fitContext` kan haar verlagen door toolresultaten te vervangen (`run.ts:274-293`). Een latere turn kan dus meer vragen. Een rekenvoorbeeld bij out256k: met 255 000 budget over en een schatting van 3000 vraagt de volgende turn 128 072.
+- **Length-stop.** Een antwoord zonder toolcalls met `finishReason` `length` eindigt de run direct als `budget_exceeded`, ook als er nog cumulatief budget over is (`run.ts:412-415`).
 - **Output per turn.** De grootste output in één turn:
 
   | Configuratie | Grootste output in één turn |
@@ -144,11 +156,11 @@ preflight max_tokens = min(maxOutputTokens, contextTokens − FIRST_PROMPT_TOKEN
 - Dat ligt boven het maximum van sol per request (128 000). Sol zou dan een preflight weigeren die hij in de echte runs haalt.
 - Ook een route met een venster van 131 072 zou weigeren, want de prompt komt er nog bij.
 
-127 874 is de grootste `max_tokens` die de harness in deze case stuurt (§3: turn 1 is de grootste request).
+In de gemeten M8-traces was 127 874 de grootste `max_tokens` die de harness in deze case zou sturen (§3). Een bovengrens voor elke turn is het niet.
 
 **Wat de preflight niet ziet.**
-- Een provider die `max_tokens` stil verlaagt, aanvaardt de request, en de preflight is dan ok.
-- Voor qwen maakt dat in de praktijk niet uit: zijn grootste turn in M8 was 16 064 output, ver onder 65 536.
+- **Een stille verlaging.** Een provider die `max_tokens` stil verlaagt, aanvaardt de request, en de preflight is dan ok. Haalt een turn die lagere grens, dan eindigt de run als `limiet` met budget over (§3, length-stop). De turn-1-controle hieronder ziet dat niet: die controleert de verstuurde waarde, niet wat de provider toestaat. In M8 bleef de grootste turn van qwen op 16 064 output, maar dat bewijst geen grens voor M9. Daarom krijgt elke `limiet`-run een oorzaak (§4.3).
+- **Een latere turn boven de preflight-waarde.** Die is mogelijk (§3), maar bleef in M8 uit. Een `benchfout` krijgt daarom een controle: was de `maxTokens` van de mislukte request groter dan het providermaximum (sol: 128 000)? Het antwoord komt in de notes, en JP beslist.
 
 **De constante is gekoppeld aan release en case.** Bij een andere release of prompt kan 3198 verschuiven. Daarom geldt in elk venster een controle:
 - In de trace van de eerste run van elke configuratie moet turn 1 `maxTokens` gelijk zijn aan de preflight-waarde.
@@ -159,7 +171,7 @@ preflight max_tokens = min(maxOutputTokens, contextTokens − FIRST_PROMPT_TOKEN
 | | 128k-venster | 256k-venster |
 |---|---|---|
 | Case | `…-out128k` | `…-out256k` |
-| Configuraties | flash, pro, qwen, sol | elk model met ≥ 1 `limiet`-run bij 128k, en sol |
+| Configuraties | flash, pro, qwen, sol | elk model dat bij 128k afvalt en minstens één `limiet`-run door budget of wandtijd heeft, en sol |
 | Runs | 3 per configuratie, ronde voor ronde zoals M8 | idem |
 | `--out` | `~/m9-runs/out128k` | `~/m9-runs/out256k` |
 | Grootboek | eigen `ledger.jsonl` onder `--out` | idem |
@@ -168,12 +180,22 @@ preflight max_tokens = min(maxOutputTokens, contextTokens − FIRST_PROMPT_TOKEN
 | Wandtijd, verwacht | ≈ 5–8 u (M8-limietruns duurden 20–28 min bij 64k) | ≈ 2–4 u per model |
 | Verwachte kosten | ≈ $1,5–3 | pro ≈ $0,35, qwen ≈ $0,40 en flash < $0,10 per run |
 
-**Regel voor stap 2.** Een `limiet`-run is `budget_exceeded` of `timed_out` (wandtijd).
-- Een model dat bij 128k kandidaat of twijfel is, stopt.
-- Een model dat afvalt zonder `limiet`-run, stopt ook.
-- Heeft geen model een `limiet`-run, dan vervalt het 256k-venster. Het 128k-rapport is dan het laatste.
+**De oorzaak van een `limiet`-run.** Elke `limiet`-run krijgt in de notes één oorzaak uit de trace en het `bench-result.json`:
 
-**Stoppen.** De stopregel is die van M8: een tweede benchfout op dezelfde configuratie. Een stop vanwege de controle in §4.2 hoort daar ook bij. JP beslist hoe het verder gaat.
+| Oorzaak | Kenmerk |
+|---|---|
+| **budget** | de cumulatieve output van de run heeft `maxOutputTokens` bereikt; de laatste request vroeg precies het resterende budget |
+| **wandtijd** | runStatus `timed_out` |
+| **length met budget over** | het laatste `model_response` heeft `finishReason` `length` en de cumulatieve output ligt onder `maxOutputTokens`. Het plafond was dan de provider of de contextruimte, niet het budget. De notes noemen de output van die turn en het resterende budget. |
+| **anders** | bijvoorbeeld `maxTurns` of `CONTEXT_EXHAUSTED`, met de code |
+
+**Regel voor stap 2.** Een model gaat naar het 256k-venster als het bij 128k **afvalt** en **minstens één `limiet`-run met oorzaak budget of wandtijd** heeft. Dat is grill 4.
+- Een model dat kandidaat of twijfel is, stopt, ook met een `limiet`-run.
+- Een model dat afvalt zonder zo'n run, stopt ook.
+- Een run met oorzaak "length met budget over" of "anders" telt niet vanzelf mee. Die gaat met haar cijfers naar JP, en JP beslist of het model naar stap 2 gaat. Een ruimer budget lost een plafond van de provider of de context niet op.
+- Gaat geen model door, dan vervalt het 256k-venster. Het 128k-rapport is dan het laatste.
+
+**Stoppen.** De stopregel is die van M8: een tweede benchfout op dezelfde configuratie. Ook een stop vanwege de controle in §4.2 of §4.5 hoort daarbij. JP beslist hoe het verder gaat.
 
 ### 4.4 Scoren en rapport
 
@@ -189,6 +211,9 @@ Per venster:
   - het venster;
   - de preflight, met de `max_tokens` die zij stuurde;
   - de controle van §4.2;
+  - de releasecontrole van §4.5;
+  - per `limiet`-run de oorzaak (§4.3);
+  - per model de beslissing voor stap 2, met het criterium;
   - de afwijkingen;
   - in het laatste rapport de tabel per model met het oordeel bij 64k (M8), 128k en 256k.
 
@@ -196,6 +221,19 @@ Per venster:
 - **Wat het opvangt:** de bytes die het model ziet, zijn identiek. De grootboektabel van het rapport noemt per run het case-id van de variant. De notes noemen de variant en zijn limieten.
 - **Aanbeveling:** accepteren.
 - **Alternatief:** een vlag `--case-id` in `score.py`. Dat is een kleine wijziging, maar die gaat tegen grill 7 in. JP kiest.
+
+### 4.5 Releasecontrole
+
+De output-limiet is de enige variabele. Daarom draait M9 tegen dezelfde harness-release als M8: `a68a74627660f2afd355e2f11d54be582466db7a`, dezelfde als in het M8-rapport (agent-harness #59).
+- Sinds die release heeft agent-harness main alleen documentatie gekregen: `git log a68a746..origin/main -- src deploy package.json` is leeg.
+- Op 2026-10-21 wees `/srv/agent-harness/current` naar `releases/a68a74627660f2afd355e2f11d54be582466db7a`.
+
+`current` is een symlink die `release-update` en `release-rollback` kunnen omzetten (`deploy/max2/ops/agent-harness-ops.sh:36, 208-215`). `run.py` roept per run `node /srv/agent-harness/current/dist/cli.js` aan.
+
+De controle:
+1. **Vóór de preflight van elk venster** moet `readlink /srv/agent-harness/current` precies `releases/a68a74627660f2afd355e2f11d54be582466db7a` zijn. Wijkt het af, dan start het venster niet en beslist JP over de vergelijkbaarheid.
+2. **Tijdens een venster** vraagt Claude JP om geen release uit te rollen. Elke run gebruikt de release waar `current` bij zijn start naar wijst.
+3. **Na de laatste run van een venster, en bij elke hervatting**, gebeurt dezelfde `readlink` nog eens. Wijkt die af, dan kunnen runs van dit venster een andere release hebben gehad. Het venster stopt, de notes melden het, en JP beslist welke runs tellen. Een wissel blijft nooit stil in hetzelfde meetresultaat.
 
 ## 5. Acceptatie
 
@@ -214,8 +252,12 @@ Per venster:
 - **AC6** (praktijk). Het 128k-venster:
   - geeft een rapport in een eigen map, zonder runs van M8 of van het andere venster;
   - de controle van §4.2 is per configuratie vastgelegd in de notes;
+  - de releasecontrole van §4.5 staat vóór en na het venster in de notes, met dezelfde release als M8;
   - de geldigheid via sol staat in het rapport.
-- **AC7** (praktijk). De beslissing voor stap 2 staat per model in de notes. Het 256k-venster draait alleen voor die modellen, plus sol.
+- **AC7** (praktijk).
+  - Elke `limiet`-run heeft in de notes een oorzaak (§4.3).
+  - De beslissing voor stap 2 staat per model in de notes, met het criterium van §4.3.
+  - Het 256k-venster draait alleen voor die modellen, plus sol.
 - **AC8.** Het laatste rapport heeft de tabel 64k / 128k / 256k.
 - **AC9.** Het key-bestand gaat alleen via `--key-file`, en de waarde komt nooit in argv, log, trace, resultaat, repo of Scrum4Me.
 
@@ -261,18 +303,21 @@ python3 -m unittest discover -s llm-bench/review_bench -v
 1. **Voorbereiden.**
    - Werk de clone `~/Development/max2-m8` op max2 bij naar main, met T1 gemerged.
    - Ruim daarbij de restanten van M8 op: het ongetrackte rapport en `__pycache__`. Kijk eerst wat er staat.
-   - Lees de revisie van `/srv/agent-harness/current` af en zet die in de notes.
+   - Doe de releasecontrole van §4.5, stap 1. Wijkt de release af, dan stop je hier en beslist JP.
 2. **Budget en sleutel.** JP leest het tegoed af en plaatst het key-bestand. Het budget is `min(10, tegoed − 2)`.
 3. **Preflight tegen out128k.**
    - `run.py --preflight` met `--models deepseek-v4-flash-or deepseek-v4-pro-or qwen3.8-or-128k gpt-6.1-sol-or`, `--case …-out128k`, `--out ~/m9-runs/out128k` en een eigen `--ledger`.
    - Weigert de provider qwen, dan beslist JP (grill 5). Bij een weigering van sol is het venster niet geldig te maken, en beslist JP ook.
 4. **Het 128k-venster.**
    - Draai de runs.
-   - Controleer na de eerste run van elke configuratie §4.2: turn 1 `maxTokens` moet 127 874 zijn.
+   - Controleer na de eerste run van elke configuratie §4.2: turn 1 `maxTokens` moet 127 874 zijn. Doe dat vóór de volgende run van die configuratie.
+   - Geef elke `limiet`-run haar oorzaak (§4.3).
+   - Controleer bij elke `benchfout` de `maxTokens` van de mislukte request (§4.2).
    - Stop volgens §4.3.
+   - Doe na de laatste run de releasecontrole van §4.5, stap 3.
    - JP verwijdert het key-bestand na het venster.
-5. **Scoren en rapporteren** volgens §4.4. Daarna volgt de beslissing voor stap 2, per model in de notes.
-6. **Het 256k-venster**, alleen als §4.3 dat geeft en op JP's go. Het volgt stap 2–5 met out256k (`~/m9-runs/out256k`): preflight, runs, controle (127 874), scoren en rapport. In de notes van het laatste rapport komt de tabel 64k / 128k / 256k.
+5. **Scoren en rapporteren** volgens §4.4. Daarna volgt de beslissing voor stap 2, per model in de notes, met het criterium van §4.3. Een geval van "length met budget over" of "anders" gaat eerst naar JP.
+6. **Het 256k-venster**, alleen als §4.3 dat geeft en op JP's go. Het volgt stap 1–5 met out256k (`~/m9-runs/out256k`): releasecontrole, preflight, runs, controle (127 874), oorzaken, scoren en rapport. In de notes van het laatste rapport komt de tabel 64k / 128k / 256k.
 7. **Afronden.** Commit de rapportmappen op een branch in max2 en open een PR via de Forgejo-API. De merge wacht op JP.
 
 **Klaar.** AC5–AC9 houden. De PR is open, en de restanten op max2 zijn genoemd of opgeruimd.
@@ -284,12 +329,14 @@ python3 -m unittest discover -s llm-bench/review_bench -v
   - Twee benchfouten stoppen de configuratie (§4.3), en JP beslist.
   - Een andere LiteLLM-timeout is een configuratiewijziging. Die valt buiten deze scope (grill 3).
 - **Wandtijd.** Bij de traagste M8-doorvoer haalt een 128k-run net de 3600 s. Een `timed_out` telt als `limiet` en voert dus naar stap 2. Dat is zo bedoeld (grill 4).
-- **qwen boven 65 536.** Weigert de provider dat, dan volgt grill 5. Verlaagt hij het stil, dan maakt dat in de praktijk niets uit (§4.2).
+- **qwen boven 65 536.** Weigert de provider dat, dan volgt grill 5. Verlaagt hij het stil, dan ziet de preflight dat niet. Een turn die de lagere grens haalt, wordt een `limiet`-run met oorzaak "length met budget over", en die gaat naar JP (§4.3). M8 liet zo'n lange turn niet zien: de grootste was 16 064.
 - **Kosten.** Het plafond per run blijft $1. Een 256k-run van pro of qwen kan tegen ≈ $0,40 lopen, ruim onder het plafond.
 - **Open voor JP:** de kop van het rapport (§4.4). De aanbeveling is accepteren.
 
 ## 8. Review
 
 Er komt één Codex-reviewronde via dispatch, met `idea_phase` PLAN, want dit document gaat vóór de ceremonie. Bij een MAJOR volgt een delta-ronde.
+
+Ronde 1 op revisie 1 gaf NO-GO, met 2 MAJOR en 3 MINOR. Alle vijf zijn gerepareerd in revisie 2. De delta-ronde volgt.
 
 Het review-record staat in `docs/reviews/2026-10-21-review-bench-output-limit-review-record.md`.
