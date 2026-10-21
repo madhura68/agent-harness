@@ -45,3 +45,35 @@ Repository: `agent-harness@2a89b2d7`. De body bevatte excerpts van max2 `run.py`
 - Er komt een extra JP-beslissing bij "length met budget over".
 
 Het eerste bruikbare resultaat en de eerste praktijkproef blijven gelijk.
+
+## Ronde 2 (delta): revisie 2 (`97902ddf44aa36b4ec104e31483874410515a53a`)
+
+Een delta-ronde door dezelfde modelfamilie (Codex), omdat de claude-sessie de wijziging schreef.
+
+**Pins:**
+- `plan` @`97902ddf`, sha256 `6d3a6686b7dffb8ac7ed7d4dc5440596c2f95c7c680b440fe857f00fcd304b62`;
+- `plan-rev1` @`2a89b2d7`, sha256 `38ceb83bca157f52d97210dc5889390caf4f72c7213e45efb6b6758ac257b929`.
+
+Repository: `agent-harness@97902ddf`. De body bevatte de delta en de remedies van ronde 1.
+
+| Slot | Request id | root_message_id | Idempotency key | idea_link | Verdict |
+|---|---|---|---|---|---|
+| CODEX | `a644ff3f-0f3d-4cd1-a020-a40b79a16c23` | `0e2a22ef-fd9b-469c-8806-07451e061235` | `2edcd4b2-8a84-4dd3-a84d-800c1c2200df` | linked (PLAN) | **NO-GO** 0/1/2 |
+
+**Ronde 1 volgens de reviewer:**
+- C-m3 en C-m4: opgelost.
+- C-M1: gedeeltelijk opgelost, zie D-M1.
+- C-M2: opgelost, onder de releasefreeze, zie D-m2.
+- C-m5: gedeeltelijk opgelost, zie D-m3.
+
+### Triage
+
+| # | Bevinding | Oordeel en remedie |
+|---|---|---|
+| D-M1 | De oorzaak-indeling was niet exclusief. Neem een `length`-antwoord mét toolcalls, gevolgd door `timed_out`. Die run voldoet aan zowel "wandtijd" als "length met budget over", en dan is de route naar stap 2 niet eenduidig. | **Geaccepteerd, gerepareerd.** Gecontroleerd: `src/run.ts:412-415` (de length-stop alleen zonder toolcalls), `:373` (`timed_out`) en `review-bench.ts:213-222` (de velden `runStatus`, `error` en `usage` van `bench-result.json`). Fix: §4.3 heeft nu zes geordende regels op de terminale `runStatus` en `error.code`, met de velden erbij en de grens output ≥ B. "Length met budget over" vraagt `budget_exceeded`, output < B, en een `length`-antwoord zonder toolcalls in de laatste turn. Een onvolledige meting valt onder "anders". |
+| D-m2 | De releasecontrole zag een wissel heen en terug (A→B→A) niet. De claim "nooit stil" was te sterk. | **Geaccepteerd, gerepareerd.** `swap_current` maakt bij elke wissel een nieuwe link (`agent-harness-ops.sh:211-215`). De mtime van de link is dus het moment van de laatste wissel. Gemeten op max2: 2026-10-21 06:50:18 UTC, de uitrol van P1 in M8. Fix: §4.5 legt die mtime vóór en na elk venster vast. Het venster is alleen zuiver als `readlink` en mtime gelijk zijn, en als JP geen wissel kent. |
+| D-m3 | Externe claims blijven ongeverifieerd: de traces, max2, de grill en de release-historie. De checkout is shallow. | **Geaccepteerd als beperking.** §8 zegt nu welke feiten de review tegen code kon controleren, welke metingen van de auteur zijn, en welke zich pas in T2 bewijzen. Er zijn geen extra pins: de controles van §4.2 en §4.5 vangen een afwijking in T2 op. |
+
+**Scope-delta.** De indeling wordt preciezer, en de releasecontrole krijgt één extra `stat`. Er komt geen bouwwerk bij. Het eerste bruikbare resultaat en de eerste praktijkproef blijven gelijk.
+
+**Nog een delta-ronde.** Grill-besluit 9 vraagt een delta-ronde bij een MAJOR, en ronde 2 gaf er één (D-M1). Ronde 3 is daarom weer een delta-ronde.

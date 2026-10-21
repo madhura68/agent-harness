@@ -6,9 +6,14 @@ last_updated: 2026-10-21
 
 # M9 — review-bench: open modellen met een ruimere output-limiet (IDEA-272)
 
-Revisie 2, 2026-10-21. Spec en plan staan in één document (grill-besluit 9).
+Revisie 3, 2026-10-21. Spec en plan staan in één document (grill-besluit 9).
 
-Revisie 2 verwerkt Codex-ronde 1 (NO-GO, 2 MAJOR en 3 MINOR):
+Revisie 3 verwerkt de delta-ronde (ronde 2, NO-GO, 1 MAJOR en 2 MINOR):
+- **D-M1:** de oorzaak van een `limiet`-run volgt nu geordende regels op de terminale `runStatus`, met de velden erbij (§4.3).
+- **D-m2:** de mtime van de link vangt ook een wissel heen en terug (§4.5).
+- **D-m3:** §8 zegt wat de review kon controleren.
+
+Revisie 2 verwerkte Codex-ronde 1 (NO-GO, 2 MAJOR en 3 MINOR):
 - **C-M1:** een `limiet`-run krijgt een oorzaak (§4.3). Een length-stop met budget over gaat naar JP.
 - **C-M2:** een releasecontrole vóór en na elk venster (§4.5).
 - **C-m3:** één regel voor stap 2.
@@ -180,14 +185,29 @@ In de gemeten M8-traces was 127 874 de grootste `max_tokens` die de harness in d
 | Wandtijd, verwacht | ≈ 5–8 u (M8-limietruns duurden 20–28 min bij 64k) | ≈ 2–4 u per model |
 | Verwachte kosten | ≈ $1,5–3 | pro ≈ $0,35, qwen ≈ $0,40 en flash < $0,10 per run |
 
-**De oorzaak van een `limiet`-run.** Elke `limiet`-run krijgt in de notes één oorzaak uit de trace en het `bench-result.json`:
+**De oorzaak van een `limiet`-run.** Elke `limiet`-run krijgt in de notes precies één oorzaak. De regels hieronder gelden in volgorde, en de eerste die past, telt.
 
-| Oorzaak | Kenmerk |
-|---|---|
-| **budget** | de cumulatieve output van de run heeft `maxOutputTokens` bereikt; de laatste request vroeg precies het resterende budget |
-| **wandtijd** | runStatus `timed_out` |
-| **length met budget over** | het laatste `model_response` heeft `finishReason` `length` en de cumulatieve output ligt onder `maxOutputTokens`. Het plafond was dan de provider of de contextruimte, niet het budget. De notes noemen de output van die turn en het resterende budget. |
-| **anders** | bijvoorbeeld `maxTurns` of `CONTEXT_EXHAUSTED`, met de code |
+Ze gebruiken deze velden:
+- uit `bench-result.json`: `runStatus`, `error.code` en `usage` (`source`, `outputTokens`);
+- uit `case.json` van de variant: `limits.maxOutputTokens`, hieronder B;
+- uit de trace: het laatste `model_request` (`turn`, `maxTokens`) en het `model_response` van dezelfde turn (`finishReason`, `toolCalls`, `usage.outputTokens`).
+
+| # | Voorwaarde | Oorzaak |
+|---|---|---|
+| 1 | `runStatus` is `timed_out` | **wandtijd** |
+| 2 | er is een `error.code`, zoals `CONTEXT_EXHAUSTED`, `TOO_MANY_TOOL_ERRORS` of `COST_LIMIT_EXCEEDED` | **anders**, met de code |
+| 3 | `usage.source` is niet `provider_reported`: de output is dan niet volledig geteld | **anders** (onvolledige meting) |
+| 4 | `runStatus` is `budget_exceeded` en `usage.outputTokens` ≥ B | **budget** |
+| 5 | `runStatus` is `budget_exceeded`, `usage.outputTokens` < B, en het `model_response` van de laatste turn heeft `finishReason` `length` en geen `toolCalls` | **length met budget over** |
+| 6 | al het andere, zoals het bereiken van `maxTurns` (`budget_exceeded` zonder code, output < B, geen length-stop) | **anders** |
+
+Bij **length met budget over** noemen de notes:
+- de turn;
+- de `maxTokens` van die request;
+- de output van die turn;
+- het resterende budget vóór die request: B min de output van de eerdere turns.
+
+Het plafond was dan de provider of de contextruimte, niet het budget.
 
 **Regel voor stap 2.** Een model gaat naar het 256k-venster als het bij 128k **afvalt** en **minstens één `limiet`-run met oorzaak budget of wandtijd** heeft. Dat is grill 4.
 - Een model dat kandidaat of twijfel is, stopt, ook met een `limiet`-run.
@@ -230,10 +250,18 @@ De output-limiet is de enige variabele. Daarom draait M9 tegen dezelfde harness-
 
 `current` is een symlink die `release-update` en `release-rollback` kunnen omzetten (`deploy/max2/ops/agent-harness-ops.sh:36, 208-215`). `run.py` roept per run `node /srv/agent-harness/current/dist/cli.js` aan.
 
+**Elke wissel geeft een nieuwe link.** `swap_current` maakt bij elke wissel een nieuwe link (`symlinkSync` en dan `renameSync`, `deploy/max2/ops/agent-harness-ops.sh:211-215, 219`). De mtime van de link (`stat -c %y`, zonder `-L`) is dus het moment van de laatste wissel. Op 2026-10-21 was dat 06:50:18 UTC, de uitrol van P1 in M8. Een heen-en-terug A→B→A laat `readlink` gelijk, maar de mtime niet.
+
 De controle:
-1. **Vóór de preflight van elk venster** moet `readlink /srv/agent-harness/current` precies `releases/a68a74627660f2afd355e2f11d54be582466db7a` zijn. Wijkt het af, dan start het venster niet en beslist JP over de vergelijkbaarheid.
+1. **Vóór de preflight van elk venster.**
+   - `readlink /srv/agent-harness/current` moet precies `releases/a68a74627660f2afd355e2f11d54be582466db7a` zijn.
+   - De mtime van de link gaat in de notes, met de starttijd van het venster.
+   - Wijkt `readlink` af, dan start het venster niet en beslist JP over de vergelijkbaarheid.
 2. **Tijdens een venster** vraagt Claude JP om geen release uit te rollen. Elke run gebruikt de release waar `current` bij zijn start naar wijst.
-3. **Na de laatste run van een venster, en bij elke hervatting**, gebeurt dezelfde `readlink` nog eens. Wijkt die af, dan kunnen runs van dit venster een andere release hebben gehad. Het venster stopt, de notes melden het, en JP beslist welke runs tellen. Een wissel blijft nooit stil in hetzelfde meetresultaat.
+3. **Na de laatste run van een venster, en bij elke hervatting.**
+   - Doe dezelfde `readlink` nog eens, plus `stat`.
+   - Het venster is alleen zuiver als `readlink` gelijk is en de mtime van de link niet veranderd is sinds stap 1.
+   - Anders, of als JP een update of rollback tijdens het venster kent, stopt het venster. De notes melden het, en JP beslist welke runs tellen.
 
 ## 5. Acceptatie
 
@@ -337,6 +365,18 @@ python3 -m unittest discover -s llm-bench/review_bench -v
 
 Er komt één Codex-reviewronde via dispatch, met `idea_phase` PLAN, want dit document gaat vóór de ceremonie. Bij een MAJOR volgt een delta-ronde.
 
-Ronde 1 op revisie 1 gaf NO-GO, met 2 MAJOR en 3 MINOR. Alle vijf zijn gerepareerd in revisie 2. De delta-ronde volgt.
+Ronde 1 op revisie 1 gaf NO-GO, met 2 MAJOR en 3 MINOR. Revisie 2 repareerde die vijf.
+
+De delta-ronde (ronde 2) op revisie 2 gaf NO-GO, met 1 MAJOR en 2 MINOR:
+- **D-M1:** de oorzaak-indeling was niet exclusief.
+- **D-m2:** de releasecontrole zag een wissel heen en terug niet.
+- **D-m3:** de grens van de verificatie.
+
+Revisie 3 repareert die drie. Het gaat om dezelfde vragen als C-M1 en C-M2. Daarom volgt nog één delta-ronde.
+
+**Wat de review kon controleren.**
+- De harness-feiten (§3 "Harness", §4.5 ops-script) staan in agent-harness en zijn tegen de code gecontroleerd.
+- De max2-feiten en de trace-metingen zijn metingen van de auteur. De reviewer kreeg excerpts en cijfers, geen eigen toegang.
+- De release, de preflight en de turn-1-waarde bewijzen zich pas in T2, via de controles van §4.2 en §4.5.
 
 Het review-record staat in `docs/reviews/2026-10-21-review-bench-output-limit-review-record.md`.
